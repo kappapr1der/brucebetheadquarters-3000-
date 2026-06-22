@@ -107,13 +107,15 @@ python -m brucebet.cli --db brucebet.sqlite import --reset `
 
 ## Реальные данные Forecasters Club
 
-В `data/` лежит первая загрузка из присланного треда:
+Локально и на сервере `data/` используется для реальной загрузки из присланного треда:
 
 - `participants.csv` - 16 участников и отметка взноса.
 - `vk_matches.csv` - 2 тура по 24 матча, с дедлайнами тура.
 - `vk_predictions.csv` - распарсенные прогнозы из VK-пасты.
 - `vk_parse_summary.txt` - краткий отчёт парсинга.
 - `forecasters.sqlite` - SQLite-база после импорта.
+
+В публичный GitHub эти файлы не коммитятся: там остаются только `data/README.md` и `data/.gitkeep`.
 
 Текущий пользователь в этой базе: `Bruce Wayne`.
 
