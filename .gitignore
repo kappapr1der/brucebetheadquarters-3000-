@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.sqlite
+.venv/
+.env
+data/*.csv
+data/*.sqlite
+data/audit_summary.md
+data/vk_parse_summary.txt
+!data/.gitkeep
+!data/README.md
