@@ -1,0 +1,21 @@
+{
+  "competition": "world_cup_2026",
+  "display_name": "World Cup 2026 Forecasters Club",
+  "timezone": "Europe/Moscow",
+  "deadline_rule": {
+    "type": "before_first_match",
+    "minutes": 90
+  },
+  "entry_fee_rub": 300,
+  "payouts": {
+    "1": 0.5,
+    "2": 0.3,
+    "3": 0.2
+  },
+  "user_participant": "Bruce Wayne",
+  "scoring": {
+    "exact": 3,
+    "diff": 2,
+    "outcome": 1
+  }
+}
