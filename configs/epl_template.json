@@ -1,0 +1,22 @@
+{
+  "competition": "epl",
+  "display_name": "English Premier League Forecast Pool",
+  "timezone": "Europe/Moscow",
+  "deadline_rule": {
+    "type": "before_first_match",
+    "minutes": 90
+  },
+  "entry_fee_rub": 300,
+  "payouts": {
+    "1": 0.5,
+    "2": 0.3,
+    "3": 0.2
+  },
+  "user_participant": "Bruce Wayne",
+  "scoring": {
+    "exact": 3,
+    "diff": 2,
+    "outcome": 1
+  },
+  "notes": "Use after World Cup. Replace teams and match calendar with EPL data."
+}
