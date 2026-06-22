@@ -1,0 +1,5 @@
+round,position,venue,city,country,neutral_site,timezone,home_rest_days,away_rest_days,home_travel_km,away_travel_km,weather,temperature_c,pitch,referee,home_motivation,away_motivation,home_rotation_risk,away_rotation_risk,notes
+1,1,Neutral Stadium,Sample City,Sample Country,true,Europe/Moscow,4,4,0,0,clear,24,natural,TBD,0.8,0.9,0.2,0.1,Favorite faces compact underdog
+1,2,Neutral Stadium,Sample City,Sample Country,true,Europe/Moscow,3,3,0,0,humid,27,natural,TBD,0.8,0.9,0.3,0.1,Upset draw path exists through transition chances
+1,3,Neutral Stadium,Sample City,Sample Country,true,Europe/Moscow,3,4,0,0,clear,23,natural,TBD,0.8,0.9,0.2,0.1,Low-total profile
+1,4,Neutral Stadium,Sample City,Sample Country,true,Europe/Moscow,4,4,0,0,clear,22,natural,TBD,0.7,0.9,0.4,0.1,Portugal favorite but draw hedge is not crazy
