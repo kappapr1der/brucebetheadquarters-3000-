@@ -1,0 +1,9 @@
+services:
+  brucebet:
+    build: .
+    container_name: brucebet-3000
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
