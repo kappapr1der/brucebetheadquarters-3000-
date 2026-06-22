@@ -1,0 +1,9 @@
+name,short_name,country,confederation,fifa_rank,elo_rating,market_value_m_eur,manager,preferred_formation,attack_rating,defense_rating,transition_rating,set_piece_rating,goalkeeper_rating,style_tags,notes,updated_at
+Belgium,BEL,Belgium,UEFA,8,1860,420,TBD,4-2-3-1,7.5,7.0,7.2,6.8,7.1,possession;patient;aging_core,Strong favorite on paper but not a 4:0 machine,2026-06-22T12:00:00+03:00
+Iran,IRN,Iran,AFC,20,1750,75,TBD,4-4-2,5.8,6.7,6.2,6.4,6.0,compact;low_block;set_pieces,Can drag favorites into ugly low-event games,2026-06-22T12:00:00+03:00
+Uruguay,URU,Uruguay,CONMEBOL,15,1825,310,TBD,4-3-3,7.1,6.9,7.4,6.5,6.8,pressing;vertical;physical,High ceiling but can leave transition space,2026-06-22T12:00:00+03:00
+Cape Verde,CPV,Cape Verde,CAF,65,1580,38,TBD,4-2-3-1,5.7,5.8,6.0,5.5,5.9,compact;counter;underdog,Dangerous if opponent overcommits,2026-06-22T12:00:00+03:00
+Ecuador,ECU,Ecuador,CONMEBOL,24,1775,245,TBD,4-3-3,6.6,7.2,7.0,6.1,6.7,athletic;pressing;low_scoring,Good defensive base,2026-06-22T12:00:00+03:00
+Curacao,CUW,Curacao,CONCACAF,82,1510,42,TBD,5-4-1,5.1,5.9,5.4,5.2,5.8,low_block;counter;deep_defense,Can make the game ugly,2026-06-22T12:00:00+03:00
+Portugal,POR,Portugal,UEFA,6,1885,980,TBD,4-3-3,8.4,7.4,7.8,7.0,7.3,technical;wide_attacks;depth,Favorite with enough depth for rotation,2026-06-22T12:00:00+03:00
+DR Congo,COD,DR Congo,CAF,58,1615,110,TBD,4-2-3-1,6.2,6.1,6.7,5.7,6.0,physical;transition;volatile,Can hurt favorites on counters,2026-06-22T12:00:00+03:00
