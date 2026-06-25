@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import sqlite3
 
 from .scoring import Score, is_prediction_eligible, parse_datetime, parse_score, score_prediction
+from .storage import active_season, active_season_id
 
 
 @dataclass
@@ -49,17 +50,35 @@ class RoundDeadline:
 
 
 def _participants(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    return list(conn.execute("SELECT * FROM participants ORDER BY name"))
+    season_id = active_season_id(conn)
+    return list(
+        conn.execute(
+            """
+            SELECT
+                p.id,
+                p.name,
+                COALESCE(sp.paid, p.paid) AS paid,
+                COALESCE(sp.active, 1) AS active
+            FROM participants p
+            LEFT JOIN season_participants sp
+                ON sp.participant_id = p.id AND sp.season_id = ?
+            WHERE COALESCE(sp.active, 1) = 1
+            ORDER BY p.name
+            """,
+            (season_id,),
+        )
+    )
 
 
 def _scored_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    season_id = active_season_id(conn)
     return list(
         conn.execute(
             """
             SELECT
                 p.name AS participant,
                 p.id AS participant_id,
-                p.paid,
+                COALESCE(sp.paid, p.paid) AS paid,
                 r.id AS round_id,
                 r.sort_order AS round_order,
                 r.deadline_at AS round_deadline_at,
@@ -72,11 +91,16 @@ def _scored_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                 pr.score,
                 pr.submitted_at
             FROM predictions pr
-            JOIN participants p ON p.id = pr.participant_id
             JOIN matches m ON m.id = pr.match_id
             JOIN rounds r ON r.id = m.round_id
+            JOIN participants p ON p.id = pr.participant_id
+            LEFT JOIN season_participants sp
+                ON sp.participant_id = p.id AND sp.season_id = r.season_id
+            WHERE r.season_id = ?
+              AND COALESCE(sp.active, 1) = 1
             ORDER BY r.sort_order, m.position, p.name
-            """
+            """,
+            (season_id,),
         )
     )
 
@@ -111,7 +135,10 @@ def compute_standings(
     }
     round_orders = [
         int(row["sort_order"])
-        for row in conn.execute("SELECT sort_order FROM rounds ORDER BY sort_order")
+        for row in conn.execute(
+            "SELECT sort_order FROM rounds WHERE season_id = ? ORDER BY sort_order",
+            (active_season_id(conn),),
+        )
     ]
 
     for row in _scored_rows(conn):
@@ -233,6 +260,7 @@ def field_summary(conn: sqlite3.Connection, match_id: int) -> dict[str, Counter]
 
 
 def round_deadlines(conn: sqlite3.Connection, lock_minutes: int = 90) -> list[RoundDeadline]:
+    season_id = active_season_id(conn)
     rows = list(
         conn.execute(
             """
@@ -243,9 +271,11 @@ def round_deadlines(conn: sqlite3.Connection, lock_minutes: int = 90) -> list[Ro
                 MIN(m.kickoff_at) AS first_kickoff_at
             FROM rounds r
             LEFT JOIN matches m ON m.round_id = r.id
+            WHERE r.season_id = ?
             GROUP BY r.id
             ORDER BY r.sort_order
-            """
+            """,
+            (season_id,),
         )
     )
     deadlines: list[RoundDeadline] = []
@@ -266,6 +296,190 @@ def round_deadlines(conn: sqlite3.Connection, lock_minutes: int = 90) -> list[Ro
             )
         )
     return deadlines
+
+
+def _aware_for_compare(value: datetime | None, now: datetime) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=now.tzinfo)
+    return value.astimezone(now.tzinfo)
+
+
+def target_round_name(conn: sqlite3.Connection, lock_minutes: int = 90) -> str | None:
+    now = datetime.now().astimezone()
+    deadlines = round_deadlines(conn, lock_minutes=lock_minutes)
+    future = [
+        item
+        for item in deadlines
+        if _aware_for_compare(item.effective_deadline_at, now) is not None
+        and _aware_for_compare(item.effective_deadline_at, now) >= now
+    ]
+    if future:
+        return future[0].round_name
+    if deadlines:
+        return deadlines[-1].round_name
+    return None
+
+
+def match_rows_for_round(conn: sqlite3.Connection, round_name: str | None = None) -> list[sqlite3.Row]:
+    season_id = active_season_id(conn)
+    if round_name is None:
+        round_name = target_round_name(conn)
+    if round_name is None:
+        return []
+    return list(
+        conn.execute(
+            """
+            SELECT m.*, r.name AS round_name, r.sort_order, r.deadline_at
+            FROM matches m
+            JOIN rounds r ON r.id = m.round_id
+            WHERE r.season_id = ? AND r.name = ?
+            ORDER BY m.position
+            """,
+            (season_id, round_name),
+        )
+    )
+
+
+def risk_map(conn: sqlite3.Connection, round_name: str | None = None) -> dict[str, object]:
+    matches = match_rows_for_round(conn, round_name)
+    if not matches:
+        return {"round_name": round_name, "safe": [], "slippery": [], "risk": [], "unknown": []}
+
+    categories: dict[str, list[dict[str, object]]] = {"safe": [], "slippery": [], "risk": [], "unknown": []}
+    for match in matches:
+        summary = field_summary(conn, int(match["id"]))
+        outcomes = summary["outcomes"]
+        total = sum(outcomes.values())
+        top = outcomes.most_common(1)[0] if outcomes else ("", 0)
+        top_share = top[1] / total if total else 0.0
+        assessment = conn.execute(
+            "SELECT risk_level, suggested_score, contrarian_note FROM match_assessments WHERE match_id = ?",
+            (int(match["id"]),),
+        ).fetchone()
+        risk_level = assessment["risk_level"] if assessment and assessment["risk_level"] else None
+        if risk_level in {"low", "safe"}:
+            bucket = "safe"
+        elif risk_level in {"high", "risk"}:
+            bucket = "risk"
+        elif risk_level == "medium":
+            bucket = "slippery"
+        elif total == 0:
+            bucket = "unknown"
+        elif top_share >= 0.75:
+            bucket = "safe"
+        elif top_share >= 0.55:
+            bucket = "slippery"
+        else:
+            bucket = "risk"
+
+        categories[bucket].append(
+            {
+                "match_id": int(match["id"]),
+                "round_name": match["round_name"],
+                "position": int(match["position"]),
+                "label": f"{match['home']} - {match['away']}",
+                "top_outcome": top[0],
+                "top_share": round(top_share, 2),
+                "predictions": total,
+                "suggested_score": assessment["suggested_score"] if assessment else "",
+                "contrarian_note": assessment["contrarian_note"] if assessment else "",
+            }
+        )
+    return {"round_name": matches[0]["round_name"], **categories}
+
+
+def hq_summary(
+    conn: sqlite3.Connection,
+    user_participant: str = "Bruce Wayne",
+    lock_minutes: int = 90,
+) -> dict[str, object]:
+    season = active_season(conn)
+    round_name = target_round_name(conn, lock_minutes=lock_minutes)
+    matches = match_rows_for_round(conn, round_name)
+    deadlines = {item.round_name: item for item in round_deadlines(conn, lock_minutes=lock_minutes)}
+    deadline = deadlines.get(round_name) if round_name else None
+    participants = _participants(conn)
+    paid_count = sum(1 for row in participants if bool(row["paid"]))
+    season_id = active_season_id(conn)
+
+    prediction_counts = {"participants": 0, "rows": 0, "mine": 0}
+    if round_name:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS rows_count, COUNT(DISTINCT pr.participant_id) AS participants_count
+            FROM predictions pr
+            JOIN matches m ON m.id = pr.match_id
+            JOIN rounds r ON r.id = m.round_id
+            WHERE r.season_id = ? AND r.name = ?
+            """,
+            (season_id, round_name),
+        ).fetchone()
+        mine = conn.execute(
+            """
+            SELECT COUNT(*) AS rows_count
+            FROM predictions pr
+            JOIN participants p ON p.id = pr.participant_id
+            JOIN matches m ON m.id = pr.match_id
+            JOIN rounds r ON r.id = m.round_id
+            WHERE r.season_id = ? AND r.name = ? AND lower(p.name) = lower(?)
+            """,
+            (season_id, round_name, user_participant),
+        ).fetchone()
+        prediction_counts = {
+            "participants": int(row["participants_count"]),
+            "rows": int(row["rows_count"]),
+            "mine": int(mine["rows_count"]),
+        }
+
+    risk = risk_map(conn, round_name)
+    return {
+        "season": season,
+        "round_name": round_name,
+        "deadline": deadline,
+        "match_count": len(matches),
+        "participant_count": len(participants),
+        "paid_count": paid_count,
+        "bank_rub": paid_count * int(season["entry_fee_rub"]),
+        "predictions": prediction_counts,
+        "risk": risk,
+    }
+
+
+def strategy_summary(
+    conn: sqlite3.Connection,
+    user_participant: str = "Bruce Wayne",
+    lock_minutes: int = 90,
+) -> dict[str, object]:
+    standings = compute_standings(conn, lock_minutes=lock_minutes)
+    me = next((item for item in standings if item.name.lower() == user_participant.lower()), None)
+    leader = standings[0] if standings else None
+    gap = (leader.total - me.total) if leader and me else None
+    if me is None or leader is None:
+        mode = "unknown"
+        advice = "Нужны участники и хотя бы часть прогнозов/результатов, чтобы строить стратегию."
+    elif me.rank == 1:
+        mode = "protect"
+        advice = "Ты впереди. Играй базу, отличайся точечно: 1-2 матча, где поле реально переоценивает фаворита."
+    elif gap is not None and gap <= 3:
+        mode = "balanced"
+        advice = "Отставание небольшое. Не надо ломать тур: ищи 1-2 аккуратных отличия от поля."
+    elif gap is not None and gap <= 8:
+        mode = "chase"
+        advice = "Нужно догонять, но не широким фронтом. Цель: 2-3 отличия, в основном в риск-матчах."
+    else:
+        mode = "aggressive"
+        advice = "Нужен апсайд. Ищи 3-4 отличия, но избегай бессмысленных 4:0 и случайных побед аутсайдера."
+    return {
+        "user": user_participant,
+        "me": me,
+        "leader": leader,
+        "gap": gap,
+        "mode": mode,
+        "advice": advice,
+        "risk": risk_map(conn),
+    }
 
 
 def recommend_match(conn: sqlite3.Connection, match_id: int) -> dict[str, object]:
@@ -316,6 +530,7 @@ def compare_participants(
     opponent: str,
     lock_minutes: int = 90,
 ) -> list[dict[str, object]]:
+    season_id = active_season_id(conn)
     rows = list(
         conn.execute(
             """
@@ -339,10 +554,12 @@ def compare_participants(
             JOIN participants me ON me.id = mine.participant_id
             JOIN predictions opp ON opp.match_id = m.id
             JOIN participants opponent ON opponent.id = opp.participant_id
-            WHERE lower(me.name) = lower(?) AND lower(opponent.name) = lower(?)
+            WHERE r.season_id = ?
+              AND lower(me.name) = lower(?)
+              AND lower(opponent.name) = lower(?)
             ORDER BY r.sort_order, m.position
             """,
-            (me, opponent),
+            (season_id, me, opponent),
         )
     )
     comparison: list[dict[str, object]] = []
