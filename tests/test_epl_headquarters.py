@@ -1,7 +1,9 @@
 from pathlib import Path
 import unittest
 
-from brucebet.analytics import hq_summary, risk_map, strategy_summary
+from datetime import datetime
+
+from brucebet.analytics import calendar_matches, hq_summary, next_calendar_match, player_status_summary, risk_map, strategy_summary
 from brucebet.storage import (
     connect,
     init_db,
@@ -11,6 +13,7 @@ from brucebet.storage import (
     import_match_odds,
     import_matches,
     import_participants,
+    import_player_statuses,
     import_predictions,
     import_team_form,
     import_team_match_factors,
@@ -32,6 +35,7 @@ def load_epl_sample():
     import_predictions(conn, EXAMPLES / "predictions.csv")
     import_team_form(conn, EXAMPLES / "team_form.csv")
     import_absences(conn, EXAMPLES / "absences.csv")
+    import_player_statuses(conn, EXAMPLES / "player_statuses.csv")
     import_match_contexts(conn, EXAMPLES / "match_contexts.csv")
     import_match_odds(conn, EXAMPLES / "match_odds.csv")
     import_team_match_factors(conn, EXAMPLES / "team_match_factors.csv")
@@ -68,6 +72,33 @@ class EplHeadquartersTest(unittest.TestCase):
         self.assertEqual(item["mode"], "protect")
         self.assertEqual(item["me"].name, "Bruce Wayne")
         self.assertEqual(item["gap"], 0)
+
+    def test_calendar_finds_next_match_and_round(self) -> None:
+        conn = load_epl_sample()
+        item = next_calendar_match(conn, user_participant="Bruce Wayne")
+
+        self.assertIsNotNone(item)
+        self.assertEqual(item.label, "Brighton - Newcastle")
+        self.assertEqual(item.deadline_at.isoformat(), "2026-08-16T14:30:00+03:00")
+        self.assertEqual(item.my_prediction_count, 1)
+
+        round_items = calendar_matches(
+            conn,
+            round_name="1",
+            start_at=datetime(2026, 1, 1).astimezone(),
+            days=365,
+            user_participant="Bruce Wayne",
+        )
+        self.assertEqual(len(round_items), 4)
+
+    def test_player_status_summary_tracks_latest_player_variables(self) -> None:
+        conn = load_epl_sample()
+        rows = player_status_summary(conn, "Arsenal")
+
+        self.assertEqual({row["player"] for row in rows}, {"Example CF", "Example LB"})
+        left_back = next(row for row in rows if row["player"] == "Example LB")
+        self.assertEqual(left_back["status"], "doubtful")
+        self.assertEqual(left_back["availability_pct"], 50)
 
     def test_old_round_unique_constraint_is_migrated_to_seasons(self) -> None:
         conn = connect(":memory:")

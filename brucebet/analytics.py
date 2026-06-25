@@ -49,6 +49,20 @@ class RoundDeadline:
         return self.computed_deadline_at or self.stored_deadline_at
 
 
+@dataclass(frozen=True)
+class CalendarItem:
+    match_id: int
+    round_name: str
+    position: int
+    label: str
+    kickoff_at: datetime | None
+    deadline_at: datetime | None
+    status: str
+    prediction_count: int
+    my_prediction_count: int
+    result: str | None
+
+
 def _participants(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     season_id = active_season_id(conn)
     return list(
@@ -304,6 +318,125 @@ def _aware_for_compare(value: datetime | None, now: datetime) -> datetime | None
     if value.tzinfo is None:
         return value.replace(tzinfo=now.tzinfo)
     return value.astimezone(now.tzinfo)
+
+
+def _match_deadline(
+    kickoff_at: datetime | None,
+    round_deadline_at: datetime | None,
+    lock_minutes: int,
+) -> datetime | None:
+    if kickoff_at is not None:
+        return kickoff_at - timedelta(minutes=lock_minutes)
+    return round_deadline_at
+
+
+def _calendar_status(
+    kickoff_at: datetime | None,
+    deadline_at: datetime | None,
+    result: str | None,
+    now: datetime,
+) -> str:
+    if result:
+        return "played"
+    comparable_deadline = _aware_for_compare(deadline_at, now)
+    comparable_kickoff = _aware_for_compare(kickoff_at, now)
+    if comparable_deadline is not None and comparable_deadline < now:
+        return "locked"
+    if comparable_deadline is not None and comparable_deadline <= now + timedelta(hours=6):
+        return "deadline_soon"
+    if comparable_kickoff is not None and comparable_kickoff.date() == now.date():
+        return "today"
+    return "scheduled"
+
+
+def calendar_matches(
+    conn: sqlite3.Connection,
+    days: int = 7,
+    user_participant: str = "Bruce Wayne",
+    lock_minutes: int = 90,
+    round_name: str | None = None,
+    start_at: datetime | None = None,
+    limit: int = 50,
+    include_unknown_kickoff: bool = False,
+) -> list[CalendarItem]:
+    season_id = active_season_id(conn)
+    now = start_at or datetime.now().astimezone()
+    until = now + timedelta(days=days)
+    params: list[object] = [user_participant, season_id]
+    round_filter = ""
+    if round_name:
+        round_filter = "AND r.name = ?"
+        params.append(round_name)
+    rows = list(
+        conn.execute(
+            f"""
+            SELECT
+                m.id,
+                m.position,
+                m.home,
+                m.away,
+                m.kickoff_at,
+                m.result,
+                r.name AS round_name,
+                r.sort_order,
+                r.deadline_at AS round_deadline_at,
+                COUNT(pr.id) AS prediction_count,
+                SUM(CASE WHEN lower(p.name) = lower(?) THEN 1 ELSE 0 END) AS my_prediction_count
+            FROM matches m
+            JOIN rounds r ON r.id = m.round_id
+            LEFT JOIN predictions pr ON pr.match_id = m.id
+            LEFT JOIN participants p ON p.id = pr.participant_id
+            WHERE r.season_id = ?
+            {round_filter}
+            GROUP BY m.id
+            ORDER BY r.sort_order, m.position
+            """,
+            params,
+        )
+    )
+    items: list[CalendarItem] = []
+    for row in rows:
+        kickoff_at = parse_datetime(row["kickoff_at"])
+        comparable_kickoff = _aware_for_compare(kickoff_at, now)
+        if comparable_kickoff is None:
+            if not include_unknown_kickoff:
+                continue
+        elif comparable_kickoff < now or comparable_kickoff > until:
+            continue
+        round_deadline_at = parse_datetime(row["round_deadline_at"])
+        deadline_at = _match_deadline(kickoff_at, round_deadline_at, lock_minutes)
+        items.append(
+            CalendarItem(
+                match_id=int(row["id"]),
+                round_name=row["round_name"],
+                position=int(row["position"]),
+                label=f"{row['home']} - {row['away']}",
+                kickoff_at=kickoff_at,
+                deadline_at=deadline_at,
+                status=_calendar_status(kickoff_at, deadline_at, row["result"], now),
+                prediction_count=int(row["prediction_count"]),
+                my_prediction_count=int(row["my_prediction_count"] or 0),
+                result=row["result"],
+            )
+        )
+        if len(items) >= limit:
+            break
+    return items
+
+
+def next_calendar_match(
+    conn: sqlite3.Connection,
+    user_participant: str = "Bruce Wayne",
+    lock_minutes: int = 90,
+) -> CalendarItem | None:
+    matches = calendar_matches(
+        conn,
+        days=370,
+        user_participant=user_participant,
+        lock_minutes=lock_minutes,
+        limit=50,
+    )
+    return next((item for item in matches if not item.result), None)
 
 
 def target_round_name(conn: sqlite3.Connection, lock_minutes: int = 90) -> str | None:
@@ -657,6 +790,51 @@ def team_profile(conn: sqlite3.Connection, query: str, form_limit: int = 5) -> d
         )
     )
     return {"team": team, "form": form, "absences": absences}
+
+
+def player_status_summary(
+    conn: sqlite3.Connection,
+    team_query: str | None = None,
+    limit: int = 30,
+) -> list[sqlite3.Row]:
+    params: list[object] = []
+    team_filter = ""
+    if team_query:
+        team = find_team(conn, team_query)
+        team_filter = "AND ps.team_id = ?"
+        params.append(int(team["id"]))
+    params.append(limit)
+    return list(
+        conn.execute(
+            f"""
+            SELECT ps.*, t.name AS team
+            FROM player_status_snapshots ps
+            JOIN teams t ON t.id = ps.team_id
+            JOIN (
+                SELECT team_id, player, MAX(updated_at) AS updated_at
+                FROM player_status_snapshots
+                GROUP BY team_id, player
+            ) latest
+              ON latest.team_id = ps.team_id
+             AND latest.player = ps.player
+             AND latest.updated_at = ps.updated_at
+            WHERE 1 = 1
+            {team_filter}
+            ORDER BY
+                CASE
+                    WHEN ps.status IN ('out', 'injured', 'suspended') THEN 0
+                    WHEN ps.status IN ('doubtful', 'questionable') THEN 1
+                    ELSE 2
+                END,
+                ps.availability_pct ASC NULLS LAST,
+                ps.form_rating DESC NULLS LAST,
+                t.name,
+                ps.player
+            LIMIT ?
+            """,
+            params,
+        )
+    )
 
 
 def match_dossier(conn: sqlite3.Connection, match_id: int) -> dict[str, object]:

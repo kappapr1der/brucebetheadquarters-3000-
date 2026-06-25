@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
+import os
 from pathlib import Path
 import shutil
 import sys
 
 from .analytics import (
+    calendar_matches,
     compare_participants,
     compute_standings,
     field_summary,
     hq_summary,
     match_header,
     match_dossier,
+    next_calendar_match,
+    player_status_summary,
     prediction_is_eligible,
     prediction_views_for_match,
     recommend_match,
@@ -21,6 +26,17 @@ from .analytics import (
     team_profile,
 )
 from .scoring import is_standard_score, normalize_score, parse_datetime, parse_score
+from .odds_api import (
+    DEFAULT_ODDS_BOOKMAKER,
+    DEFAULT_ODDS_MARKETS,
+    DEFAULT_ODDS_REGIONS,
+    DEFAULT_ODDS_SPORT,
+    OddsApiError,
+    TheOddsApiClient,
+    sync_odds_to_db,
+)
+from .pl_fixtures import DEFAULT_PL_COMPSEASON_ID, DEFAULT_PL_SEASON_LABEL, PremierLeagueApiError, sync_pl_fixtures_to_db
+from .sources import SourceConfig, check_all_sources
 from .storage import (
     activate_profile,
     active_season,
@@ -32,6 +48,7 @@ from .storage import (
     import_match_odds,
     import_matches,
     import_participants,
+    import_player_statuses,
     import_predictions,
     import_team_form,
     import_team_match_factors,
@@ -39,6 +56,7 @@ from .storage import (
     init_db,
     reset_db,
 )
+from .variable_sync import VariableSyncResult, sync_match_variables
 from .vk_parser import parse_file as parse_vk_file
 
 
@@ -83,6 +101,58 @@ def print_key_values(items: list[tuple[str, object]]) -> None:
         print_rows(["field", "value"], rows)
 
 
+def odds_api_key() -> str:
+    return os.getenv("THE_ODDS_API_KEY", "").strip()
+
+
+def env_default(name: str, fallback: str) -> str:
+    return os.getenv(name, fallback).strip() or fallback
+
+
+def print_odds_quota(remaining: int | None, used: int | None, last: int | None) -> None:
+    print_key_values(
+        [
+            ("requests_remaining", remaining),
+            ("requests_used", used),
+            ("requests_last", last),
+        ]
+    )
+
+
+def variable_sync_rows(result: VariableSyncResult) -> list[tuple[str, object]]:
+    rows: list[tuple[str, object]] = [
+        ("updated_at", result.updated_at),
+        ("fpl_players_seen", result.fpl_players_seen),
+        ("fpl_players_imported", result.fpl_players_imported),
+        ("fpl_teams_matched", result.fpl_teams_matched),
+        ("elo_teams_checked", result.elo_teams_checked),
+        ("elo_teams_updated", result.elo_teams_updated),
+        ("contexts_upserted", result.contexts_upserted),
+        ("factors_upserted", result.factors_upserted),
+        ("weather_checked", result.weather_checked),
+        ("weather_updated", result.weather_updated),
+        ("weather_skipped", result.weather_skipped),
+        ("assessments_upserted", result.assessments_upserted),
+    ]
+    if result.fpl_unmatched_teams:
+        rows.append(("fpl_unmatched_teams", ", ".join(result.fpl_unmatched_teams[:12])))
+    if result.elo_unmatched_teams:
+        rows.append(("elo_unmatched_teams", ", ".join(result.elo_unmatched_teams[:12])))
+    if result.errors:
+        rows.append(("errors", " | ".join(result.errors)))
+    return rows
+
+
+def source_config_from_env(timeout: int = 20) -> SourceConfig:
+    return SourceConfig(
+        the_odds_api_key=os.getenv("THE_ODDS_API_KEY", "").strip(),
+        api_football_key=os.getenv("API_FOOTBALL_KEY", "").strip(),
+        football_data_token=os.getenv("FOOTBALL_DATA_TOKEN", "").strip(),
+        thesportsdb_key=os.getenv("THESPORTSDB_KEY", "123").strip() or "123",
+        timeout=timeout,
+    )
+
+
 def print_risk_map(item: dict[str, object]) -> None:
     labels = [("safe", "Safe"), ("slippery", "Slippery"), ("risk", "Risk"), ("unknown", "Unknown")]
     print(f"Round: {clean(item.get('round_name'))}")
@@ -101,6 +171,26 @@ def print_risk_map(item: dict[str, object]) -> None:
         print()
         print(f"{title}:")
         print_rows(["#", "match", "top", "share", "n", "base"], rows)
+
+
+def print_calendar_items(items: list[object]) -> None:
+    print_rows(
+        ["round", "#", "match", "kickoff", "deadline", "status", "mine", "field", "result"],
+        [
+            [
+                item.round_name,
+                item.position,
+                item.label,
+                clean(item.kickoff_at.isoformat() if item.kickoff_at else None),
+                clean(item.deadline_at.isoformat() if item.deadline_at else None),
+                item.status,
+                "yes" if item.my_prediction_count else "no",
+                item.prediction_count,
+                clean(item.result),
+            ]
+            for item in items
+        ],
+    )
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -126,6 +216,8 @@ def cmd_import(args: argparse.Namespace) -> int:
         totals.append(f"team_form={import_team_form(conn, args.team_form)}")
     if args.absences:
         totals.append(f"absences={import_absences(conn, args.absences)}")
+    if args.player_statuses:
+        totals.append(f"player_statuses={import_player_statuses(conn, args.player_statuses)}")
     if args.contexts:
         totals.append(f"contexts={import_match_contexts(conn, args.contexts)}")
     if args.odds:
@@ -147,6 +239,7 @@ def cmd_load_sample(args: argparse.Namespace) -> int:
     import_predictions(conn, base / "predictions.csv")
     import_team_form(conn, base / "team_form.csv")
     import_absences(conn, base / "absences.csv")
+    import_player_statuses(conn, base / "player_statuses.csv")
     import_match_contexts(conn, base / "match_contexts.csv")
     import_match_odds(conn, base / "match_odds.csv")
     import_team_match_factors(conn, base / "team_match_factors.csv")
@@ -240,6 +333,88 @@ def cmd_deadlines(args: argparse.Namespace) -> int:
             ]
         )
     print_rows(["round", "first_kickoff", "stored_deadline", "computed_deadline", "effective"], rows)
+    return 0
+
+
+def cmd_calendar(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    items = calendar_matches(
+        conn,
+        days=args.days,
+        user_participant=args.user,
+        lock_minutes=args.lock_minutes,
+        round_name=args.round,
+        limit=args.limit,
+        include_unknown_kickoff=args.include_unknown,
+    )
+    print_calendar_items(items)
+    return 0
+
+
+def cmd_today(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    items = calendar_matches(
+        conn,
+        days=1,
+        user_participant=args.user,
+        lock_minutes=args.lock_minutes,
+        start_at=today,
+        limit=args.limit,
+    )
+    print_calendar_items(items)
+    return 0
+
+
+def cmd_week(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    items = calendar_matches(
+        conn,
+        days=7,
+        user_participant=args.user,
+        lock_minutes=args.lock_minutes,
+        limit=args.limit,
+    )
+    print_calendar_items(items)
+    return 0
+
+
+def cmd_next(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    item = next_calendar_match(conn, user_participant=args.user, lock_minutes=args.lock_minutes)
+    if item is None:
+        print("No upcoming matches with kickoff_at.")
+        return 0
+    print_key_values(
+        [
+            ("round", item.round_name),
+            ("position", item.position),
+            ("match", item.label),
+            ("kickoff", item.kickoff_at.isoformat() if item.kickoff_at else None),
+            ("deadline", item.deadline_at.isoformat() if item.deadline_at else None),
+            ("status", item.status),
+            ("your_forecast", "yes" if item.my_prediction_count else "no"),
+            ("field_predictions", item.prediction_count),
+            ("result", item.result),
+        ]
+    )
+    return 0
+
+
+def cmd_round_calendar(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    start = datetime(1900, 1, 1).astimezone()
+    items = calendar_matches(
+        conn,
+        days=60000,
+        user_participant=args.user,
+        lock_minutes=args.lock_minutes,
+        round_name=args.round,
+        start_at=start,
+        limit=args.limit,
+        include_unknown_kickoff=True,
+    )
+    print_calendar_items(items)
     return 0
 
 
@@ -404,6 +579,30 @@ def cmd_team(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_variables(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    rows = player_status_summary(conn, args.team, limit=args.limit)
+    print_rows(
+        ["team", "player", "role", "status", "avail", "form", "min5", "starts5", "source", "updated"],
+        [
+            [
+                row["team"],
+                row["player"],
+                clean(row["role"]),
+                clean(row["status"]),
+                clean(row["availability_pct"]),
+                clean(row["form_rating"]),
+                clean(row["minutes_last_5"]),
+                clean(row["starts_last_5"]),
+                clean(row["source"]),
+                clean(row["updated_at"]),
+            ]
+            for row in rows
+        ],
+    )
+    return 0
+
+
 def cmd_dossier(args: argparse.Namespace) -> int:
     conn = open_db(args)
     match = find_match(conn, args.query)
@@ -533,6 +732,149 @@ def cmd_dossier(args: argparse.Namespace) -> int:
             ]
         )
     return 0
+
+
+def cmd_odds(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    match = find_match(conn, args.query)
+    dossier = match_dossier(conn, int(match["id"]))
+    print(match_header(dossier["match"]))
+    if not dossier["odds"]:
+        print("No stored odds snapshots.")
+        return 0
+    print_rows(
+        ["bookmaker", "captured_at", "home", "draw", "away", "u2.5", "o2.5", "btts_y", "btts_n"],
+        [
+            [
+                row["bookmaker"],
+                row["captured_at"],
+                clean(row["home_win"]),
+                clean(row["draw"]),
+                clean(row["away_win"]),
+                clean(row["under_2_5"]),
+                clean(row["over_2_5"]),
+                clean(row["btts_yes"]),
+                clean(row["btts_no"]),
+            ]
+            for row in dossier["odds"][: args.limit]
+        ],
+    )
+    return 0
+
+
+def cmd_quota(args: argparse.Namespace) -> int:
+    key = odds_api_key()
+    if not key:
+        print("THE_ODDS_API_KEY is not set.", file=sys.stderr)
+        return 2
+    try:
+        check = TheOddsApiClient(key).sports(all_sports=args.all)
+    except OddsApiError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print_key_values(
+        [
+            ("ok", check.ok),
+            ("sports_count", check.sports_count),
+            ("sport_present", args.sport in check.sport_keys),
+        ]
+    )
+    print_odds_quota(check.quota.requests_remaining, check.quota.requests_used, check.quota.requests_last)
+    return 0
+
+
+def cmd_sync_odds(args: argparse.Namespace) -> int:
+    key = odds_api_key()
+    if not key:
+        print("THE_ODDS_API_KEY is not set.", file=sys.stderr)
+        return 2
+    conn = open_db(args)
+    try:
+        result = sync_odds_to_db(
+            conn,
+            api_key=key,
+            sport=args.sport,
+            regions=args.regions,
+            markets=args.markets,
+            bookmaker=args.bookmaker,
+            days_ahead=args.days,
+        )
+    except OddsApiError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print_key_values(
+        [
+            ("sport", result.sport),
+            ("regions", result.regions),
+            ("markets", result.markets),
+            ("bookmaker", result.bookmaker),
+            ("captured_at", result.captured_at),
+            ("events_seen", result.events_seen),
+            ("matched", result.matched),
+            ("inserted", result.inserted),
+            ("unmatched", len(result.unmatched)),
+        ]
+    )
+    print_odds_quota(result.quota.requests_remaining, result.quota.requests_used, result.quota.requests_last)
+    if result.unmatched:
+        print()
+        print("Unmatched events:")
+        for item in result.unmatched[: args.show_unmatched]:
+            print(f"- {item}")
+    return 0
+
+
+def cmd_sources(args: argparse.Namespace) -> int:
+    checks = check_all_sources(source_config_from_env(timeout=args.timeout))
+    print_rows(
+        ["source", "ok", "configured", "detail"],
+        [[item.name, "yes" if item.ok else "no", "yes" if item.configured else "no", item.detail] for item in checks],
+    )
+    return 0 if all(item.ok for item in checks if item.configured) else 1
+
+
+def cmd_sync_fixtures(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    try:
+        result = sync_pl_fixtures_to_db(
+            conn,
+            compseason_id=args.compseason_id,
+            season_label=args.season_label,
+            timezone_name=args.timezone,
+        )
+    except PremierLeagueApiError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print_key_values(
+        [
+            ("source", result.source),
+            ("compseason_id", result.compseason_id),
+            ("season_label", result.season_label),
+            ("fetched", result.fetched),
+            ("imported", result.imported),
+            ("rounds", result.rounds),
+            ("first_kickoff", result.first_kickoff),
+            ("last_kickoff", result.last_kickoff),
+        ]
+    )
+    return 0
+
+
+def cmd_sync_variables(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    result = sync_match_variables(
+        conn,
+        days_ahead=args.days,
+        weather_days=args.weather_days,
+        timeout=args.timeout,
+        timezone_name=args.timezone,
+        include_fpl=not args.skip_fpl,
+        include_elo=not args.skip_elo,
+        include_context=not args.skip_context,
+        include_assessments=not args.skip_assessments,
+    )
+    print_key_values(variable_sync_rows(result))
+    return 0 if not result.errors else 1
 
 
 def cmd_audit(args: argparse.Namespace) -> int:
@@ -666,6 +1008,7 @@ def cmd_copy_examples(args: argparse.Namespace) -> int:
         "predictions.csv",
         "team_form.csv",
         "absences.csv",
+        "player_statuses.csv",
         "match_contexts.csv",
         "match_odds.csv",
         "team_match_factors.csv",
@@ -710,6 +1053,7 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--predictions")
     imp.add_argument("--team-form")
     imp.add_argument("--absences")
+    imp.add_argument("--player-statuses")
     imp.add_argument("--contexts")
     imp.add_argument("--odds")
     imp.add_argument("--factors")
@@ -739,6 +1083,29 @@ def build_parser() -> argparse.ArgumentParser:
     deadlines = sub.add_parser("deadlines", help="Show round deadlines.")
     deadlines.set_defaults(func=cmd_deadlines)
 
+    calendar = sub.add_parser("calendar", help="Show upcoming match calendar.")
+    calendar.add_argument("--days", type=int, default=14)
+    calendar.add_argument("--limit", type=int, default=30)
+    calendar.add_argument("--round")
+    calendar.add_argument("--include-unknown", action="store_true")
+    calendar.set_defaults(func=cmd_calendar)
+
+    today = sub.add_parser("today", help="Show today's matches.")
+    today.add_argument("--limit", type=int, default=30)
+    today.set_defaults(func=cmd_today)
+
+    week = sub.add_parser("week", help="Show the next seven days.")
+    week.add_argument("--limit", type=int, default=30)
+    week.set_defaults(func=cmd_week)
+
+    next_match = sub.add_parser("next", help="Show the next scheduled match.")
+    next_match.set_defaults(func=cmd_next)
+
+    round_calendar = sub.add_parser("round", help="Show one round calendar.")
+    round_calendar.add_argument("round")
+    round_calendar.add_argument("--limit", type=int, default=40)
+    round_calendar.set_defaults(func=cmd_round_calendar)
+
     hq = sub.add_parser("hq", help="Show headquarters summary for the active round.")
     hq.set_defaults(func=cmd_hq)
 
@@ -763,9 +1130,54 @@ def build_parser() -> argparse.ArgumentParser:
     team.add_argument("query")
     team.set_defaults(func=cmd_team)
 
+    variables = sub.add_parser("variables", help="Show player availability/form snapshots.")
+    variables.add_argument("team", nargs="?")
+    variables.add_argument("--limit", type=int, default=30)
+    variables.set_defaults(func=cmd_variables)
+
     dossier = sub.add_parser("dossier", help="Show match variables: context, odds, factors, absences.")
     dossier.add_argument("query")
     dossier.set_defaults(func=cmd_dossier)
+
+    odds = sub.add_parser("odds", help="Show stored odds snapshots for one match.")
+    odds.add_argument("query")
+    odds.add_argument("--limit", type=int, default=10)
+    odds.set_defaults(func=cmd_odds)
+
+    quota = sub.add_parser("quota", help="Check The Odds API key and remaining credits.")
+    quota.add_argument("--sport", default=env_default("THE_ODDS_API_SPORT", DEFAULT_ODDS_SPORT))
+    quota.add_argument("--all", action="store_true", help="Ask The Odds API for active and inactive sports.")
+    quota.set_defaults(func=cmd_quota)
+
+    sync_odds = sub.add_parser("sync-odds", help="Fetch The Odds API snapshots into match_odds.")
+    sync_odds.add_argument("--sport", default=env_default("THE_ODDS_API_SPORT", DEFAULT_ODDS_SPORT))
+    sync_odds.add_argument("--regions", default=env_default("THE_ODDS_API_REGIONS", DEFAULT_ODDS_REGIONS))
+    sync_odds.add_argument("--markets", default=env_default("THE_ODDS_API_MARKETS", DEFAULT_ODDS_MARKETS))
+    sync_odds.add_argument("--bookmaker", default=env_default("THE_ODDS_API_BOOKMAKER", DEFAULT_ODDS_BOOKMAKER))
+    sync_odds.add_argument("--days", type=int, default=int(env_default("THE_ODDS_API_DAYS_AHEAD", "30")))
+    sync_odds.add_argument("--show-unmatched", type=int, default=10)
+    sync_odds.set_defaults(func=cmd_sync_odds)
+
+    sources = sub.add_parser("sources", help="Check configured/free data sources.")
+    sources.add_argument("--timeout", type=int, default=20)
+    sources.set_defaults(func=cmd_sources)
+
+    sync_fixtures = sub.add_parser("sync-fixtures", help="Fetch official Premier League fixtures into matches.")
+    sync_fixtures.add_argument("--compseason-id", type=int, default=int(env_default("PREMIER_LEAGUE_COMPSEASON_ID", str(DEFAULT_PL_COMPSEASON_ID))))
+    sync_fixtures.add_argument("--season-label", default=env_default("PREMIER_LEAGUE_SEASON_LABEL", DEFAULT_PL_SEASON_LABEL))
+    sync_fixtures.add_argument("--timezone", default=env_default("BRUCEBET_TIMEZONE", "Europe/Moscow"))
+    sync_fixtures.set_defaults(func=cmd_sync_fixtures)
+
+    sync_variables = sub.add_parser("sync-variables", help="Fetch FPL/ClubElo/weather/context variables into the database.")
+    sync_variables.add_argument("--days", type=int, default=int(env_default("BRUCEBET_VARIABLE_DAYS_AHEAD", "365")))
+    sync_variables.add_argument("--weather-days", type=int, default=int(env_default("BRUCEBET_WEATHER_DAYS_AHEAD", "16")))
+    sync_variables.add_argument("--timeout", type=int, default=30)
+    sync_variables.add_argument("--timezone", default=env_default("BRUCEBET_TIMEZONE", "Europe/Moscow"))
+    sync_variables.add_argument("--skip-fpl", action="store_true")
+    sync_variables.add_argument("--skip-elo", action="store_true")
+    sync_variables.add_argument("--skip-context", action="store_true")
+    sync_variables.add_argument("--skip-assessments", action="store_true")
+    sync_variables.set_defaults(func=cmd_sync_variables)
 
     audit = sub.add_parser("audit", help="Show missing, invalid, and late prediction issues.")
     audit.set_defaults(func=cmd_audit)

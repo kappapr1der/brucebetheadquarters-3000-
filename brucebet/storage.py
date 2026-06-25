@@ -138,6 +138,27 @@ CREATE TABLE IF NOT EXISTS absences (
     UNIQUE(team_id, player, status)
 );
 
+CREATE TABLE IF NOT EXISTS player_status_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    player TEXT NOT NULL,
+    role TEXT,
+    status TEXT,
+    availability_pct REAL,
+    form_rating REAL,
+    minutes_last_5 INTEGER,
+    starts_last_5 INTEGER,
+    goals_last_5 REAL,
+    assists_last_5 REAL,
+    xg_last_5 REAL,
+    xa_last_5 REAL,
+    source TEXT,
+    source_ref TEXT,
+    notes TEXT,
+    updated_at TEXT NOT NULL,
+    UNIQUE(team_id, player, source, updated_at)
+);
+
 CREATE TABLE IF NOT EXISTS match_contexts (
     match_id INTEGER PRIMARY KEY REFERENCES matches(id) ON DELETE CASCADE,
     venue TEXT,
@@ -210,9 +231,10 @@ CREATE TABLE IF NOT EXISTS match_assessments (
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
@@ -232,6 +254,7 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS match_odds;
         DROP TABLE IF EXISTS match_contexts;
         DROP TABLE IF EXISTS absences;
+        DROP TABLE IF EXISTS player_status_snapshots;
         DROP TABLE IF EXISTS team_form;
         DROP TABLE IF EXISTS predictions;
         DROP TABLE IF EXISTS matches;
@@ -750,6 +773,63 @@ def upsert_absence(conn: sqlite3.Connection, row: dict[str, str]) -> int:
     return int(db_row["id"])
 
 
+def upsert_player_status(conn: sqlite3.Connection, row: dict[str, str]) -> int:
+    team_id = ensure_team(conn, row["team"])
+    updated_at = optional_iso_datetime(row.get("updated_at"))
+    if updated_at is None:
+        raise ValueError("player_status.updated_at is required")
+    source = optional_text(row.get("source")) or "manual"
+    conn.execute(
+        """
+        INSERT INTO player_status_snapshots(
+            team_id, player, role, status, availability_pct, form_rating,
+            minutes_last_5, starts_last_5, goals_last_5, assists_last_5,
+            xg_last_5, xa_last_5, source, source_ref, notes, updated_at
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(team_id, player, source, updated_at) DO UPDATE SET
+            role = excluded.role,
+            status = excluded.status,
+            availability_pct = excluded.availability_pct,
+            form_rating = excluded.form_rating,
+            minutes_last_5 = excluded.minutes_last_5,
+            starts_last_5 = excluded.starts_last_5,
+            goals_last_5 = excluded.goals_last_5,
+            assists_last_5 = excluded.assists_last_5,
+            xg_last_5 = excluded.xg_last_5,
+            xa_last_5 = excluded.xa_last_5,
+            source_ref = excluded.source_ref,
+            notes = excluded.notes
+        """,
+        (
+            team_id,
+            row["player"].strip(),
+            optional_text(row.get("role")),
+            optional_text(row.get("status")),
+            optional_float(row.get("availability_pct")),
+            optional_float(row.get("form_rating")),
+            optional_int(row.get("minutes_last_5")),
+            optional_int(row.get("starts_last_5")),
+            optional_float(row.get("goals_last_5")),
+            optional_float(row.get("assists_last_5")),
+            optional_float(row.get("xg_last_5")),
+            optional_float(row.get("xa_last_5")),
+            source,
+            optional_text(row.get("source_ref")),
+            optional_text(row.get("notes")),
+            updated_at,
+        ),
+    )
+    db_row = conn.execute(
+        """
+        SELECT id FROM player_status_snapshots
+        WHERE team_id = ? AND player = ? AND source = ? AND updated_at = ?
+        """,
+        (team_id, row["player"].strip(), source, updated_at),
+    ).fetchone()
+    return int(db_row["id"])
+
+
 def upsert_match_context(conn: sqlite3.Connection, row: dict[str, str]) -> int:
     match_id = get_match_id(conn, row["round"], int(row["position"]))
     conn.execute(
@@ -1006,6 +1086,16 @@ def import_absences(conn: sqlite3.Connection, path: str | Path) -> int:
     with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle):
             upsert_absence(conn, row)
+            count += 1
+    conn.commit()
+    return count
+
+
+def import_player_statuses(conn: sqlite3.Connection, path: str | Path) -> int:
+    count = 0
+    with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            upsert_player_status(conn, row)
             count += 1
     conn.commit()
     return count

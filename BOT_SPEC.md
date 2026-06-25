@@ -33,6 +33,9 @@
 - `/audit` - пропуски, нечитаемые счета, нормализованные форматы, поздние прогнозы.
 - `/deadlines` - дедлайны.
 - `/schedule` - поставить напоминания.
+- `/quota` - проверить The Odds API и остаток кредитов.
+- `/sync_fixtures` - подтянуть официальный календарь Premier League.
+- `/sync_odds` - подтянуть рыночные кэфы в базу.
 - `/table` - таблица конкурса.
 
 Аналитические команды:
@@ -40,6 +43,7 @@
 - `/field <матч>` - как ставит поле.
 - `/match <матч>` - прогнозы участников по матчу.
 - `/recommend <матч>` - структурная рекомендация.
+- `/odds <матч>` - последние сохранённые рыночные кэфы.
 - `/risk [тур]` - риск-карта тура.
 - `/strategy` - режим игры относительно таблицы.
 - `/vs <участник>` - отличия от участника.
@@ -50,6 +54,13 @@
 - `/draft [safe|balanced|aggressive|against_field]` - черновик прогноза.
 - `/review [тур]` - пост-туровый разбор.
 - `/watch add/remove/list` - участники, за которыми следим.
+
+## Current Automated Data Additions
+
+- `/sync_variables`: sync FPL player statuses, ClubElo ratings, match context/weather, team factors, and draft model assessments.
+- `/dossier <match>`: show the match variable card.
+- Background sync: fixtures + variables every `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS` when `BRUCEBET_AUTO_SYNC=1`, after startup delay `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES`.
+- Background sync does not call The Odds API; odds snapshots stay manual near deadline.
 
 ## Service Messages
 
