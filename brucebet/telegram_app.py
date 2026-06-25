@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
-from typing import Callable
+from typing import Callable, Iterable
 
 from telegram import Update
 from telegram.ext import (
@@ -24,10 +24,13 @@ from .analytics import (
     compare_participants,
     compute_standings,
     field_summary,
+    hq_summary,
     match_header,
     prediction_views_for_match,
     recommend_match,
+    risk_map,
     round_deadlines,
+    strategy_summary,
 )
 from .scoring import is_standard_score, normalize_score, parse_datetime, parse_score
 from .service_messages import (
@@ -38,6 +41,8 @@ from .service_messages import (
     render,
 )
 from .storage import (
+    activate_profile,
+    active_season,
     connect,
     find_match,
     import_matches,
@@ -58,6 +63,9 @@ class BotSettings:
     db_path: Path
     data_dir: Path
     user_participant: str
+    competition: str
+    season: str
+    season_display: str
     allowed_chat_ids: frozenset[int]
     lock_minutes: int
 
@@ -77,6 +85,9 @@ def load_settings() -> BotSettings:
         db_path=Path(os.getenv("BRUCEBET_DB_PATH", "data/forecasters.sqlite")),
         data_dir=Path(os.getenv("BRUCEBET_DATA_DIR", "data")),
         user_participant=os.getenv("BRUCEBET_USER_PARTICIPANT", "Bruce Wayne"),
+        competition=os.getenv("BRUCEBET_COMPETITION", "epl"),
+        season=os.getenv("BRUCEBET_SEASON", "2026/27"),
+        season_display=os.getenv("BRUCEBET_SEASON_DISPLAY", "EPL 2026/27"),
         allowed_chat_ids=parse_chat_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS")),
         lock_minutes=int(os.getenv("BRUCEBET_LOCK_MINUTES", "90")),
     )
@@ -91,6 +102,13 @@ def conn_from_context(context: ContextTypes.DEFAULT_TYPE) -> sqlite3.Connection:
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = connect(settings.db_path)
     init_db(conn)
+    activate_profile(
+        conn,
+        competition_code=settings.competition,
+        season_name=settings.season,
+        season_display_name=settings.season_display,
+        lock_minutes=settings.lock_minutes,
+    )
     return conn
 
 
@@ -131,6 +149,25 @@ def render_rows(headers: list[str], rows: list[list[object]]) -> str:
     return "```\n" + "\n".join(lines) + "\n```"
 
 
+def render_risk_map(item: dict[str, object]) -> str:
+    sections: list[str] = [f"Тур: {clean(item.get('round_name'))}"]
+    labels = [("safe", "Безопасные"), ("slippery", "Скользкие"), ("risk", "Матчи для риска"), ("unknown", "Без поля")]
+    for key, title in labels:
+        rows = [
+            [
+                row["position"],
+                row["label"],
+                row["top_outcome"],
+                row["top_share"],
+                row["predictions"],
+                row["suggested_score"],
+            ]
+            for row in item.get(key, [])
+        ]
+        sections.append(title + ":\n" + render_rows(["#", "match", "top", "share", "n", "base"], rows))
+    return "\n\n".join(sections)
+
+
 def clean(value: object) -> str:
     return "" if value is None else str(value)
 
@@ -155,12 +192,14 @@ def db_status(conn: sqlite3.Connection) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = settings_from_context(context)
     conn = conn_from_context(context)
+    season = active_season(conn)
     lines = [
         "BruceBet 3000 на связи.",
+        f"Активный профиль: {season['display_name'] or season['name']}.",
         db_status(conn),
         f"Твой участник: {settings.user_participant}.",
         "",
-        "Команды: /load, /table, /field, /recommend, /match, /vs, /deadlines, /schedule, /audit.",
+        "Команды: /hq, /load, /table, /field, /recommend, /risk, /strategy, /match, /vs, /deadlines, /schedule, /audit.",
     ]
     if not settings.allowed_chat_ids:
         lines.append("")
@@ -175,9 +214,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\n".join(
             [
                 "/load - пришли VK-пасту текстом или файлом",
+                "/hq - штаб активного тура",
                 "/table - таблица конкурса",
                 "/field <матч> - поле прогнозов",
                 "/recommend <матч> - рекомендация по матчу",
+                "/risk [тур] - риск-карта тура",
+                "/strategy - стратегия относительно таблицы",
                 "/match <матч> - прогнозы участников",
                 "/vs <участник> - отличия тебя от участника",
                 "/deadlines - дедлайны туров",
@@ -200,6 +242,7 @@ async def load_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def table_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = settings_from_context(context)
     conn = conn_from_context(context)
+    season = active_season(conn)
     rows = [
         [
             item.rank,
@@ -212,9 +255,62 @@ async def table_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "yes" if item.paid else "no",
             item.prize_rub,
         ]
-        for item in compute_standings(conn, lock_minutes=settings.lock_minutes)
+        for item in compute_standings(conn, entry_fee_rub=int(season["entry_fee_rub"]), lock_minutes=settings.lock_minutes)
     ]
     await send_text(update, render_rows(["#", "name", "pts", "exact", "diff", "outcome", "late", "paid", "prize"], rows))
+
+
+@require_access
+async def hq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    conn = conn_from_context(context)
+    item = hq_summary(conn, user_participant=settings.user_participant, lock_minutes=settings.lock_minutes)
+    season = item["season"]
+    deadline = item["deadline"]
+    effective = deadline.effective_deadline_at.isoformat() if deadline and deadline.effective_deadline_at else "не указан"
+    focus = item["risk"].get("risk", [])[:3] + item["risk"].get("slippery", [])[:3]
+    lines = [
+        f"Штаб: {season['display_name'] or season['name']}",
+        f"Тур: {item['round_name'] or 'не найден'}",
+        f"Дедлайн: {effective}",
+        f"Матчей: {item['match_count']}",
+        f"Твой прогноз: {item['predictions']['mine']}/{item['match_count']}",
+        f"Прогнозы поля: {item['predictions']['participants']}/{item['participant_count']} участников, строк {item['predictions']['rows']}",
+        f"Участников с взносом: {item['paid_count']}/{item['participant_count']}. Банк: {item['bank_rub']} руб.",
+        "",
+        "Фокус риска:",
+        render_rows(
+            ["#", "match", "top", "share", "base"],
+            [[row["position"], row["label"], row["top_outcome"], row["top_share"], row["suggested_score"]] for row in focus],
+        ),
+    ]
+    await send_text(update, "\n".join(lines))
+
+
+@require_access
+async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = conn_from_context(context)
+    await send_text(update, render_risk_map(risk_map(conn, query_text(context) or None)))
+
+
+@require_access
+async def strategy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    conn = conn_from_context(context)
+    item = strategy_summary(conn, user_participant=settings.user_participant, lock_minutes=settings.lock_minutes)
+    me = item["me"]
+    leader = item["leader"]
+    lines = [
+        f"Режим: {item['mode']}",
+        f"Ты: {me.rank if me else '?'} место, {me.total if me else '?'} очков",
+        f"Лидер: {leader.name if leader else '?'} ({leader.total if leader else '?'} очков)",
+        f"Отставание: {item['gap'] if item['gap'] is not None else '?'}",
+        "",
+        item["advice"],
+        "",
+        render_risk_map(item["risk"]),
+    ]
+    await send_text(update, "\n".join(lines))
 
 
 @require_access
@@ -310,18 +406,24 @@ async def vs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def audit_text(conn: sqlite3.Connection, lock_minutes: int) -> str:
+    season_id = int(active_season(conn)["id"])
     missing = list(
         conn.execute(
             """
             SELECT p.name AS participant, r.name AS round_name, GROUP_CONCAT(m.position, ',') AS positions, COUNT(*) AS count
-            FROM participants p
+            FROM season_participants sp
+            JOIN participants p ON p.id = sp.participant_id
             CROSS JOIN matches m
             JOIN rounds r ON r.id = m.round_id
             LEFT JOIN predictions pr ON pr.participant_id = p.id AND pr.match_id = m.id
-            WHERE pr.id IS NULL
+            WHERE sp.season_id = ?
+              AND sp.active = 1
+              AND r.season_id = ?
+              AND pr.id IS NULL
             GROUP BY p.id, r.id
             ORDER BY r.sort_order, p.name
-            """
+            """,
+            (season_id, season_id),
         )
     )
     score_rows = list(
@@ -332,8 +434,10 @@ def audit_text(conn: sqlite3.Connection, lock_minutes: int) -> str:
             JOIN participants p ON p.id = pr.participant_id
             JOIN matches m ON m.id = pr.match_id
             JOIN rounds r ON r.id = m.round_id
+            WHERE r.season_id = ?
             ORDER BY r.sort_order, p.name, m.position
-            """
+            """,
+            (season_id,),
         )
     )
     unreadable: dict[tuple[str, str], list[str]] = {}
@@ -355,8 +459,10 @@ def audit_text(conn: sqlite3.Connection, lock_minutes: int) -> str:
             JOIN participants p ON p.id = pr.participant_id
             JOIN matches m ON m.id = pr.match_id
             JOIN rounds r ON r.id = m.round_id
+            WHERE r.season_id = ?
             ORDER BY r.sort_order, p.name, m.position
-            """
+            """,
+            (season_id,),
         )
     )
     from .analytics import prediction_is_eligible
@@ -460,6 +566,13 @@ async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 def import_parsed_files(settings: BotSettings, templates_count: int) -> tuple[int, int, int]:
     conn = connect(settings.db_path)
     init_db(conn)
+    activate_profile(
+        conn,
+        competition_code=settings.competition,
+        season_name=settings.season,
+        season_display_name=settings.season_display,
+        lock_minutes=settings.lock_minutes,
+    )
     participants_path = settings.data_dir / "participants.csv"
     matches_path = settings.data_dir / "vk_matches.csv"
     predictions_path = settings.data_dir / "vk_predictions.csv"
@@ -555,9 +668,12 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("load", load_cmd))
+    application.add_handler(CommandHandler("hq", hq_cmd))
     application.add_handler(CommandHandler("table", table_cmd))
     application.add_handler(CommandHandler("field", field_cmd))
     application.add_handler(CommandHandler("recommend", recommend_cmd))
+    application.add_handler(CommandHandler("risk", risk_cmd))
+    application.add_handler(CommandHandler("strategy", strategy_cmd))
     application.add_handler(CommandHandler("match", match_cmd))
     application.add_handler(CommandHandler("vs", vs_cmd))
     application.add_handler(CommandHandler("audit", audit_cmd))
