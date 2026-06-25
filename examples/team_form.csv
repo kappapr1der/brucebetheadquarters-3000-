@@ -1,9 +1,9 @@
 team,match_date,opponent,venue,competition,goals_for,goals_against,xg_for,xg_against,result,importance,notes
-Belgium,2026-06-21,Ecuador,neutral,World Cup,0,0,1.1,0.8,D,0.9,Low-event draw
-Belgium,2026-06-18,New Zealand,neutral,World Cup,2,0,1.7,0.5,W,0.9,Controlled win
-Iran,2026-06-21,Belgium,neutral,World Cup,0,0,0.8,1.1,D,0.9,Defended deep and survived
-Iran,2026-06-18,Egypt,neutral,World Cup,0,1,0.7,1.2,L,0.9,Limited attack
-Uruguay,2026-06-22,Cape Verde,neutral,World Cup,2,2,1.8,1.1,D,0.9,Good attack but unstable defensive transitions
-Cape Verde,2026-06-22,Uruguay,neutral,World Cup,2,2,1.1,1.8,D,0.9,Finished limited chances well
-Portugal,2026-06-20,Uzbekistan,neutral,World Cup,2,0,2.0,0.6,W,0.9,Comfortable favorite win
-DR Congo,2026-06-20,Colombia,neutral,World Cup,1,1,0.9,1.4,D,0.9,Stayed alive through counters
+Arsenal,2026-08-08,Tottenham,home,Preseason,2,1,1.8,1.0,W,0.4,Pressing looked ready
+Chelsea,2026-08-08,Newcastle,away,Preseason,1,1,1.2,1.4,D,0.4,Good transitions but shaky rest defense
+Liverpool,2026-08-09,Everton,home,Preseason,3,1,2.2,0.7,W,0.4,Created enough for a heavy favorite profile
+Burnley,2026-08-09,Leeds,away,Preseason,0,1,0.7,1.1,L,0.4,Low block held for long spells
+Brighton,2026-08-10,Aston Villa,home,Preseason,2,2,1.6,1.7,D,0.4,Open and high-variance
+Newcastle,2026-08-10,Chelsea,home,Preseason,1,1,1.4,1.2,D,0.4,Physical edge remains
+Tottenham,2026-08-08,Arsenal,away,Preseason,1,2,1.0,1.8,L,0.4,High line exposed
+Manchester United,2026-08-09,West Ham,home,Preseason,2,1,1.5,1.2,W,0.4,Good moments, not full control

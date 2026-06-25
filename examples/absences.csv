@@ -1,5 +1,5 @@
 team,player,role,status,severity,impact_rating,expected_return,source,notes,updated_at
-Belgium,Example CB,center_back,doubtful,minor,0.4,unknown,manual,Placeholder until official team news,2026-06-22T12:00:00+03:00
-Iran,Example DM,defensive_midfielder,suspended,medium,0.6,next_round,manual,Placeholder suspension check,2026-06-22T12:00:00+03:00
-Portugal,Example FW,forward,questionable,minor,0.3,unknown,manual,Rotation risk more important than injury itself,2026-06-22T12:00:00+03:00
-DR Congo,Example LB,left_back,injured,medium,0.5,unknown,manual,Needs confirmation from pre-match reports,2026-06-22T12:00:00+03:00
+Arsenal,Example LB,left_back,doubtful,minor,0.3,unknown,manual,Placeholder until official team news,2026-06-25T12:00:00+03:00
+Chelsea,Example DM,defensive_midfielder,suspended,medium,0.6,matchweek_2,manual,Midfield balance risk,2026-06-25T12:00:00+03:00
+Liverpool,Example RW,right_winger,questionable,minor,0.4,unknown,manual,Does not change favorite status much,2026-06-25T12:00:00+03:00
+Manchester United,Example CB,center_back,injured,medium,0.5,unknown,manual,Raises high-line/transition risk,2026-06-25T12:00:00+03:00
