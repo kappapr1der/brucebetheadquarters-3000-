@@ -9,5 +9,6 @@ Keep real contest data here on the server:
 - `vk_predictions.csv`
 - `forecasters.sqlite`
 - parser/audit outputs
+- `snapshots/` - optional private git repo with sanitized CSV/JSON exports
 
 The public GitHub repository intentionally excludes real participant forecasts and SQLite files.

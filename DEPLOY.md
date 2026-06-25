@@ -43,6 +43,10 @@ Recommended env:
 - `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES=5`
 - `BRUCEBET_VARIABLE_DAYS_AHEAD=365`
 - `BRUCEBET_WEATHER_DAYS_AHEAD=16`
+- `BRUCEBET_SNAPSHOT_LABEL=server-auto`
+- `BRUCEBET_SNAPSHOT_OUT_DIR=data/snapshots/current`
+- `BRUCEBET_SNAPSHOT_REPO=/opt/brucebet-3000/data/snapshots`
+- `BRUCEBET_SNAPSHOT_PUSH=auto`
 - `THE_ODDS_API_SPORT=soccer_epl`
 - `THE_ODDS_API_REGIONS=eu`
 - `THE_ODDS_API_MARKETS=h2h,totals`
@@ -85,3 +89,36 @@ In Telegram:
 Send the VK pasted text as a message or `.txt` file. The bot will parse it, update `data/vk_matches.csv`, `data/vk_predictions.csv`, and import into SQLite.
 
 The `data/` directory is mounted as a Docker volume, so database and parsed CSV files survive container rebuilds.
+
+## Server snapshot autocommits
+
+The production folder itself does not need to be a git repository. Runtime snapshots live in a separate repo under:
+
+```bash
+/opt/brucebet-3000/data/snapshots
+```
+
+Manual run:
+
+```bash
+cd /opt/brucebet-3000
+chmod +x scripts/autocommit-snapshot.sh
+BRUCEBET_SNAPSHOT_PUSH=0 scripts/autocommit-snapshot.sh
+```
+
+The script exports safe CSV/JSON files to `data/snapshots/current`, commits only `.gitignore`, `README.md`, and `current/`, and never commits `.env` or SQLite files.
+
+The host script does not source `.env` by default because Docker env files can contain values that are not shell-safe. Pass snapshot overrides directly before the command when needed.
+
+Cron example, every 6 hours:
+
+```bash
+(crontab -l 2>/dev/null; echo '17 */6 * * * cd /opt/brucebet-3000 && BRUCEBET_SNAPSHOT_PUSH=auto scripts/autocommit-snapshot.sh >> /var/log/brucebet-snapshot.log 2>&1') | crontab -
+```
+
+Automatic push is optional. Use only a private repository:
+
+```bash
+git -C /opt/brucebet-3000/data/snapshots remote add origin git@github.com:kappapr1der/brucebet-private-snapshots.git
+git -C /opt/brucebet-3000/data/snapshots push -u origin main
+```

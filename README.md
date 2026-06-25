@@ -41,6 +41,7 @@
 python -m brucebet.cli --db brucebet.sqlite load-sample
 python -m brucebet.cli --db brucebet.sqlite sync-fixtures
 python -m brucebet.cli --db brucebet.sqlite sync-variables
+python -m brucebet.cli --db brucebet.sqlite snapshot --out-dir data/snapshots/current
 python -m brucebet.cli --db brucebet.sqlite hq
 python -m brucebet.cli --db brucebet.sqlite risk
 python -m brucebet.cli --db brucebet.sqlite strategy
@@ -99,6 +100,10 @@ BRUCEBET_AUTO_SYNC_INTERVAL_HOURS=12
 BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES=5
 BRUCEBET_VARIABLE_DAYS_AHEAD=365
 BRUCEBET_WEATHER_DAYS_AHEAD=16
+BRUCEBET_SNAPSHOT_LABEL=server-auto
+BRUCEBET_SNAPSHOT_OUT_DIR=data/snapshots/current
+BRUCEBET_SNAPSHOT_REPO=/opt/brucebet-3000/data/snapshots
+BRUCEBET_SNAPSHOT_PUSH=auto
 THE_ODDS_API_KEY=
 THE_ODDS_API_SPORT=soccer_epl
 THE_ODDS_API_REGIONS=eu
@@ -163,6 +168,7 @@ Calendar commands:
 - `brucebet variables [team]` - latest player status/form snapshots.
 - `brucebet sync-fixtures` - fetch official Premier League fixtures into `matches`.
 - `brucebet sync-variables` - fetch FPL, ClubElo, context/weather, factors, and draft assessments.
+- `brucebet snapshot` - export stable sanitized CSV/JSON files for server-side git snapshots.
 - `brucebet dossier <team>` - show the match variable card.
 - `brucebet quota` - check The Odds API key and remaining credits without spending odds quota.
 - `brucebet sources` - check all configured/free data sources.
@@ -205,6 +211,16 @@ The background sync does not call The Odds API, so it does not spend odds credit
 Реальные прогнозы, участники, SQLite и выгрузки должны жить только в серверном `data/`.
 
 В публичный GitHub они не коммитятся: там остаются `data/README.md` и `data/.gitkeep`.
+
+## Runtime Snapshots
+
+Use `brucebet snapshot` to export stable CSV files and `manifest.json` for the active season:
+
+```powershell
+python -m brucebet.cli --db brucebet.sqlite snapshot --out-dir data/snapshots/current
+```
+
+On the server, `scripts/autocommit-snapshot.sh` commits those exports in a separate git repository at `/opt/brucebet-3000/data/snapshots`. Keep automatic push pointed at a private remote only.
 
 ## World Cup Legacy
 

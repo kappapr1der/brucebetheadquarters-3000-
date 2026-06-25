@@ -37,6 +37,7 @@ from .odds_api import (
 )
 from .pl_fixtures import DEFAULT_PL_COMPSEASON_ID, DEFAULT_PL_SEASON_LABEL, PremierLeagueApiError, sync_pl_fixtures_to_db
 from .sources import SourceConfig, check_all_sources
+from .snapshot import export_snapshot
 from .storage import (
     activate_profile,
     active_season,
@@ -877,6 +878,22 @@ def cmd_sync_variables(args: argparse.Namespace) -> int:
     return 0 if not result.errors else 1
 
 
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    result = export_snapshot(conn, args.out_dir, label=args.label)
+    print_key_values(
+        [
+            ("out_dir", result.out_dir),
+            ("manifest", result.manifest_path),
+            ("generated_at", result.generated_at),
+            ("season", result.season),
+            ("files", len(result.tables)),
+            ("rows", sum(result.tables.values())),
+        ]
+    )
+    return 0
+
+
 def cmd_audit(args: argparse.Namespace) -> int:
     conn = open_db(args)
     season_id = int(active_season(conn)["id"])
@@ -1178,6 +1195,15 @@ def build_parser() -> argparse.ArgumentParser:
     sync_variables.add_argument("--skip-context", action="store_true")
     sync_variables.add_argument("--skip-assessments", action="store_true")
     sync_variables.set_defaults(func=cmd_sync_variables)
+
+    snapshot = sub.add_parser("snapshot", help="Export a safe CSV/JSON snapshot of the active season.")
+    snapshot.add_argument(
+        "--out-dir",
+        default=env_default("BRUCEBET_SNAPSHOT_OUT_DIR", "data/snapshots/current"),
+        help="Output directory for stable snapshot files.",
+    )
+    snapshot.add_argument("--label", default=env_default("BRUCEBET_SNAPSHOT_LABEL", "manual"))
+    snapshot.set_defaults(func=cmd_snapshot)
 
     audit = sub.add_parser("audit", help="Show missing, invalid, and late prediction issues.")
     audit.set_defaults(func=cmd_audit)
