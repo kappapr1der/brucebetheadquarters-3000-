@@ -8,6 +8,7 @@ WORKDIR /app
 COPY requirements.txt pyproject.toml README.md ./
 COPY brucebet ./brucebet
 COPY configs ./configs
+COPY examples ./examples
 COPY data ./data
 
 RUN pip install --no-cache-dir -r requirements.txt \
