@@ -1,5 +1,5 @@
 round,position,venue,city,country,neutral_site,timezone,home_rest_days,away_rest_days,home_travel_km,away_travel_km,weather,temperature_c,pitch,referee,home_motivation,away_motivation,home_rotation_risk,away_rotation_risk,notes
-1,1,Neutral Stadium,Sample City,Sample Country,true,Europe/Moscow,4,4,0,0,clear,24,natural,TBD,0.8,0.9,0.2,0.1,Favorite faces compact underdog
-1,2,Neutral Stadium,Sample City,Sample Country,true,Europe/Moscow,3,3,0,0,humid,27,natural,TBD,0.8,0.9,0.3,0.1,Upset draw path exists through transition chances
-1,3,Neutral Stadium,Sample City,Sample Country,true,Europe/Moscow,3,4,0,0,clear,23,natural,TBD,0.8,0.9,0.2,0.1,Low-total profile
-1,4,Neutral Stadium,Sample City,Sample Country,true,Europe/Moscow,4,4,0,0,clear,22,natural,TBD,0.7,0.9,0.4,0.1,Portugal favorite but draw hedge is not crazy
+1,1,Emirates Stadium,London,England,false,Europe/London,7,7,0,10,clear,20,natural,TBD,0.9,0.9,0.1,0.2,London derby: favorite edge but draw path is live
+1,2,Anfield,Liverpool,England,false,Europe/London,7,7,0,145,clear,18,natural,TBD,0.9,0.95,0.1,0.1,Heavy favorite against low block
+1,3,Amex Stadium,Brighton,England,false,Europe/London,6,6,0,560,windy,19,natural,TBD,0.8,0.85,0.2,0.2,Good split-field match
+1,4,Tottenham Hotspur Stadium,London,England,false,Europe/London,7,7,0,335,clear,21,natural,TBD,0.9,0.9,0.3,0.25,Big-six volatility and high goal profile
