@@ -28,6 +28,9 @@ Recommended env:
 - `BRUCEBET_DB_PATH=data/forecasters.sqlite`
 - `BRUCEBET_DATA_DIR=data`
 - `BRUCEBET_USER_PARTICIPANT=Bruce Wayne`
+- `BRUCEBET_COMPETITION=epl`
+- `BRUCEBET_SEASON=2026/27`
+- `BRUCEBET_SEASON_DISPLAY=EPL 2026/27`
 - `BRUCEBET_LOCK_MINUTES=90`
 
 ## Smoke test
@@ -36,11 +39,14 @@ In Telegram:
 
 ```text
 /start
+/hq
 /deadlines
 /table
 /audit
-/field Бельгия
-/recommend Бельгия
+/field Arsenal
+/recommend Arsenal
+/risk
+/strategy
 /schedule
 ```
 

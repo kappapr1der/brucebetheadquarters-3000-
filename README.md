@@ -1,79 +1,120 @@
-# BruceBet 3000
+# BruceBet Headquarters 3000
 
-MVP для конкурса прогнозов: считает очки, тай-брейки, поле прогнозов и сценарии по конкретному матчу.
+Личный штаб прогнозиста для длинного сезона АПЛ.
 
-Плюс ведет базу переменных для прогноза: команды, форма, травмы/дисквалификации, коэффициенты, контекст матча, мотивация, усталость, ротация и ручная оценка риска.
+Задача бота не в том, чтобы притворяться футбольным оракулом. Его задача: держать тур, дедлайн, поле прогнозов, таблицу, риск и стратегию в одном месте, чтобы решение было лучше, чем “ну тут вроде 2:0”.
 
-## Что уже зашито
+## Active Profile
 
-- Точный счет: 3 очка.
-- Та же разница: 2 очка.
-- Тот же исход: 1 очко.
-- Иначе: 0 очков.
-- Стандартный счет: `0:0`-`9:9`.
-- `2-0`, `2;0`, `2 : 0` принимаются и нормализуются в `2:0`.
-- `10:0`, лишние слова и другой мусор считаются невалидными.
-- Дедлайн по матчу: прогноз должен быть отправлен не позднее чем за 90 минут до начала матча.
-- Если прогноз тура отправлен до общего дедлайна тура, все матчи считаются допустимыми.
-- Если прогноз отправлен после общего дедлайна тура, допустимость считается поматчево: матч засчитывается только если до его kickoff ещё больше 90 минут.
-- Тай-брейки: очки, точные счета, разницы, затем очки в последнем туре, предпоследнем и так далее.
-- Призовой фонд: `paid=true` участники по 300 рублей, топ-3 получают 50/30/20%.
+По умолчанию проект работает как EPL-штаб:
 
-## Быстрый старт
+- competition: `epl`
+- season: `2026/27`
+- display: `EPL 2026/27`
+- пользователь: `Bruce Wayne`
+- дедлайн: за 90 минут до первого матча тура
+- очки: точный счет 3, разница 2, исход 1
+
+Профиль лежит в `configs/epl_2026_27.json`, будущие сезоны можно делать копией `configs/epl_template.json`.
+
+## Что Уже Есть
+
+- SQLite-ядро для сезонов, участников, взносов, туров, матчей, прогнозов и результатов.
+- Сезонные взносы: один и тот же участник может играть в разных сезонах с разным статусом оплаты.
+- Гибкий парсер счёта: `2:1`, `2-1`, `2;1`, `2 : 1` принимаются и нормализуются.
+- Двузначные счета вроде `10:0` считаются невалидными и уходят в аудит.
+- Таблица с тай-брейками: очки, точные, разницы, очки последних туров.
+- `/hq`: штаб активного тура.
+- `/risk`: риск-карта тура.
+- `/strategy`: режим игры относительно лидера.
+- `/field`, `/recommend`, `/match`, `/vs`, `/audit`, `/deadlines`.
+- Сервисные сообщения: “принято”, “теперь кидай прогнозы участников”, “проверь аудит”.
+- Напоминания за 24 часа, 6 часов, 3 часа, 1 час и 20 минут до дедлайна.
+- Docker-деплой Telegram-бота.
+
+## Быстрый Старт
 
 ```powershell
 python -m brucebet.cli --db brucebet.sqlite load-sample
+python -m brucebet.cli --db brucebet.sqlite hq
+python -m brucebet.cli --db brucebet.sqlite risk
+python -m brucebet.cli --db brucebet.sqlite strategy
 python -m brucebet.cli --db brucebet.sqlite table
-python -m brucebet.cli --db brucebet.sqlite field Belgium
-python -m brucebet.cli --db brucebet.sqlite scenario Belgium 1:1
-python -m brucebet.cli --db brucebet.sqlite vs Bruce Igor
-python -m brucebet.cli --db brucebet.sqlite team Belgium
-python -m brucebet.cli --db brucebet.sqlite dossier Belgium
-python -m brucebet.cli --db brucebet.sqlite recommend Belgium
-python -m brucebet.cli --db brucebet.sqlite deadlines
+python -m brucebet.cli --db brucebet.sqlite field Arsenal
+python -m brucebet.cli --db brucebet.sqlite recommend Arsenal
 python -m brucebet.cli --db brucebet.sqlite audit
 ```
 
-Если `python` не находится в Windows-среде Codex, используй bundled runtime:
+Если `python` не находится в Windows-среде Codex:
 
 ```powershell
 C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m brucebet.cli --db brucebet.sqlite load-sample
 ```
 
-## CSV-форматы
+## Telegram
 
-`examples/participants.csv`
-
-```csv
-name,paid
-Bruce,true
-Igor,true
-Guest,false
-```
-
-`examples/matches.csv`
-
-```csv
-round,position,home,away,kickoff_at,result
-1,1,Belgium,Iran,2026-06-22T18:00:00+03:00,0:0
-1,2,Uruguay,Cape Verde,2026-06-22T21:00:00+03:00,
-```
-
-`examples/predictions.csv`
-
-```csv
-participant,round,position,score,submitted_at,source
-Bruce,1,1,0:0,2026-06-22T15:00:00+03:00,telegram
-Igor,1,1,1:0,2026-06-22T15:00:00+03:00,telegram
-```
-
-Импорт своих данных:
+Локально:
 
 ```powershell
-python -m brucebet.cli --db brucebet.sqlite import --reset --participants participants.csv --teams teams.csv --matches matches.csv --predictions predictions.csv
+$env:TELEGRAM_BOT_TOKEN="..."
+python -m brucebet.telegram_app
 ```
 
-Полный импорт с переменными:
+Docker:
+
+```bash
+cp .env.example .env
+nano .env
+docker compose up -d --build
+docker compose logs -f brucebet
+```
+
+Основные env:
+
+```text
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_ALLOWED_CHAT_IDS=
+BRUCEBET_DB_PATH=data/forecasters.sqlite
+BRUCEBET_DATA_DIR=data
+BRUCEBET_USER_PARTICIPANT=Bruce Wayne
+BRUCEBET_COMPETITION=epl
+BRUCEBET_SEASON=2026/27
+BRUCEBET_SEASON_DISPLAY=EPL 2026/27
+BRUCEBET_LOCK_MINUTES=90
+```
+
+Команды Telegram:
+
+- `/start`
+- `/hq`
+- `/load`
+- `/table`
+- `/field <матч>`
+- `/recommend <матч>`
+- `/risk [тур]`
+- `/strategy`
+- `/match <матч>`
+- `/vs <участник>`
+- `/deadlines`
+- `/schedule`
+- `/audit`
+
+## CSV
+
+Шаблоны лежат в `examples/`:
+
+- `participants.csv` - участники активного сезона и статус взноса.
+- `matches.csv` - matchweek, порядок матчей, kickoff, результат.
+- `predictions.csv` - прогнозы участников.
+- `teams.csv` - сила клубов, стиль, условные рейтинги.
+- `team_form.csv` - форма, xG, последние матчи.
+- `absences.csv` - травмы, дисквалификации, сомнительные игроки.
+- `match_contexts.csv` - стадион, отдых, переезд, погода, мотивация, ротация.
+- `match_odds.csv` - снимки коэффициентов.
+- `team_match_factors.csv` - матчевые факторы по каждой команде.
+- `match_assessments.csv` - ручная оценка штаба: базовый счёт, риск, контр-сценарий.
+
+Импорт:
 
 ```powershell
 python -m brucebet.cli --db brucebet.sqlite import --reset `
@@ -89,109 +130,12 @@ python -m brucebet.cli --db brucebet.sqlite import --reset `
   --assessments match_assessments.csv
 ```
 
-## Команды
+## Runtime Data
 
-- `table` - общая таблица, точные, разницы, исходы, опоздания и призовые.
-- `match Belgium` - прогнозы и очки по матчу.
-- `field Belgium` - консенсус поля: `P1/X/P2` и популярные счета.
-- `recommend Belgium` - структурная рекомендация: базовый счёт, риск, уверенность, поле и контр-сценарий.
-- `deadlines` - дедлайны туров; если есть kickoff первого матча, дедлайн считается как `kickoff - 90 минут`.
-- `scenario Belgium 1:1` - кто сколько получит при сценарии `1:1`.
-- `vs Bruce Igor` - где Bruce отличается от Igor и сколько уже выиграл/проиграл на этих отличиях.
-- `team Belgium` - паспорт команды: сила, стиль, форма, травмы/дисквалификации.
-- `dossier Belgium` - матчевое досье: команды, контекст, коэффициенты, факторы, отсутствующие, ручная оценка.
-- `audit` - пропущенные прогнозы, нечитаемые счета, нестандартные принятые форматы и поздние отправки.
-- `parse-vk pasted-text.txt --out-dir data` - разобрать VK-пасту Forecasters Club в CSV.
-- `brucebet/service_messages.py` - сервисные ответы бота: принято, следующий шаг, аудит, дедлайн.
-- В сервисных сообщениях уже есть расписание напоминаний: за 24 часа, 6 часов, 3 часа, 1 час и 20 минут до дедлайна, плюс сообщение после дедлайна.
+Реальные прогнозы, участники, SQLite и выгрузки должны жить только в серверном `data/`.
 
-## Реальные данные Forecasters Club
+В публичный GitHub они не коммитятся: там остаются `data/README.md` и `data/.gitkeep`.
 
-Локально и на сервере `data/` используется для реальной загрузки из присланного треда:
+## World Cup Legacy
 
-- `participants.csv` - 16 участников и отметка взноса.
-- `vk_matches.csv` - 2 тура по 24 матча, с дедлайнами тура.
-- `vk_predictions.csv` - распарсенные прогнозы из VK-пасты.
-- `vk_parse_summary.txt` - краткий отчёт парсинга.
-- `forecasters.sqlite` - SQLite-база после импорта.
-
-В публичный GitHub эти файлы не коммитятся: там остаются только `data/README.md` и `data/.gitkeep`.
-
-Текущий пользователь в этой базе: `Bruce Wayne`.
-
-Команды для пересборки:
-
-```powershell
-python -m brucebet.cli parse-vk pasted-text.txt --out-dir data
-python -m brucebet.cli --db data\forecasters.sqlite import --reset --participants data\participants.csv --matches data\vk_matches.csv --predictions data\vk_predictions.csv
-python -m brucebet.cli --db data\forecasters.sqlite audit
-```
-
-Для корректного частичного допуска поздних прогнозов нужно заполнить `kickoff_at` в `vk_matches.csv`. Без kickoff-времени поздний после общего дедлайна прогноз считается недоказанно поздним.
-
-## Переменные для прогноза
-
-Шаблоны лежат в `examples/`:
-
-- `teams.csv` - рейтинг FIFA, Elo, стоимость состава, стиль, сила атаки/защиты.
-- `team_form.csv` - последние матчи, голы, xG, важность матча.
-- `absences.csv` - травмы, дисквалификации, сомнительные игроки, сила влияния.
-- `match_contexts.csv` - стадион, погода, отдых, переезд, мотивация, риск ротации.
-- `match_odds.csv` - 1X2, тоталы, BTTS, время снимка коэффициентов.
-- `team_match_factors.csv` - факторы конкретной команды в конкретном матче.
-- `match_assessments.csv` - наша ручная оценка: риск, уверенность, контр-сценарий, предложенный счет.
-
-Рекомендованная карта источников описана в `DATA_SOURCES.md`.
-
-## Следующий слой
-
-После загрузки реальных участников и матчей можно подключать Telegram:
-
-- `/table`
-- `/field <матч>`
-- `/scenario <матч> <счет>`
-- `/vs <игрок>`
-- `/team <команда>`
-- `/dossier <матч>`
-- напоминания за 3 часа, 1 час и 20 минут до дедлайна
-
-Ядро уже отделено от интерфейса, поэтому Telegram-бот будет тонким адаптером поверх SQLite.
-
-Целевая логика бота описана в `BOT_SPEC.md`. Профиль текущего турнира лежит в `configs/world_cup_2026.json`, шаблон будущего АПЛ-режима - в `configs/epl_template.json`.
-
-Сервисные сообщения для Telegram-бота вынесены в `brucebet/service_messages.py`: после твоего прогноза бот должен отвечать "принято", показывать сколько матчей увидел, подсвечивать нестандартные принятые форматы/пропущенные строки, ставить напоминания перед дедлайном и просить прогнозы участников следующим шагом.
-
-## Telegram deploy
-
-Telegram-оболочка уже есть: `brucebet/telegram_app.py`.
-
-Локальный запуск:
-
-```powershell
-$env:TELEGRAM_BOT_TOKEN="..."
-python -m brucebet.telegram_app
-```
-
-Docker-запуск на сервере:
-
-```bash
-cp .env.example .env
-nano .env
-docker compose up -d --build
-docker compose logs -f brucebet
-```
-
-Подробно: `DEPLOY.md`.
-
-Команды Telegram:
-
-- `/start`
-- `/load`
-- `/table`
-- `/field <матч>`
-- `/recommend <матч>`
-- `/match <матч>`
-- `/vs <участник>`
-- `/deadlines`
-- `/schedule`
-- `/audit`
+Старый ЧМ-сценарий не удалён из архитектуры: VK-парсер и `configs/world_cup_2026.json` оставлены как совместимый режим. Но активная разработка теперь идёт под EPL-longterm: сезонность, профили участников, риск-карта, стратегия и пост-туровый разбор.
