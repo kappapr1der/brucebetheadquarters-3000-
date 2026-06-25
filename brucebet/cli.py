@@ -9,16 +9,21 @@ from .analytics import (
     compare_participants,
     compute_standings,
     field_summary,
+    hq_summary,
     match_header,
     match_dossier,
     prediction_is_eligible,
     prediction_views_for_match,
     recommend_match,
+    risk_map,
     round_deadlines,
+    strategy_summary,
     team_profile,
 )
 from .scoring import is_standard_score, normalize_score, parse_datetime, parse_score
 from .storage import (
+    activate_profile,
+    active_season,
     connect,
     find_match,
     import_absences,
@@ -38,6 +43,22 @@ from .vk_parser import parse_file as parse_vk_file
 
 
 DEFAULT_DB = "brucebet.sqlite"
+
+
+def open_db(args: argparse.Namespace, reset: bool = False):
+    conn = connect(args.db)
+    if reset:
+        reset_db(conn)
+    else:
+        init_db(conn)
+    activate_profile(
+        conn,
+        competition_code=args.competition,
+        season_name=args.season,
+        season_display_name=args.season_display,
+        lock_minutes=args.lock_minutes,
+    )
+    return conn
 
 
 def print_rows(headers: list[str], rows: list[list[object]]) -> None:
@@ -62,22 +83,36 @@ def print_key_values(items: list[tuple[str, object]]) -> None:
         print_rows(["field", "value"], rows)
 
 
+def print_risk_map(item: dict[str, object]) -> None:
+    labels = [("safe", "Safe"), ("slippery", "Slippery"), ("risk", "Risk"), ("unknown", "Unknown")]
+    print(f"Round: {clean(item.get('round_name'))}")
+    for key, title in labels:
+        rows = [
+            [
+                row["position"],
+                row["label"],
+                row["top_outcome"],
+                row["top_share"],
+                row["predictions"],
+                row["suggested_score"],
+            ]
+            for row in item.get(key, [])
+        ]
+        print()
+        print(f"{title}:")
+        print_rows(["#", "match", "top", "share", "n", "base"], rows)
+
+
 def cmd_init(args: argparse.Namespace) -> int:
-    conn = connect(args.db)
-    if args.reset:
-        reset_db(conn)
-    else:
-        init_db(conn)
+    conn = open_db(args, reset=args.reset)
+    season = active_season(conn)
     print(f"Database ready: {args.db}")
+    print(f"Active profile: {season['competition_code']} {season['name']}")
     return 0
 
 
 def cmd_import(args: argparse.Namespace) -> int:
-    conn = connect(args.db)
-    if args.reset:
-        reset_db(conn)
-    else:
-        init_db(conn)
+    conn = open_db(args, reset=args.reset)
     totals = []
     if args.participants:
         totals.append(f"participants={import_participants(conn, args.participants)}")
@@ -105,8 +140,7 @@ def cmd_import(args: argparse.Namespace) -> int:
 
 def cmd_load_sample(args: argparse.Namespace) -> int:
     base = Path(__file__).resolve().parents[1] / "examples"
-    conn = connect(args.db)
-    reset_db(conn)
+    conn = open_db(args, reset=True)
     import_participants(conn, base / "participants.csv")
     import_teams(conn, base / "teams.csv")
     import_matches(conn, base / "matches.csv")
@@ -122,7 +156,7 @@ def cmd_load_sample(args: argparse.Namespace) -> int:
 
 
 def cmd_table(args: argparse.Namespace) -> int:
-    conn = connect(args.db)
+    conn = open_db(args)
     standings = compute_standings(conn, entry_fee_rub=args.entry_fee, lock_minutes=args.lock_minutes)
     rows = [
         [
@@ -146,7 +180,7 @@ def cmd_table(args: argparse.Namespace) -> int:
 
 
 def cmd_match(args: argparse.Namespace) -> int:
-    conn = connect(args.db)
+    conn = open_db(args)
     match = find_match(conn, args.query)
     print(match_header(match))
     views = prediction_views_for_match(conn, int(match["id"]), lock_minutes=args.lock_minutes)
@@ -156,7 +190,7 @@ def cmd_match(args: argparse.Namespace) -> int:
 
 
 def cmd_field(args: argparse.Namespace) -> int:
-    conn = connect(args.db)
+    conn = open_db(args)
     match = find_match(conn, args.query)
     print(match_header(match))
     summary = field_summary(conn, int(match["id"]))
@@ -169,7 +203,7 @@ def cmd_field(args: argparse.Namespace) -> int:
 
 
 def cmd_recommend(args: argparse.Namespace) -> int:
-    conn = connect(args.db)
+    conn = open_db(args)
     match = find_match(conn, args.query)
     item = recommend_match(conn, int(match["id"]))
     print(match_header(item["match"]))
@@ -193,7 +227,7 @@ def cmd_recommend(args: argparse.Namespace) -> int:
 
 
 def cmd_deadlines(args: argparse.Namespace) -> int:
-    conn = connect(args.db)
+    conn = open_db(args)
     rows = []
     for item in round_deadlines(conn, lock_minutes=args.lock_minutes):
         rows.append(
@@ -209,8 +243,70 @@ def cmd_deadlines(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_hq(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    item = hq_summary(conn, user_participant=args.user, lock_minutes=args.lock_minutes)
+    season = item["season"]
+    deadline = item["deadline"]
+    effective = deadline.effective_deadline_at.isoformat() if deadline and deadline.effective_deadline_at else ""
+    print(f"BruceBet Headquarters: {season['display_name'] or season['name']}")
+    print_key_values(
+        [
+            ("round", item["round_name"]),
+            ("deadline", effective),
+            ("matches", item["match_count"]),
+            ("participants", item["participant_count"]),
+            ("paid", item["paid_count"]),
+            ("bank_rub", item["bank_rub"]),
+            ("your_forecast", f"{item['predictions']['mine']}/{item['match_count']}"),
+            (
+                "field_loaded",
+                f"{item['predictions']['participants']}/{item['participant_count']} participants, "
+                f"{item['predictions']['rows']} rows",
+            ),
+        ]
+    )
+    print()
+    print("Risk focus:")
+    focus = item["risk"].get("risk", [])[:3] + item["risk"].get("slippery", [])[:3]
+    print_rows(
+        ["#", "match", "top", "share", "base"],
+        [[row["position"], row["label"], row["top_outcome"], row["top_share"], row["suggested_score"]] for row in focus],
+    )
+    return 0
+
+
+def cmd_risk(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    print_risk_map(risk_map(conn, args.round))
+    return 0
+
+
+def cmd_strategy(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    item = strategy_summary(conn, user_participant=args.user, lock_minutes=args.lock_minutes)
+    me = item["me"]
+    leader = item["leader"]
+    print_key_values(
+        [
+            ("user", item["user"]),
+            ("mode", item["mode"]),
+            ("your_rank", me.rank if me else None),
+            ("your_points", me.total if me else None),
+            ("leader", leader.name if leader else None),
+            ("leader_points", leader.total if leader else None),
+            ("gap", item["gap"]),
+            ("advice", item["advice"]),
+        ]
+    )
+    print()
+    print("Risk map:")
+    print_risk_map(item["risk"])
+    return 0
+
+
 def cmd_scenario(args: argparse.Namespace) -> int:
-    conn = connect(args.db)
+    conn = open_db(args)
     match = find_match(conn, args.query)
     scenario = parse_score(args.score)
     if scenario is None:
@@ -227,7 +323,7 @@ def cmd_scenario(args: argparse.Namespace) -> int:
 
 
 def cmd_vs(args: argparse.Namespace) -> int:
-    conn = connect(args.db)
+    conn = open_db(args)
     comparison = compare_participants(conn, args.me, args.opponent, lock_minutes=args.lock_minutes)
     rows = [
         [
@@ -246,7 +342,7 @@ def cmd_vs(args: argparse.Namespace) -> int:
 
 
 def cmd_team(args: argparse.Namespace) -> int:
-    conn = connect(args.db)
+    conn = open_db(args)
     profile = team_profile(conn, args.query)
     team = profile["team"]
     print(f"Team: {team['name']}")
@@ -309,7 +405,7 @@ def cmd_team(args: argparse.Namespace) -> int:
 
 
 def cmd_dossier(args: argparse.Namespace) -> int:
-    conn = connect(args.db)
+    conn = open_db(args)
     match = find_match(conn, args.query)
     dossier = match_dossier(conn, int(match["id"]))
     print(match_header(dossier["match"]))
@@ -440,7 +536,8 @@ def cmd_dossier(args: argparse.Namespace) -> int:
 
 
 def cmd_audit(args: argparse.Namespace) -> int:
-    conn = connect(args.db)
+    conn = open_db(args)
+    season_id = int(active_season(conn)["id"])
 
     missing = list(
         conn.execute(
@@ -450,14 +547,19 @@ def cmd_audit(args: argparse.Namespace) -> int:
                 r.name AS round_name,
                 GROUP_CONCAT(m.position, ',') AS positions,
                 COUNT(*) AS count
-            FROM participants p
+            FROM season_participants sp
+            JOIN participants p ON p.id = sp.participant_id
             CROSS JOIN matches m
             JOIN rounds r ON r.id = m.round_id
             LEFT JOIN predictions pr ON pr.participant_id = p.id AND pr.match_id = m.id
-            WHERE pr.id IS NULL
+            WHERE sp.season_id = ?
+              AND sp.active = 1
+              AND r.season_id = ?
+              AND pr.id IS NULL
             GROUP BY p.id, r.id
             ORDER BY r.sort_order, p.name
-            """
+            """,
+            (season_id, season_id),
         )
     )
     print("Missing predictions:")
@@ -474,8 +576,10 @@ def cmd_audit(args: argparse.Namespace) -> int:
             JOIN participants p ON p.id = pr.participant_id
             JOIN matches m ON m.id = pr.match_id
             JOIN rounds r ON r.id = m.round_id
+            WHERE r.season_id = ?
             ORDER BY r.sort_order, p.name, m.position
-            """
+            """,
+            (season_id,),
         )
     )
     invalid_grouped: dict[tuple[str, str], list[str]] = {}
@@ -525,8 +629,10 @@ def cmd_audit(args: argparse.Namespace) -> int:
             JOIN participants p ON p.id = pr.participant_id
             JOIN matches m ON m.id = pr.match_id
             JOIN rounds r ON r.id = m.round_id
+            WHERE r.season_id = ?
             ORDER BY r.sort_order, p.name, m.position
-            """
+            """,
+            (season_id,),
         )
     )
     for row in late_rows:
@@ -587,6 +693,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="brucebet", description="BruceBet 3000 contest toolkit")
     parser.add_argument("--db", default=DEFAULT_DB, help=f"SQLite database path, default: {DEFAULT_DB}")
     parser.add_argument("--lock-minutes", type=int, default=90, help="Prediction lock time before kickoff.")
+    parser.add_argument("--competition", default="epl", help="Competition profile code, default: epl.")
+    parser.add_argument("--season", default="2026/27", help="Season profile name, default: 2026/27.")
+    parser.add_argument("--season-display", default="EPL 2026/27", help="Human-readable active season name.")
+    parser.add_argument("--user", default="Bruce Wayne", help="Your participant name for strategy commands.")
     sub = parser.add_subparsers(required=True)
 
     init = sub.add_parser("init", help="Create an empty database.")
@@ -628,6 +738,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     deadlines = sub.add_parser("deadlines", help="Show round deadlines.")
     deadlines.set_defaults(func=cmd_deadlines)
+
+    hq = sub.add_parser("hq", help="Show headquarters summary for the active round.")
+    hq.set_defaults(func=cmd_hq)
+
+    risk = sub.add_parser("risk", help="Show the risk map for a round.")
+    risk.add_argument("round", nargs="?")
+    risk.set_defaults(func=cmd_risk)
+
+    strategy = sub.add_parser("strategy", help="Show season strategy against the table.")
+    strategy.set_defaults(func=cmd_strategy)
 
     scenario = sub.add_parser("scenario", help="Score one match under a hypothetical result.")
     scenario.add_argument("query")
