@@ -524,6 +524,46 @@ def risk_map(conn: sqlite3.Connection, round_name: str | None = None) -> dict[st
     return {"round_name": matches[0]["round_name"], **categories}
 
 
+def _freshness_item(raw: str | None, now: datetime) -> dict[str, object]:
+    updated_at = parse_datetime(raw)
+    comparable = _aware_for_compare(updated_at, now)
+    age_minutes = None
+    if comparable is not None:
+        age_minutes = max(0, int((now - comparable).total_seconds() // 60))
+    return {"updated_at": raw, "age_minutes": age_minutes}
+
+
+def data_freshness(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, dict[str, object]]:
+    """Return the latest timestamp for every signal used in match decisions."""
+    now = now or datetime.now().astimezone()
+    season_id = active_season_id(conn)
+    queries = {
+        "fpl": "SELECT MAX(updated_at) AS updated_at FROM player_status_snapshots WHERE source = 'FPL'",
+        "elo": "SELECT MAX(updated_at) AS updated_at FROM teams WHERE elo_rating IS NOT NULL",
+        "odds": """
+            SELECT MAX(mo.captured_at) AS updated_at
+            FROM match_odds mo
+            JOIN matches m ON m.id = mo.match_id
+            JOIN rounds r ON r.id = m.round_id
+            WHERE r.season_id = ?
+        """,
+        "model": """
+            SELECT MAX(ma.updated_at) AS updated_at
+            FROM match_assessments ma
+            JOIN matches m ON m.id = ma.match_id
+            JOIN rounds r ON r.id = m.round_id
+            WHERE r.season_id = ?
+        """,
+        "results": "SELECT MAX(finished_at) AS updated_at FROM result_sync_runs",
+    }
+    values: dict[str, str | None] = {}
+    for key, query in queries.items():
+        params: tuple[object, ...] = (season_id,) if key in {"odds", "model"} else ()
+        row = conn.execute(query, params).fetchone()
+        values[key] = row["updated_at"] if row else None
+    return {key: _freshness_item(value, now) for key, value in values.items()}
+
+
 def hq_summary(
     conn: sqlite3.Connection,
     user_participant: str = "Bruce Wayne",
@@ -578,6 +618,98 @@ def hq_summary(
         "bank_rub": paid_count * int(season["entry_fee_rub"]),
         "predictions": prediction_counts,
         "risk": risk,
+        "freshness": data_freshness(conn),
+    }
+
+
+def ready_summary(
+    conn: sqlite3.Connection,
+    user_participant: str = "Bruce Wayne",
+    lock_minutes: int = 90,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Preflight the active round before committing a prediction to the contest."""
+    now = now or datetime.now().astimezone()
+    hq = hq_summary(conn, user_participant=user_participant, lock_minutes=lock_minutes)
+    round_name = hq["round_name"]
+    matches = match_rows_for_round(conn, round_name)
+    deadline = hq["deadline"]
+    effective_deadline = deadline.effective_deadline_at if deadline else None
+    comparable_deadline = _aware_for_compare(effective_deadline, now)
+    minutes_to_deadline = (
+        int((comparable_deadline - now).total_seconds() // 60)
+        if comparable_deadline is not None
+        else None
+    )
+    unknown_kickoff = [int(row["position"]) for row in matches if parse_datetime(row["kickoff_at"]) is None]
+    participants = _participants(conn)
+    user_present = any(str(row["name"]).lower() == user_participant.lower() for row in participants)
+    missing_mine = max(0, len(matches) - int(hq["predictions"]["mine"]))
+    expected_field_rows = len(matches) * len(participants)
+    missing_field = max(0, expected_field_rows - int(hq["predictions"]["rows"]))
+    model_coverage = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM model_forecasts f
+        JOIN matches m ON m.id = f.match_id
+        JOIN rounds r ON r.id = m.round_id
+        WHERE r.season_id = ? AND r.name = ?
+        """,
+        (active_season_id(conn), round_name),
+    ).fetchone()
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if not matches:
+        blockers.append("Нет матчей активного тура.")
+    if effective_deadline is None:
+        blockers.append("Не вычислен дедлайн тура.")
+    if unknown_kickoff:
+        blockers.append(f"Нет kickoff у матчей: {', '.join(map(str, unknown_kickoff))}.")
+    if minutes_to_deadline is not None and minutes_to_deadline < 0:
+        blockers.append("Дедлайн уже прошёл.")
+    if participants and not user_present:
+        blockers.append(f"Участник {user_participant} не загружен в активный сезон.")
+    elif user_present and missing_mine:
+        warnings.append(f"Не хватает твоих прогнозов: {missing_mine}.")
+    if not participants:
+        warnings.append("Участники пока не загружены.")
+    elif missing_field:
+        warnings.append(f"Поле ещё неполное: не хватает {missing_field} строк прогнозов.")
+    if len(matches) and int(model_coverage["count"]) < len(matches):
+        warnings.append(f"Модель зафиксирована не для всех матчей: {model_coverage['count']}/{len(matches)}.")
+
+    freshness = hq["freshness"]
+    nearing_deadline = minutes_to_deadline is not None and minutes_to_deadline <= 72 * 60
+    for key, title, threshold in [("fpl", "FPL", 36 * 60), ("model", "модель", 48 * 60)]:
+        item = freshness[key]
+        if item["updated_at"] is None:
+            warnings.append(f"Нет данных источника: {title}.")
+        elif item["age_minutes"] is not None and item["age_minutes"] > threshold:
+            warnings.append(f"Данные {title} устарели: {item['age_minutes']} мин.")
+    if nearing_deadline:
+        odds = freshness["odds"]
+        if odds["updated_at"] is None:
+            warnings.append("Перед близким дедлайном нет сохранённых кэфов.")
+        elif odds["age_minutes"] is not None and odds["age_minutes"] > 36 * 60:
+            warnings.append(f"Кэфы устарели: {odds['age_minutes']} мин.")
+
+    status = "blocked" if blockers else "attention" if warnings else "ready"
+    return {
+        "status": status,
+        "round_name": round_name,
+        "deadline": effective_deadline,
+        "minutes_to_deadline": minutes_to_deadline,
+        "match_count": len(matches),
+        "unknown_kickoff": unknown_kickoff,
+        "participants": len(participants),
+        "your_predictions": int(hq["predictions"]["mine"]),
+        "missing_your_predictions": missing_mine if user_present else None,
+        "field_predictions": int(hq["predictions"]["rows"]),
+        "expected_field_predictions": expected_field_rows,
+        "model_forecasts": int(model_coverage["count"]),
+        "freshness": freshness,
+        "blockers": blockers,
+        "warnings": warnings,
     }
 
 

@@ -25,6 +25,7 @@
 - Двузначные счета вроде `10:0` считаются невалидными и уходят в аудит.
 - Таблица с тай-брейками: очки, точные, разницы, очки последних туров.
 - `/hq`: штаб активного тура.
+- `/ready`: предтуровый preflight: дедлайн, покрытие прогнозами, готовность модели и свежесть источников.
 - `/risk`: риск-карта тура.
 - `/strategy`: режим игры относительно лидера.
 - `/field`, `/recommend`, `/match`, `/vs`, `/audit`, `/deadlines`.
@@ -37,6 +38,7 @@
 - `/review <тур>`: пост-туровый разбор, туровая таблица и матчи-качели.
 - `/calibration [тур]`: честная калибровка замороженных до kickoff прогнозов модели.
 - `/rehearse`: изолированная репетиция полного тура без изменения живой базы.
+- `/setresult`: ручной резервный финальный счёт с неизменяемой историей исправлений.
 - Docker-деплой Telegram-бота.
 
 ## Быстрый Старт
@@ -51,6 +53,7 @@ python -m brucebet.cli --db brucebet.sqlite calibration
 python -m brucebet.cli rehearse
 python -m brucebet.cli --db brucebet.sqlite snapshot --out-dir data/snapshots/current
 python -m brucebet.cli --db brucebet.sqlite hq
+python -m brucebet.cli --db brucebet.sqlite ready
 python -m brucebet.cli --db brucebet.sqlite risk
 python -m brucebet.cli --db brucebet.sqlite strategy
 python -m brucebet.cli --db brucebet.sqlite calendar
@@ -130,6 +133,7 @@ THESPORTSDB_KEY=123
 - `/start`
 - `/id`
 - `/hq`
+- `/ready`
 - `/load`
 - `/table`
 - `/field <матч>`
@@ -152,6 +156,8 @@ THESPORTSDB_KEY=123
 - `/review <тур>`
 - `/calibration [тур]`
 - `/rehearse`
+- `/setresult Arsenal - Chelsea | 2:1 | официальный feed задержался`
+- `/resulthistory Arsenal`
 
 ## CSV
 
@@ -183,6 +189,9 @@ Calendar commands:
 - `brucebet sync-fixtures` - fetch official Premier League fixtures into `matches`.
 - `brucebet sync-variables` - fetch FPL, ClubElo, context/weather, factors, and draft assessments.
 - `brucebet sync-results` - write only completed official results and save completed round reviews.
+- `brucebet ready` - preflight the active round: deadline, coverage, model, and data freshness.
+- `brucebet set-result <match> <score> --reason <text>` - manually record a fallback final score with an audit trail.
+- `brucebet result-history <match>` - inspect the manual result override journal.
 - `brucebet review <тур>` - post-round scoreboard, score swings, and model performance.
 - `brucebet calibration [тур]` - accuracy/points for pre-kickoff frozen model forecasts.
 - `brucebet rehearse` - isolated end-to-end rehearsal without live database writes.
@@ -223,6 +232,18 @@ python -m brucebet.cli --db brucebet.sqlite import --reset `
 Telegram has `/sync_variables`, `/sync_results`, and `/dossier <match>`. The bot also runs a quiet background sync every `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS` when `BRUCEBET_AUTO_SYNC=1`, after `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES` on startup. It freezes available model drafts before kickoff and checks finished official results without spending Odds API credits.
 
 The background sync does not call The Odds API, so it does not spend odds credits. Use `/sync_odds` manually closer to deadline. `/schedule` subscribes the current chat to persistent reminders; the dispatcher checks due deliveries every `BRUCEBET_REMINDER_INTERVAL_MINUTES` and retries failed sends inside the configured grace window.
+
+## Preflight And Result Fallback
+
+Before publishing forecasts, use `/ready`. It checks kickoff/deadline coverage, your and the field's submissions, frozen model coverage, and the freshness of FPL, Elo, odds, model, and results data. `/hq` includes the same source-freshness panel.
+
+If the official results feed lags, use the restricted command:
+
+```text
+/setresult Arsenal - Chelsea | 2:1 | официальный feed задержался
+```
+
+The score is normalized, current standings/reviews are recalculated, and the previous score, time, chat, and reason are retained in the SQLite audit log. Inspect it with `/resulthistory Arsenal`.
 
 ## Runtime Data
 

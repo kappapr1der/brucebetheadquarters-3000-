@@ -34,6 +34,7 @@ from .analytics import (
     next_calendar_match,
     player_status_summary,
     prediction_views_for_match,
+    ready_summary,
     recommend_match,
     risk_map,
     round_deadlines,
@@ -80,6 +81,8 @@ from .storage import (
     import_participants,
     import_predictions,
     init_db,
+    manual_result_history,
+    set_manual_match_result,
 )
 from .variable_sync import VariableSyncResult, sync_match_variables
 from .vk_parser import parse_file as parse_vk_file
@@ -346,6 +349,39 @@ def render_variable_sync(result: VariableSyncResult) -> str:
     return "Variables sync done.\n\n" + render_key_values(rows)
 
 
+def render_freshness(items: dict[str, dict[str, object]]) -> str:
+    return render_rows(
+        ["source", "updated_at", "age_min"],
+        [[key, clean(value["updated_at"]), clean(value["age_minutes"])] for key, value in items.items()],
+    )
+
+
+def render_ready(item: dict[str, object]) -> str:
+    status_labels = {"ready": "Готово", "attention": "Нужно внимание", "blocked": "Стоп"}
+    sections = [
+        f"Preflight: {status_labels.get(item['status'], item['status'])}",
+        render_rows(
+            ["field", "value"],
+            [
+                ["round", item["round_name"] or ""],
+                ["deadline", item["deadline"].isoformat() if item["deadline"] else ""],
+                ["minutes_to_deadline", clean(item["minutes_to_deadline"])],
+                ["matches", item["match_count"]],
+                ["your_predictions", item["your_predictions"]],
+                ["missing_yours", clean(item["missing_your_predictions"])],
+                ["field", f"{item['field_predictions']}/{item['expected_field_predictions']}"],
+                ["model", f"{item['model_forecasts']}/{item['match_count']}"],
+            ],
+        ),
+    ]
+    if item["blockers"]:
+        sections.append("Стоп-факторы:\n" + "\n".join(f"- {row}" for row in item["blockers"]))
+    if item["warnings"]:
+        sections.append("Проверь:\n" + "\n".join(f"- {row}" for row in item["warnings"]))
+    sections.append("Свежесть данных:\n" + render_freshness(item["freshness"]))
+    return "\n\n".join(sections)
+
+
 def render_calibration(item: dict[str, object]) -> str:
     rows = [
         ["forecasts", item["forecasts"]],
@@ -528,7 +564,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         db_status(conn),
         f"Твой участник: {settings.user_participant}.",
         "",
-        "Команды: /hq, /calendar, /today, /week, /next, /round, /variables, /load, /table, /field, /recommend, /odds, /quota, /sources, /sync_fixtures, /sync_results, /sync_odds, /risk, /strategy, /match, /vs, /deadlines, /schedule, /audit, /review, /calibration, /rehearse, /id.",
+        "Команды: /hq, /ready, /calendar, /today, /week, /next, /round, /variables, /load, /table, /field, /recommend, /odds, /quota, /sources, /sync_fixtures, /sync_results, /sync_odds, /risk, /strategy, /match, /vs, /deadlines, /schedule, /audit, /review, /calibration, /setresult, /resulthistory, /rehearse, /id.",
     ]
     lines.append("New: /sync_variables, /dossier <match>.")
     if not settings.allowed_chat_ids:
@@ -575,6 +611,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/id - показать chat_id для whitelist",
                 "/load - пришли VK-пасту текстом или файлом",
                 "/hq - штаб активного тура",
+                "/ready - предтуровый контроль перед отправкой прогнозов",
                 "/table - таблица конкурса",
                 "/field <матч> - поле прогнозов",
                 "/recommend <матч> - рекомендация по матчу",
@@ -599,6 +636,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/review <тур> - пост-туровый разбор и качели очков",
                 "/calibration [тур] - точность зафиксированных прогнозов модели",
                 "/rehearse - изолированная репетиция полного тура",
+                "/setresult Матч | 2:1 | причина - ручной резервный результат с журналом",
+                "/resulthistory <матч> - история ручных исправлений результата",
             ]
         ),
     )
@@ -657,8 +696,83 @@ async def hq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ["#", "match", "top", "share", "base"],
             [[row["position"], row["label"], row["top_outcome"], row["top_share"], row["suggested_score"]] for row in focus],
         ),
+        "",
+        "Свежесть данных:",
+        render_freshness(item["freshness"]),
     ]
     await send_text(update, "\n".join(lines))
+
+
+@require_access
+async def ready_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    conn = conn_from_context(context)
+    await send_text(update, render_ready(ready_summary(conn, user_participant=settings.user_participant, lock_minutes=settings.lock_minutes)))
+
+
+def parse_result_override(raw: str) -> tuple[str, str, str | None] | None:
+    parts = [part.strip() for part in raw.split("|")]
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        return None
+    reason = " | ".join(part for part in parts[2:] if part) or None
+    return parts[0], parts[1], reason
+
+
+@require_access
+async def setresult_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    parsed = parse_result_override(query_text(context))
+    if parsed is None:
+        await send_text(update, "Формат: /setresult Arsenal - Chelsea | 2:1 | причина")
+        return
+    query, score, reason = parsed
+    conn = conn_from_context(context)
+    try:
+        match = find_match(conn, query)
+        previous, current = set_manual_match_result(
+            conn,
+            int(match["id"]),
+            score,
+            actor_chat_id=update.effective_chat.id if update.effective_chat else None,
+            reason=reason or "manual fallback",
+        )
+    except ValueError as exc:
+        await send_text(update, str(exc))
+        return
+    reviews = finalize_completed_rounds(conn, lock_minutes=settings.lock_minutes)
+    await send_text(
+        update,
+        "Ручной результат сохранён и записан в журнал.\n"
+        + f"{match_header(match)}\n"
+        + f"Было: {previous or 'пусто'}\nСтало: {current}\n"
+        + f"Обновлено завершённых разборов: {len(reviews)}.\n"
+        + "История: /resulthistory "
+        + query,
+    )
+
+
+@require_access
+async def resulthistory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = query_text(context)
+    if not query:
+        await send_text(update, "Напиши матч: /resulthistory Arsenal")
+        return
+    conn = conn_from_context(context)
+    try:
+        match = find_match(conn, query)
+    except ValueError as exc:
+        await send_text(update, str(exc))
+        return
+    rows = manual_result_history(conn, int(match["id"]))
+    await send_text(
+        update,
+        match_header(match)
+        + "\n\n"
+        + render_rows(
+            ["previous", "new", "changed_at", "chat_id", "reason"],
+            [[clean(row["previous_result"]), row["new_result"], row["changed_at"], clean(row["actor_chat_id"]), clean(row["reason"])] for row in rows],
+        ),
+    )
 
 
 @require_access
@@ -1526,6 +1640,7 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("load", load_cmd))
     application.add_handler(CommandHandler("hq", hq_cmd))
+    application.add_handler(CommandHandler("ready", ready_cmd))
     application.add_handler(CommandHandler("table", table_cmd))
     application.add_handler(CommandHandler("field", field_cmd))
     application.add_handler(CommandHandler("recommend", recommend_cmd))
@@ -1551,6 +1666,8 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("review", review_cmd))
     application.add_handler(CommandHandler("calibration", calibration_cmd))
     application.add_handler(CommandHandler("rehearse", rehearse_cmd))
+    application.add_handler(CommandHandler("setresult", setresult_cmd))
+    application.add_handler(CommandHandler("resulthistory", resulthistory_cmd))
     application.add_handler(CommandHandler("deadline", deadlines_cmd))
     application.add_handler(CommandHandler("deadlines", deadlines_cmd))
     application.add_handler(CommandHandler("schedule", schedule_cmd))

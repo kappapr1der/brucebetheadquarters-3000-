@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from datetime import datetime
 from pathlib import Path
 import sqlite3
 
@@ -241,6 +242,16 @@ CREATE TABLE IF NOT EXISTS result_sync_runs (
     notes TEXT
 );
 
+CREATE TABLE IF NOT EXISTS manual_result_overrides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+    previous_result TEXT,
+    new_result TEXT NOT NULL,
+    changed_at TEXT NOT NULL,
+    actor_chat_id INTEGER,
+    reason TEXT
+);
+
 CREATE TABLE IF NOT EXISTS round_reviews (
     round_id INTEGER PRIMARY KEY REFERENCES rounds(id) ON DELETE CASCADE,
     completed_at TEXT NOT NULL,
@@ -308,6 +319,7 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS model_forecasts;
         DROP TABLE IF EXISTS round_reviews;
         DROP TABLE IF EXISTS result_sync_runs;
+        DROP TABLE IF EXISTS manual_result_overrides;
         DROP TABLE IF EXISTS team_match_factors;
         DROP TABLE IF EXISTS match_odds;
         DROP TABLE IF EXISTS match_contexts;
@@ -683,6 +695,52 @@ def upsert_match(
         (round_id, position),
     ).fetchone()
     return int(row["id"])
+
+
+def set_manual_match_result(
+    conn: sqlite3.Connection,
+    match_id: int,
+    result: str,
+    actor_chat_id: int | None = None,
+    reason: str | None = None,
+    changed_at: str | None = None,
+) -> tuple[str | None, str]:
+    """Set a validated fallback result and retain an audit record for every change."""
+    parsed = parse_score(result)
+    if parsed is None:
+        raise ValueError("Result must be a one-digit score such as 2:1")
+    row = conn.execute("SELECT result FROM matches WHERE id = ?", (match_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"Unknown match id: {match_id}")
+    previous = row["result"]
+    normalized = parsed.label()
+    timestamp = parse_datetime(changed_at).isoformat() if changed_at else datetime.now().astimezone().isoformat()
+    conn.execute("UPDATE matches SET result = ? WHERE id = ?", (normalized, match_id))
+    conn.execute(
+        """
+        INSERT INTO manual_result_overrides(
+            match_id, previous_result, new_result, changed_at, actor_chat_id, reason
+        )
+        VALUES(?, ?, ?, ?, ?, ?)
+        """,
+        (match_id, previous, normalized, timestamp, actor_chat_id, optional_text(reason)),
+    )
+    conn.commit()
+    return previous, normalized
+
+
+def manual_result_history(conn: sqlite3.Connection, match_id: int) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            """
+            SELECT previous_result, new_result, changed_at, actor_chat_id, reason
+            FROM manual_result_overrides
+            WHERE match_id = ?
+            ORDER BY id DESC
+            """,
+            (match_id,),
+        )
+    )
 
 
 def upsert_prediction(

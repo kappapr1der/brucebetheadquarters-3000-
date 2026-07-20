@@ -64,6 +64,7 @@ In Telegram:
 /start
 /id
 /hq
+/ready
 /calendar
 /next
 /variables
@@ -86,9 +87,13 @@ In Telegram:
 /review 1
 /calibration
 /rehearse
+/setresult Arsenal - Chelsea | 2:1 | official feed delay
+/resulthistory Arsenal
 ```
 
 `/schedule` subscribes the current chat to persistent deadline reminders. Delivery state is stored in SQLite, so a container restart does not lose the schedule or resend reminders already delivered.
+
+`/ready` is the operational preflight before a round. It surfaces missing forecasts, unknown kickoff times, incomplete model coverage, and source freshness. `/setresult <match> | <score> | <reason>` is restricted by the Telegram whitelist and writes every manual fallback into an audit log; use it only while the official result feed is delayed or being corrected.
 
 ## Updating data
 

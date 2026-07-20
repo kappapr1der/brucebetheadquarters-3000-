@@ -375,6 +375,26 @@ def active_season_snapshot_tables(season_id: int) -> Iterable[SnapshotTable]:
         """,
         (season_id,),
     )
+    yield SnapshotTable(
+        "manual_result_overrides.csv",
+        """
+        SELECT
+            r.name AS round,
+            m.position,
+            m.home,
+            m.away,
+            mo.previous_result,
+            mo.new_result,
+            mo.changed_at,
+            mo.reason
+        FROM manual_result_overrides mo
+        JOIN matches m ON m.id = mo.match_id
+        JOIN rounds r ON r.id = m.round_id
+        WHERE r.season_id = ?
+        ORDER BY r.sort_order, m.position, mo.changed_at
+        """,
+        (season_id,),
+    )
 
 
 def export_snapshot(conn: sqlite3.Connection, out_dir: str | Path, label: str | None = None) -> SnapshotResult:

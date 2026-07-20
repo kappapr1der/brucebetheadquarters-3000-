@@ -22,6 +22,7 @@ from .analytics import (
     player_status_summary,
     prediction_is_eligible,
     prediction_views_for_match,
+    ready_summary,
     recommend_match,
     risk_map,
     round_deadlines,
@@ -66,7 +67,9 @@ from .storage import (
     import_team_match_factors,
     import_teams,
     init_db,
+    manual_result_history,
     reset_db,
+    set_manual_match_result,
 )
 from .variable_sync import VariableSyncResult, sync_match_variables
 from .vk_parser import parse_file as parse_vk_file
@@ -203,6 +206,13 @@ def print_calendar_items(items: list[object]) -> None:
             for item in items
         ],
     )
+
+
+def freshness_rows(items: dict[str, dict[str, object]]) -> list[list[object]]:
+    return [
+        [key, clean(value["updated_at"]), clean(value["age_minutes"])]
+        for key, value in items.items()
+    ]
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -459,6 +469,69 @@ def cmd_hq(args: argparse.Namespace) -> int:
     print_rows(
         ["#", "match", "top", "share", "base"],
         [[row["position"], row["label"], row["top_outcome"], row["top_share"], row["suggested_score"]] for row in focus],
+    )
+    print()
+    print("Data freshness:")
+    print_rows(["source", "updated_at", "age_minutes"], freshness_rows(item["freshness"]))
+    return 0
+
+
+def cmd_ready(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    item = ready_summary(conn, user_participant=args.user, lock_minutes=args.lock_minutes)
+    print_key_values(
+        [
+            ("status", item["status"]),
+            ("round", item["round_name"]),
+            ("deadline", item["deadline"].isoformat() if item["deadline"] else None),
+            ("minutes_to_deadline", item["minutes_to_deadline"]),
+            ("matches", item["match_count"]),
+            ("your_predictions", item["your_predictions"]),
+            ("missing_your_predictions", item["missing_your_predictions"]),
+            ("field_predictions", f"{item['field_predictions']}/{item['expected_field_predictions']}"),
+            ("model_forecasts", f"{item['model_forecasts']}/{item['match_count']}"),
+        ]
+    )
+    if item["blockers"]:
+        print("\nBlockers:")
+        for row in item["blockers"]:
+            print(f"- {row}")
+    if item["warnings"]:
+        print("\nWarnings:")
+        for row in item["warnings"]:
+            print(f"- {row}")
+    print("\nData freshness:")
+    print_rows(["source", "updated_at", "age_minutes"], freshness_rows(item["freshness"]))
+    return 0
+
+
+def cmd_set_result(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    match = find_match(conn, args.query)
+    previous, current = set_manual_match_result(conn, int(match["id"]), args.score, reason=args.reason)
+    reviews = finalize_completed_rounds(conn, lock_minutes=args.lock_minutes)
+    print_key_values(
+        [
+            ("match", match_header(match)),
+            ("previous_result", previous),
+            ("manual_result", current),
+            ("reason", args.reason),
+            ("completed_round_reviews", len(reviews)),
+        ]
+    )
+    return 0
+
+
+def cmd_result_history(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    match = find_match(conn, args.query)
+    print(match_header(match))
+    print_rows(
+        ["previous", "new", "changed_at", "chat_id", "reason"],
+        [
+            [clean(row["previous_result"]), row["new_result"], row["changed_at"], clean(row["actor_chat_id"]), clean(row["reason"])]
+            for row in manual_result_history(conn, int(match["id"]))
+        ],
     )
     return 0
 
@@ -1251,6 +1324,9 @@ def build_parser() -> argparse.ArgumentParser:
     hq = sub.add_parser("hq", help="Show headquarters summary for the active round.")
     hq.set_defaults(func=cmd_hq)
 
+    ready = sub.add_parser("ready", help="Run a preflight check for the active round.")
+    ready.set_defaults(func=cmd_ready)
+
     risk = sub.add_parser("risk", help="Show the risk map for a round.")
     risk.add_argument("round", nargs="?")
     risk.set_defaults(func=cmd_risk)
@@ -1325,6 +1401,16 @@ def build_parser() -> argparse.ArgumentParser:
     sync_results.add_argument("--compseason-id", type=int, default=int(env_default("PREMIER_LEAGUE_COMPSEASON_ID", str(DEFAULT_PL_COMPSEASON_ID))))
     sync_results.add_argument("--season-label", default=env_default("PREMIER_LEAGUE_SEASON_LABEL", DEFAULT_PL_SEASON_LABEL))
     sync_results.set_defaults(func=cmd_sync_results)
+
+    set_result = sub.add_parser("set-result", help="Manually set a fallback final result and record an audit entry.")
+    set_result.add_argument("query")
+    set_result.add_argument("score")
+    set_result.add_argument("--reason", default="manual fallback")
+    set_result.set_defaults(func=cmd_set_result)
+
+    result_history = sub.add_parser("result-history", help="Show manual result override history for one match.")
+    result_history.add_argument("query")
+    result_history.set_defaults(func=cmd_result_history)
 
     review = sub.add_parser("review", help="Show a post-round review with score swings and model results.")
     review.add_argument("round")

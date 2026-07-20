@@ -1,10 +1,18 @@
 from datetime import datetime
 import unittest
 
-from brucebet.analytics import capture_model_forecasts, model_calibration_summary, round_review
+from brucebet.analytics import capture_model_forecasts, model_calibration_summary, ready_summary, round_review
 from brucebet.pl_fixtures import import_pl_fixtures, import_pl_results
 from brucebet.reminders import due_reminders, mark_delivery_sent, subscribe_chat
-from brucebet.storage import connect, reset_db, upsert_match, upsert_match_assessment, upsert_prediction
+from brucebet.storage import (
+    connect,
+    manual_result_history,
+    reset_db,
+    set_manual_match_result,
+    upsert_match,
+    upsert_match_assessment,
+    upsert_prediction,
+)
 
 
 def completed_fixture(home: str, away: str, home_score: int, away_score: int) -> dict[str, object]:
@@ -85,6 +93,56 @@ class AutomationTest(unittest.TestCase):
         self.assertEqual(review["participants"][0]["participant"], "Bruce Wayne")
         self.assertEqual(calibration["exact"], 1)
         self.assertEqual(calibration["points"], 3)
+
+    def test_ready_summary_exposes_missing_field_and_data_gaps(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2026-08-15T18:00:00+03:00", None)
+        upsert_prediction(conn, "Bruce Wayne", "1", 1, "2:1", "2026-08-15T14:00:00+03:00", "test")
+        upsert_match_assessment(
+            conn,
+            {
+                "round": "1",
+                "position": "1",
+                "suggested_score": "2:1",
+                "risk_level": "medium",
+                "confidence": "0.60",
+                "updated_at": "2026-08-14T10:00:00+03:00",
+            },
+        )
+        capture_model_forecasts(conn, now=datetime.fromisoformat("2026-08-14T18:00:00+03:00"))
+
+        item = ready_summary(
+            conn,
+            now=datetime.fromisoformat("2026-08-15T15:00:00+03:00"),
+        )
+
+        self.assertEqual(item["round_name"], "1")
+        self.assertEqual(item["your_predictions"], 1)
+        self.assertEqual(item["model_forecasts"], 1)
+        self.assertEqual(item["status"], "attention")
+        self.assertTrue(any("FPL" in row for row in item["warnings"]))
+
+    def test_manual_result_override_keeps_audit_history(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        match_id = upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2026-08-15T18:00:00+03:00", "1:1")
+
+        previous, current = set_manual_match_result(
+            conn,
+            match_id,
+            "2-1",
+            actor_chat_id=42,
+            reason="official feed delay",
+            changed_at="2026-08-15T20:00:00+03:00",
+        )
+        history = manual_result_history(conn, match_id)
+
+        self.assertEqual(previous, "1:1")
+        self.assertEqual(current, "2:1")
+        self.assertEqual(history[0]["previous_result"], "1:1")
+        self.assertEqual(history[0]["new_result"], "2:1")
+        self.assertEqual(history[0]["reason"], "official feed delay")
 
 
 if __name__ == "__main__":
