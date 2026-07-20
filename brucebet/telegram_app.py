@@ -22,18 +22,22 @@ from telegram.ext import (
 
 from .analytics import (
     calendar_matches,
+    capture_model_forecasts,
     compare_participants,
     compute_standings,
     field_summary,
+    finalize_completed_rounds,
     hq_summary,
     match_dossier,
     match_header,
+    model_calibration_summary,
     next_calendar_match,
     player_status_summary,
     prediction_views_for_match,
     recommend_match,
     risk_map,
     round_deadlines,
+    round_review,
     strategy_summary,
 )
 from .odds_api import (
@@ -45,11 +49,23 @@ from .odds_api import (
     TheOddsApiClient,
     sync_odds_to_db,
 )
-from .pl_fixtures import DEFAULT_PL_COMPSEASON_ID, DEFAULT_PL_SEASON_LABEL, PremierLeagueApiError, sync_pl_fixtures_to_db
+from .pl_fixtures import (
+    DEFAULT_PL_COMPSEASON_ID,
+    DEFAULT_PL_SEASON_LABEL,
+    PremierLeagueApiError,
+    sync_pl_fixtures_to_db,
+    sync_pl_results_to_db,
+)
+from .rehearsal import run_rehearsal
+from .reminders import (
+    due_reminders,
+    mark_delivery_failed,
+    mark_delivery_sent,
+    reminder_overview,
+    subscribe_chat,
+)
 from .scoring import is_standard_score, normalize_score, parse_datetime, parse_score
 from .service_messages import (
-    deadline_after_message,
-    deadline_reminder_schedule,
     deadline_schedule_created,
     participant_forecasts_loaded,
     render,
@@ -101,6 +117,8 @@ class BotSettings:
     auto_sync_enabled: bool
     auto_sync_interval_hours: int
     auto_sync_first_delay_minutes: int
+    reminder_interval_minutes: int
+    reminder_grace_minutes: int
 
 
 def parse_chat_ids(raw: str | None) -> frozenset[int]:
@@ -146,6 +164,8 @@ def load_settings() -> BotSettings:
         auto_sync_enabled=parse_bool(os.getenv("BRUCEBET_AUTO_SYNC"), default=True),
         auto_sync_interval_hours=int(os.getenv("BRUCEBET_AUTO_SYNC_INTERVAL_HOURS", "12")),
         auto_sync_first_delay_minutes=int(os.getenv("BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES", "5")),
+        reminder_interval_minutes=int(os.getenv("BRUCEBET_REMINDER_INTERVAL_MINUTES", "5")),
+        reminder_grace_minutes=int(os.getenv("BRUCEBET_REMINDER_GRACE_MINUTES", "35")),
     )
 
 
@@ -326,6 +346,51 @@ def render_variable_sync(result: VariableSyncResult) -> str:
     return "Variables sync done.\n\n" + render_key_values(rows)
 
 
+def render_calibration(item: dict[str, object]) -> str:
+    rows = [
+        ["forecasts", item["forecasts"]],
+        ["scored", item["scored"]],
+        ["pending", item["pending"]],
+        ["exact", item["exact"]],
+        ["diff", item["diff"]],
+        ["outcome", item["outcome"]],
+        ["miss", item["miss"]],
+        ["points", item["points"]],
+        ["points_per_match", item["points_per_match"]],
+    ]
+    buckets = [
+        [name, values["forecasts"], values["exact"], values["diff"], values["outcome"], values["miss"], values["points"]]
+        for name, values in item["buckets"].items()
+    ]
+    return "Model calibration:\n" + render_rows(["metric", "value"], rows) + "\n\nConfidence:\n" + render_rows(
+        ["bucket", "n", "exact", "diff", "outcome", "miss", "points"], buckets
+    )
+
+
+def render_round_review(item: dict[str, object]) -> str:
+    sections = [
+        f"Разбор тура {item['round_name']}: завершено {item['finished_count']}/{item['match_count']}",
+        "Туровая таблица:\n"
+        + render_rows(
+            ["participant", "points", "exact", "diff", "outcome", "miss", "late"],
+            [
+                [row["participant"], row["points"], row["exact"], row["diff"], row["outcome"], row["miss"], row["late"]]
+                for row in item["participants"]
+            ],
+        ),
+    ]
+    if item["swings"]:
+        sections.append(
+            "Качели тура:\n"
+            + render_rows(
+                ["#", "match", "result", "spread"],
+                [[row["position"], row["match"], row["result"], row["spread"]] for row in item["swings"]],
+            )
+        )
+    sections.append(render_calibration(item["calibration"]))
+    return "\n\n".join(sections)
+
+
 def render_dossier(dossier: dict[str, object]) -> str:
     sections = [match_header(dossier["match"])]
     sections.append(
@@ -454,6 +519,8 @@ def db_status(conn: sqlite3.Connection) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = settings_from_context(context)
     conn = conn_from_context(context)
+    if update.effective_chat is not None:
+        subscribe_chat(conn, update.effective_chat.id)
     season = active_season(conn)
     lines = [
         "BruceBet 3000 на связи.",
@@ -461,7 +528,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         db_status(conn),
         f"Твой участник: {settings.user_participant}.",
         "",
-        "Команды: /hq, /calendar, /today, /week, /next, /round, /variables, /load, /table, /field, /recommend, /odds, /quota, /sources, /sync_fixtures, /sync_odds, /risk, /strategy, /match, /vs, /deadlines, /schedule, /audit, /id.",
+        "Команды: /hq, /calendar, /today, /week, /next, /round, /variables, /load, /table, /field, /recommend, /odds, /quota, /sources, /sync_fixtures, /sync_results, /sync_odds, /risk, /strategy, /match, /vs, /deadlines, /schedule, /audit, /review, /calibration, /rehearse, /id.",
     ]
     lines.append("New: /sync_variables, /dossier <match>.")
     if not settings.allowed_chat_ids:
@@ -503,6 +570,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\n".join(
             [
                 "/sync_variables - sync FPL, ClubElo, context, weather, model variables",
+                "/sync_results - забрать финальные результаты и закрыть завершенные туры",
                 "/dossier <match> - match variable card",
                 "/id - показать chat_id для whitelist",
                 "/load - пришли VK-пасту текстом или файлом",
@@ -526,8 +594,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/match <матч> - прогнозы участников",
                 "/vs <участник> - отличия тебя от участника",
                 "/deadlines - дедлайны туров",
-                "/schedule - поставить напоминания в этот чат",
+                "/schedule - подписать этот чат на постоянные напоминания",
                 "/audit - пропуски, нестандартные форматы, поздние проверки",
+                "/review <тур> - пост-туровый разбор и качели очков",
+                "/calibration [тур] - точность зафиксированных прогнозов модели",
+                "/rehearse - изолированная репетиция полного тура",
             ]
         ),
     )
@@ -814,7 +885,7 @@ async def sync_odds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await send_text(update, "\n".join(lines))
 
 
-def sync_variables_worker(settings: BotSettings) -> VariableSyncResult:
+def sync_variables_worker(settings: BotSettings) -> tuple[VariableSyncResult, int]:
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = connect(settings.db_path)
     try:
@@ -826,12 +897,13 @@ def sync_variables_worker(settings: BotSettings) -> VariableSyncResult:
             season_display_name=settings.season_display,
             lock_minutes=settings.lock_minutes,
         )
-        return sync_match_variables(
+        result = sync_match_variables(
             conn,
             days_ahead=settings.variables_days_ahead,
             weather_days=settings.weather_days_ahead,
             timezone_name=settings.timezone,
         )
+        return result, capture_model_forecasts(conn)
     finally:
         conn.close()
 
@@ -840,8 +912,90 @@ def sync_variables_worker(settings: BotSettings) -> VariableSyncResult:
 async def sync_variables_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = settings_from_context(context)
     await send_text(update, "Syncing FPL, ClubElo, context, weather, and model draft variables.")
-    result = await asyncio.to_thread(sync_variables_worker, settings)
-    await send_text(update, render_variable_sync(result))
+    result, captured = await asyncio.to_thread(sync_variables_worker, settings)
+    await send_text(update, render_variable_sync(result) + f"\n\nModel forecasts frozen before kickoff: {captured}.")
+
+
+def sync_results_worker(settings: BotSettings):
+    settings.db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        activate_profile(
+            conn,
+            competition_code=settings.competition,
+            season_name=settings.season,
+            season_display_name=settings.season_display,
+            lock_minutes=settings.lock_minutes,
+        )
+        result = sync_pl_results_to_db(
+            conn,
+            compseason_id=settings.pl_compseason_id,
+            season_label=settings.pl_season_label,
+        )
+        return result, finalize_completed_rounds(conn, lock_minutes=settings.lock_minutes)
+    finally:
+        conn.close()
+
+
+@require_access
+async def sync_results_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    await send_text(update, "Проверяю финальные результаты через официальный PL feed.")
+    try:
+        result, reviews = await asyncio.to_thread(sync_results_worker, settings)
+    except PremierLeagueApiError as exc:
+        await send_text(update, f"Результаты не синкнулись:\n{exc}")
+        return
+    lines = [
+        "Синк результатов готов.",
+        f"finished_seen: {result.finished_seen}",
+        f"matched: {result.matched}",
+        f"updated: {result.updated}",
+        f"completed_round_reviews: {len(reviews)}",
+    ]
+    if result.unmatched:
+        lines.append("Не сматчил: " + "; ".join(result.unmatched[:5]))
+    await send_text(update, "\n".join(lines))
+
+
+@require_access
+async def review_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    round_name = query_text(context)
+    if not round_name:
+        await send_text(update, "Напиши тур: /review 1")
+        return
+    conn = conn_from_context(context)
+    try:
+        item = round_review(conn, round_name, lock_minutes=settings.lock_minutes)
+    except ValueError as exc:
+        await send_text(update, str(exc))
+        return
+    await send_text(update, render_round_review(item))
+
+
+@require_access
+async def calibration_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = conn_from_context(context)
+    await send_text(update, render_calibration(model_calibration_summary(conn, round_name=query_text(context) or None)))
+
+
+@require_access
+async def rehearse_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    item = await asyncio.to_thread(run_rehearsal, settings.lock_minutes)
+    standings = render_rows(
+        ["#", "participant", "points"],
+        [[row["rank"], row["name"], row["points"]] for row in item["standings"]],
+    )
+    await send_text(
+        update,
+        "Репетиция прошла в изолированной базе, живые данные не тронуты.\n\n"
+        + standings
+        + "\n\n"
+        + render_round_review(item["review"]),
+    )
 
 
 @require_access
@@ -1118,52 +1272,31 @@ async def variables_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    data = context.job.data
-    await context.bot.send_message(chat_id=data["chat_id"], text=data["text"])
-
-
 @require_access
 async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = settings_from_context(context)
     chat = update.effective_chat
     if chat is None:
         return
-    if context.job_queue is None:
-        await send_text(update, "JobQueue не подключён. Проверь зависимость python-telegram-bot[job-queue].")
-        return
-
-    now = datetime.now().astimezone()
     conn = conn_from_context(context)
-    scheduled = 0
+    subscribe_chat(conn, chat.id)
+    overview = reminder_overview(conn, chat.id)
     messages: list[str] = []
     for deadline in round_deadlines(conn, lock_minutes=settings.lock_minutes):
         effective = deadline.effective_deadline_at
-        if effective is None or effective <= now:
+        if effective is None or effective <= datetime.now().astimezone():
             continue
-        for item in deadline_reminder_schedule(effective):
-            if item.send_at <= now:
-                continue
-            context.job_queue.run_once(
-                reminder_job,
-                when=item.send_at,
-                data={"chat_id": chat.id, "text": item.reply.text},
-                name=f"round-{deadline.round_name}-{item.key}-{chat.id}",
-            )
-            scheduled += 1
-        context.job_queue.run_once(
-            reminder_job,
-            when=effective,
-            data={"chat_id": chat.id, "text": deadline_after_message(effective).text},
-            name=f"round-{deadline.round_name}-deadline-passed-{chat.id}",
-        )
-        scheduled += 1
         messages.append(render(deadline_schedule_created(deadline.round_name, effective)))
 
-    if scheduled == 0:
+    if not messages:
         await send_text(update, "Будущих дедлайнов с датой не нашёл. Нужен шаблон тура или kickoff/deadline в базе.")
     else:
-        await send_text(update, "\n\n".join(messages) + f"\n\nВсего задач напоминаний: {scheduled}.")
+        await send_text(
+            update,
+            "\n\n".join(messages)
+            + "\n\nНапоминания сохранены в базе и переживут рестарт контейнера. "
+            + f"Доставлено раньше: {overview['sent']}; ожидают повтора: {overview['pending']}.",
+        )
 
 
 def import_parsed_files(settings: BotSettings, templates_count: int) -> tuple[int, int, int]:
@@ -1265,25 +1398,107 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await process_vk_text(update, context, text)
 
 
-def auto_sync_worker(settings: BotSettings) -> tuple[object, VariableSyncResult]:
+def auto_sync_worker(settings: BotSettings) -> tuple[object, VariableSyncResult, int, object, list[dict[str, object]]]:
     fixture_result = sync_fixtures_worker(settings)
-    variable_result = sync_variables_worker(settings)
-    return fixture_result, variable_result
+    variable_result, captured = sync_variables_worker(settings)
+    result_sync, reviews = sync_results_worker(settings)
+    return fixture_result, variable_result, captured, result_sync, reviews
 
 
 async def auto_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = settings_from_context(context)
     try:
-        fixture_result, variable_result = await asyncio.to_thread(auto_sync_worker, settings)
+        fixture_result, variable_result, captured, result_sync, reviews = await asyncio.to_thread(auto_sync_worker, settings)
     except Exception:  # noqa: BLE001 - background job must keep the bot alive.
         LOGGER.exception("Auto sync failed")
         return
     LOGGER.info(
-        "Auto sync done fixtures=%s variables_contexts=%s variables_errors=%s",
+        "Auto sync done fixtures=%s variables_contexts=%s model_captured=%s results_updated=%s completed_reviews=%s variables_errors=%s",
         getattr(fixture_result, "imported", None),
         variable_result.contexts_upserted,
+        captured,
+        result_sync.updated,
+        len(reviews),
         len(variable_result.errors),
     )
+
+
+def due_reminders_worker(settings: BotSettings):
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        activate_profile(
+            conn,
+            competition_code=settings.competition,
+            season_name=settings.season,
+            season_display_name=settings.season_display,
+            lock_minutes=settings.lock_minutes,
+        )
+        return due_reminders(
+            conn,
+            lock_minutes=settings.lock_minutes,
+            grace_minutes=settings.reminder_grace_minutes,
+        )
+    finally:
+        conn.close()
+
+
+def complete_reminder_delivery_worker(settings: BotSettings, delivery_id: int, error: str | None = None) -> None:
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        if error:
+            mark_delivery_failed(conn, delivery_id, error)
+        else:
+            mark_delivery_sent(conn, delivery_id)
+    finally:
+        conn.close()
+
+
+async def deadline_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    try:
+        deliveries = await asyncio.to_thread(due_reminders_worker, settings)
+    except Exception:  # noqa: BLE001 - one failing reminder pass must not kill polling.
+        LOGGER.exception("Deadline reminder lookup failed")
+        return
+    for delivery in deliveries:
+        try:
+            await context.bot.send_message(chat_id=delivery.chat_id, text=delivery.text)
+        except Exception as exc:  # noqa: BLE001 - leave it pending for a retry.
+            LOGGER.warning("Deadline reminder failed chat=%s key=%s: %s", delivery.chat_id, delivery.reminder_key, exc)
+            await asyncio.to_thread(complete_reminder_delivery_worker, settings, delivery.delivery_id, str(exc))
+            continue
+        await asyncio.to_thread(complete_reminder_delivery_worker, settings, delivery.delivery_id)
+
+
+def configure_deadline_reminders(application: Application, settings: BotSettings) -> None:
+    if settings.allowed_chat_ids:
+        conn = connect(settings.db_path)
+        try:
+            init_db(conn)
+            activate_profile(
+                conn,
+                competition_code=settings.competition,
+                season_name=settings.season,
+                season_display_name=settings.season_display,
+                lock_minutes=settings.lock_minutes,
+            )
+            for chat_id in settings.allowed_chat_ids:
+                subscribe_chat(conn, chat_id)
+        finally:
+            conn.close()
+    if application.job_queue is None:
+        LOGGER.warning("Deadline reminders requested, but JobQueue is not available")
+        return
+    interval = max(1, settings.reminder_interval_minutes)
+    application.job_queue.run_repeating(
+        deadline_reminder_job,
+        interval=timedelta(minutes=interval),
+        first=timedelta(seconds=15),
+        name="brucebet-deadline-reminders",
+    )
+    LOGGER.info("Deadline reminder dispatcher scheduled every %s minutes", interval)
 
 
 def configure_auto_sync(application: Application, settings: BotSettings) -> None:
@@ -1318,6 +1533,7 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("quota", quota_cmd))
     application.add_handler(CommandHandler("sources", sources_cmd))
     application.add_handler(CommandHandler("sync_fixtures", sync_fixtures_cmd))
+    application.add_handler(CommandHandler("sync_results", sync_results_cmd))
     application.add_handler(CommandHandler("sync_odds", sync_odds_cmd))
     application.add_handler(CommandHandler("sync_variables", sync_variables_cmd))
     application.add_handler(CommandHandler("risk", risk_cmd))
@@ -1332,12 +1548,16 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("dossier", dossier_cmd))
     application.add_handler(CommandHandler("vs", vs_cmd))
     application.add_handler(CommandHandler("audit", audit_cmd))
+    application.add_handler(CommandHandler("review", review_cmd))
+    application.add_handler(CommandHandler("calibration", calibration_cmd))
+    application.add_handler(CommandHandler("rehearse", rehearse_cmd))
     application.add_handler(CommandHandler("deadline", deadlines_cmd))
     application.add_handler(CommandHandler("deadlines", deadlines_cmd))
     application.add_handler(CommandHandler("schedule", schedule_cmd))
     application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     configure_auto_sync(application, settings)
+    configure_deadline_reminders(application, settings)
     return application
 
 

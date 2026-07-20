@@ -41,6 +41,8 @@ Recommended env:
 - `BRUCEBET_AUTO_SYNC=1`
 - `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS=12`
 - `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES=5`
+- `BRUCEBET_REMINDER_INTERVAL_MINUTES=5`
+- `BRUCEBET_REMINDER_GRACE_MINUTES=35`
 - `BRUCEBET_VARIABLE_DAYS_AHEAD=365`
 - `BRUCEBET_WEATHER_DAYS_AHEAD=16`
 - `BRUCEBET_SNAPSHOT_LABEL=server-auto`
@@ -68,6 +70,7 @@ In Telegram:
 /quota
 /sources
 /sync_fixtures
+/sync_results
 /sync_variables
 /sync_odds
 /dossier Arsenal
@@ -80,9 +83,12 @@ In Telegram:
 /risk
 /strategy
 /schedule
+/review 1
+/calibration
+/rehearse
 ```
 
-`/schedule` puts reminder jobs in the running process for the current chat. If the container restarts, run `/schedule` again.
+`/schedule` subscribes the current chat to persistent deadline reminders. Delivery state is stored in SQLite, so a container restart does not lose the schedule or resend reminders already delivered.
 
 ## Updating data
 

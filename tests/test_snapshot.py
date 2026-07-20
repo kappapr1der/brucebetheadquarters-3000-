@@ -65,6 +65,8 @@ class SnapshotTest(unittest.TestCase):
             filenames = {path.name for path in out_dir.iterdir()}
             self.assertIn("manifest.json", filenames)
             self.assertIn("match_assessments.csv", filenames)
+            self.assertIn("model_forecasts.csv", filenames)
+            self.assertIn("round_reviews.csv", filenames)
             self.assertFalse(any(path.suffix == ".sqlite" for path in out_dir.iterdir()))
 
 

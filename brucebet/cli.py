@@ -9,11 +9,14 @@ import sys
 
 from .analytics import (
     calendar_matches,
+    capture_model_forecasts,
     compare_participants,
     compute_standings,
     field_summary,
+    finalize_completed_rounds,
     hq_summary,
     match_header,
+    model_calibration_summary,
     match_dossier,
     next_calendar_match,
     player_status_summary,
@@ -22,6 +25,7 @@ from .analytics import (
     recommend_match,
     risk_map,
     round_deadlines,
+    round_review,
     strategy_summary,
     team_profile,
 )
@@ -35,7 +39,14 @@ from .odds_api import (
     TheOddsApiClient,
     sync_odds_to_db,
 )
-from .pl_fixtures import DEFAULT_PL_COMPSEASON_ID, DEFAULT_PL_SEASON_LABEL, PremierLeagueApiError, sync_pl_fixtures_to_db
+from .pl_fixtures import (
+    DEFAULT_PL_COMPSEASON_ID,
+    DEFAULT_PL_SEASON_LABEL,
+    PremierLeagueApiError,
+    sync_pl_fixtures_to_db,
+    sync_pl_results_to_db,
+)
+from .rehearsal import run_rehearsal
 from .sources import SourceConfig, check_all_sources
 from .snapshot import export_snapshot
 from .storage import (
@@ -875,7 +886,121 @@ def cmd_sync_variables(args: argparse.Namespace) -> int:
         include_assessments=not args.skip_assessments,
     )
     print_key_values(variable_sync_rows(result))
+    captured = capture_model_forecasts(conn)
+    print(f"model_forecasts_captured={captured}")
     return 0 if not result.errors else 1
+
+
+def print_calibration(item: dict[str, object]) -> None:
+    print_key_values(
+        [
+            ("model", item["model_key"]),
+            ("forecasts", item["forecasts"]),
+            ("scored", item["scored"]),
+            ("pending", item["pending"]),
+            ("exact", item["exact"]),
+            ("diff", item["diff"]),
+            ("outcome", item["outcome"]),
+            ("miss", item["miss"]),
+            ("points", item["points"]),
+            ("points_per_match", item["points_per_match"]),
+        ]
+    )
+    print()
+    print("Confidence buckets:")
+    print_rows(
+        ["bucket", "forecasts", "exact", "diff", "outcome", "miss", "points"],
+        [
+            [bucket, value["forecasts"], value["exact"], value["diff"], value["outcome"], value["miss"], value["points"]]
+            for bucket, value in item["buckets"].items()
+        ],
+    )
+
+
+def print_round_review(item: dict[str, object]) -> None:
+    print_key_values(
+        [
+            ("round", item["round_name"]),
+            ("finished", f"{item['finished_count']}/{item['match_count']}"),
+            ("complete", item["complete"]),
+        ]
+    )
+    print()
+    print("Round standings:")
+    print_rows(
+        ["participant", "points", "exact", "diff", "outcome", "miss", "late"],
+        [
+            [row["participant"], row["points"], row["exact"], row["diff"], row["outcome"], row["miss"], row["late"]]
+            for row in item["participants"]
+        ],
+    )
+    if item["swings"]:
+        print()
+        print("Main swings:")
+        print_rows(
+            ["#", "match", "result", "spread", "max", "min"],
+            [
+                [row["position"], row["match"], row["result"], row["spread"], row["max_points"], row["min_points"]]
+                for row in item["swings"]
+            ],
+        )
+    print()
+    print("Model calibration:")
+    print_calibration(item["calibration"])
+
+
+def cmd_sync_results(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    try:
+        result = sync_pl_results_to_db(
+            conn,
+            compseason_id=args.compseason_id,
+            season_label=args.season_label,
+        )
+    except PremierLeagueApiError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    reviews = finalize_completed_rounds(conn, lock_minutes=args.lock_minutes)
+    print_key_values(
+        [
+            ("source", result.source),
+            ("fetched", result.fetched),
+            ("finished_seen", result.finished_seen),
+            ("matched", result.matched),
+            ("updated", result.updated),
+            ("unmatched", len(result.unmatched)),
+            ("completed_round_reviews", len(reviews)),
+        ]
+    )
+    if result.unmatched:
+        print("Unmatched completed fixtures:")
+        for item in result.unmatched[:10]:
+            print(f"- {item}")
+    return 0
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    print_round_review(round_review(conn, args.round, lock_minutes=args.lock_minutes))
+    return 0
+
+
+def cmd_calibration(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    print_calibration(model_calibration_summary(conn, round_name=args.round or None))
+    return 0
+
+
+def cmd_rehearse(args: argparse.Namespace) -> int:
+    item = run_rehearsal(lock_minutes=args.lock_minutes)
+    print("Rehearsal completed without touching the live database.")
+    print_key_values([("model_forecasts_captured", item["captured"]), ("reviews_saved", item["reviews_saved"])])
+    print()
+    print("Final standings:")
+    print_rows([["#", "participant", "points"][index] for index in range(3)], [[row["rank"], row["name"], row["points"]] for row in item["standings"]])
+    print()
+    print_round_review(item["review"])
+    return 0
 
 
 def cmd_snapshot(args: argparse.Namespace) -> int:
@@ -1195,6 +1320,22 @@ def build_parser() -> argparse.ArgumentParser:
     sync_variables.add_argument("--skip-context", action="store_true")
     sync_variables.add_argument("--skip-assessments", action="store_true")
     sync_variables.set_defaults(func=cmd_sync_variables)
+
+    sync_results = sub.add_parser("sync-results", help="Fetch completed PL results and finalize complete round reviews.")
+    sync_results.add_argument("--compseason-id", type=int, default=int(env_default("PREMIER_LEAGUE_COMPSEASON_ID", str(DEFAULT_PL_COMPSEASON_ID))))
+    sync_results.add_argument("--season-label", default=env_default("PREMIER_LEAGUE_SEASON_LABEL", DEFAULT_PL_SEASON_LABEL))
+    sync_results.set_defaults(func=cmd_sync_results)
+
+    review = sub.add_parser("review", help="Show a post-round review with score swings and model results.")
+    review.add_argument("round")
+    review.set_defaults(func=cmd_review)
+
+    calibration = sub.add_parser("calibration", help="Show BruceBet model calibration from frozen pre-kickoff forecasts.")
+    calibration.add_argument("round", nargs="?")
+    calibration.set_defaults(func=cmd_calibration)
+
+    rehearse = sub.add_parser("rehearse", help="Run an isolated end-to-end test round without touching live data.")
+    rehearse.set_defaults(func=cmd_rehearse)
 
     snapshot = sub.add_parser("snapshot", help="Export a safe CSV/JSON snapshot of the active season.")
     snapshot.add_argument(

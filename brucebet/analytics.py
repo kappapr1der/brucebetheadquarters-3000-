@@ -3,9 +3,10 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+import json
 import sqlite3
 
-from .scoring import Score, is_prediction_eligible, parse_datetime, parse_score, score_prediction
+from .scoring import Score, is_prediction_eligible, normalize_score, parse_datetime, parse_score, score_prediction
 from .storage import active_season, active_season_id
 
 
@@ -613,6 +614,270 @@ def strategy_summary(
         "advice": advice,
         "risk": risk_map(conn),
     }
+
+
+def capture_model_forecasts(
+    conn: sqlite3.Connection,
+    now: datetime | None = None,
+    model_key: str = "brucebet",
+) -> int:
+    """Freeze the current model draft before kickoff for later honest calibration."""
+    now = now or datetime.now().astimezone()
+    season_id = active_season_id(conn)
+    rows = conn.execute(
+        """
+        SELECT
+            m.id AS match_id,
+            m.kickoff_at,
+            a.suggested_score,
+            a.confidence,
+            a.risk_level,
+            a.updated_at
+        FROM matches m
+        JOIN rounds r ON r.id = m.round_id
+        JOIN match_assessments a ON a.match_id = m.id
+        WHERE r.season_id = ?
+        ORDER BY r.sort_order, m.position
+        """,
+        (season_id,),
+    )
+    captured = 0
+    for row in rows:
+        score = normalize_score(row["suggested_score"])
+        kickoff = parse_datetime(row["kickoff_at"])
+        if score is None or (kickoff is not None and kickoff <= now):
+            continue
+        cursor = conn.execute(
+            """
+            INSERT INTO model_forecasts(
+                match_id, model_key, suggested_score, confidence, risk_level, captured_at, assessment_updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(match_id, model_key) DO NOTHING
+            """,
+            (
+                int(row["match_id"]),
+                model_key,
+                score,
+                row["confidence"],
+                row["risk_level"],
+                now.isoformat(),
+                row["updated_at"],
+            ),
+        )
+        captured += int(cursor.rowcount)
+    conn.commit()
+    return captured
+
+
+def model_calibration_summary(
+    conn: sqlite3.Connection,
+    round_name: str | None = None,
+    model_key: str = "brucebet",
+) -> dict[str, object]:
+    season_id = active_season_id(conn)
+    where_round = "AND r.name = ?" if round_name else ""
+    params: tuple[object, ...] = (season_id, model_key, round_name) if round_name else (season_id, model_key)
+    rows = conn.execute(
+        f"""
+        SELECT
+            r.name AS round_name,
+            r.sort_order,
+            m.id AS match_id,
+            m.home,
+            m.away,
+            m.result,
+            f.suggested_score,
+            f.confidence,
+            f.risk_level,
+            f.captured_at
+        FROM model_forecasts f
+        JOIN matches m ON m.id = f.match_id
+        JOIN rounds r ON r.id = m.round_id
+        WHERE r.season_id = ? AND f.model_key = ? {where_round}
+        ORDER BY r.sort_order, m.position
+        """,
+        params,
+    ).fetchall()
+    totals: Counter[str] = Counter()
+    buckets: dict[str, Counter[str]] = {"low": Counter(), "medium": Counter(), "high": Counter()}
+    matches: list[dict[str, object]] = []
+    for row in rows:
+        award = score_prediction(parse_score(row["suggested_score"]), parse_score(row["result"]))
+        bucket = "low"
+        confidence = float(row["confidence"] or 0)
+        if confidence >= 0.65:
+            bucket = "high"
+        elif confidence >= 0.45:
+            bucket = "medium"
+        totals[award.category] += 1
+        totals["points"] += award.points
+        buckets[bucket][award.category] += 1
+        buckets[bucket]["points"] += award.points
+        matches.append(
+            {
+                "round_name": row["round_name"],
+                "match": f"{row['home']} - {row['away']}",
+                "forecast": row["suggested_score"],
+                "result": row["result"] or "",
+                "category": award.category,
+                "points": award.points,
+                "confidence": row["confidence"],
+                "risk_level": row["risk_level"] or "",
+            }
+        )
+    scored = sum(totals[key] for key in ("exact", "diff", "outcome", "miss"))
+    return {
+        "model_key": model_key,
+        "forecasts": len(rows),
+        "scored": scored,
+        "pending": totals["pending"],
+        "exact": totals["exact"],
+        "diff": totals["diff"],
+        "outcome": totals["outcome"],
+        "miss": totals["miss"],
+        "points": totals["points"],
+        "points_per_match": round(totals["points"] / scored, 2) if scored else 0.0,
+        "buckets": {
+            key: {
+                "forecasts": sum(value[item] for item in ("exact", "diff", "outcome", "miss", "pending")),
+                "points": value["points"],
+                "exact": value["exact"],
+                "diff": value["diff"],
+                "outcome": value["outcome"],
+                "miss": value["miss"],
+            }
+            for key, value in buckets.items()
+        },
+        "matches": matches,
+    }
+
+
+def round_review(conn: sqlite3.Connection, round_name: str, lock_minutes: int = 90) -> dict[str, object]:
+    """Build a compact factual debrief for one round, including score swings."""
+    season_id = active_season_id(conn)
+    round_row = conn.execute(
+        "SELECT id, name, sort_order, deadline_at FROM rounds WHERE season_id = ? AND name = ?",
+        (season_id, round_name),
+    ).fetchone()
+    if round_row is None:
+        raise ValueError(f"Unknown round: {round_name}")
+    matches = list(
+        conn.execute(
+            "SELECT id, position, home, away, kickoff_at, result FROM matches WHERE round_id = ? ORDER BY position",
+            (int(round_row["id"]),),
+        )
+    )
+    participants = {
+        int(row["id"]): {
+            "participant": row["name"],
+            "points": 0,
+            "exact": 0,
+            "diff": 0,
+            "outcome": 0,
+            "miss": 0,
+            "late": 0,
+        }
+        for row in _participants(conn)
+    }
+    predictions = conn.execute(
+        """
+        SELECT pr.participant_id, pr.match_id, pr.score, pr.submitted_at
+        FROM predictions pr
+        JOIN matches m ON m.id = pr.match_id
+        WHERE m.round_id = ?
+        """,
+        (int(round_row["id"]),),
+    ).fetchall()
+    match_by_id = {int(match["id"]): match for match in matches}
+    points_by_match: dict[int, list[int]] = defaultdict(list)
+    deadline_at = parse_datetime(round_row["deadline_at"])
+    for row in predictions:
+        participant = participants.get(int(row["participant_id"]))
+        match = match_by_id.get(int(row["match_id"]))
+        if participant is None or match is None:
+            continue
+        eligible = prediction_is_eligible(
+            parse_datetime(row["submitted_at"]),
+            parse_datetime(match["kickoff_at"]),
+            deadline_at,
+            lock_minutes,
+        )
+        if not eligible:
+            participant["late"] += 1
+            continue
+        award = score_prediction(parse_score(row["score"]), parse_score(match["result"]))
+        participant["points"] += award.points
+        participant[award.category] = int(participant.get(award.category, 0)) + 1
+        if parse_score(match["result"]):
+            points_by_match[int(match["id"])].append(award.points)
+    participant_rows = sorted(
+        participants.values(),
+        key=lambda row: (-int(row["points"]), -int(row["exact"]), -int(row["diff"]), str(row["participant"]).lower()),
+    )
+    swings = []
+    for match in matches:
+        points = points_by_match.get(int(match["id"]), [])
+        if not points or parse_score(match["result"]) is None:
+            continue
+        swings.append(
+            {
+                "position": int(match["position"]),
+                "match": f"{match['home']} - {match['away']}",
+                "result": match["result"],
+                "spread": max(points) - min(points),
+                "max_points": max(points),
+                "min_points": min(points),
+            }
+        )
+    swings.sort(key=lambda row: (-int(row["spread"]), int(row["position"])))
+    finished = sum(1 for match in matches if parse_score(match["result"]) is not None)
+    return {
+        "round_name": round_row["name"],
+        "round_id": int(round_row["id"]),
+        "match_count": len(matches),
+        "finished_count": finished,
+        "complete": bool(matches) and finished == len(matches),
+        "participants": participant_rows,
+        "swings": swings[:5],
+        "calibration": model_calibration_summary(conn, round_name=round_name),
+    }
+
+
+def finalize_completed_rounds(conn: sqlite3.Connection, lock_minutes: int = 90) -> list[dict[str, object]]:
+    """Persist a review whenever every match in a round has a valid final score."""
+    season_id = active_season_id(conn)
+    rounds = conn.execute(
+        "SELECT id, name FROM rounds WHERE season_id = ? ORDER BY sort_order",
+        (season_id,),
+    ).fetchall()
+    saved: list[dict[str, object]] = []
+    completed_at = datetime.now().astimezone().isoformat()
+    for row in rounds:
+        review = round_review(conn, str(row["name"]), lock_minutes=lock_minutes)
+        if not review["complete"]:
+            continue
+        conn.execute(
+            """
+            INSERT INTO round_reviews(round_id, completed_at, match_count, finished_count, payload_json)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(round_id) DO UPDATE SET
+                completed_at = excluded.completed_at,
+                match_count = excluded.match_count,
+                finished_count = excluded.finished_count,
+                payload_json = excluded.payload_json
+            """,
+            (
+                int(row["id"]),
+                completed_at,
+                int(review["match_count"]),
+                int(review["finished_count"]),
+                json.dumps(review, ensure_ascii=True, sort_keys=True),
+            ),
+        )
+        saved.append(review)
+    conn.commit()
+    return saved
 
 
 def recommend_match(conn: sqlite3.Connection, match_id: int) -> dict[str, object]:

@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import re
 from zoneinfo import ZoneInfo
 import sqlite3
 import urllib.parse
@@ -28,6 +29,16 @@ class FixtureSyncResult:
     rounds: int
     first_kickoff: str | None
     last_kickoff: str | None
+
+
+@dataclass(frozen=True)
+class ResultSyncResult:
+    source: str
+    fetched: int
+    finished_seen: int
+    matched: int
+    updated: int
+    unmatched: tuple[str, ...]
 
 
 class PremierLeagueApiError(RuntimeError):
@@ -127,12 +138,97 @@ def result_score(fixture: dict[str, object]) -> str | None:
     score = fixture.get("score") or {}
     if not isinstance(score, dict):
         return None
-    home = score.get("homeScore") or score.get("home")
-    away = score.get("awayScore") or score.get("away")
+    home = score.get("homeScore") if score.get("homeScore") is not None else score.get("home")
+    away = score.get("awayScore") if score.get("awayScore") is not None else score.get("away")
     try:
         return f"{int(home)}:{int(away)}" if home is not None and away is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def fixture_is_finished(fixture: dict[str, object]) -> bool:
+    """Return true only for fixtures the official feed marks as complete."""
+    status = str(fixture.get("status") or "").strip().upper()
+    return status in {"C", "COMPLETED", "FINISHED", "FT", "AET", "PEN"}
+
+
+def _team_key(name: str) -> str:
+    value = name.lower().replace("&", "and")
+    return re.sub(r"[^a-z0-9]+", "", value)
+
+
+def import_pl_results(conn: sqlite3.Connection, fixtures: list[dict[str, object]]) -> ResultSyncResult:
+    """Import completed results without altering the calendar or incomplete matches."""
+    from .storage import active_season_id
+
+    season_id = active_season_id(conn)
+    db_matches = list(
+        conn.execute(
+            """
+            SELECT m.id, m.home, m.away
+            FROM matches m
+            JOIN rounds r ON r.id = m.round_id
+            WHERE r.season_id = ?
+            """,
+            (season_id,),
+        )
+    )
+    by_teams = {(_team_key(row["home"]), _team_key(row["away"])): int(row["id"]) for row in db_matches}
+    finished_seen = 0
+    matched = 0
+    updated = 0
+    unmatched: list[str] = []
+
+    for fixture in fixtures:
+        if not fixture_is_finished(fixture):
+            continue
+        finished_seen += 1
+        teams = fixture.get("teams") or []
+        if not isinstance(teams, list) or len(teams) < 2:
+            continue
+        home = team_name(teams[0])
+        away = team_name(teams[1])
+        score = result_score(fixture)
+        match_id = by_teams.get((_team_key(home), _team_key(away)))
+        if not home or not away or not score or match_id is None:
+            unmatched.append(f"{home or '?'} - {away or '?'}")
+            continue
+        matched += 1
+        cursor = conn.execute(
+            "UPDATE matches SET result = ? WHERE id = ? AND COALESCE(result, '') <> ?",
+            (score, match_id, score),
+        )
+        updated += int(cursor.rowcount)
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT INTO result_sync_runs(
+            source, started_at, finished_at, fixtures_seen, finished_seen, matched, updated, unmatched, notes
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "premierleague.com public API",
+            now,
+            now,
+            len(fixtures),
+            finished_seen,
+            matched,
+            updated,
+            len(unmatched),
+            "; ".join(unmatched[:20]),
+        ),
+    )
+    conn.commit()
+    return ResultSyncResult(
+        source="premierleague.com public API",
+        fetched=len(fixtures),
+        finished_seen=finished_seen,
+        matched=matched,
+        updated=updated,
+        unmatched=tuple(unmatched),
+    )
 
 
 def import_pl_fixtures(
@@ -174,7 +270,7 @@ def import_pl_fixtures(
                 home=home,
                 away=away,
                 kickoff_at=kickoff_at,
-                result=result_score(fixture),
+                result=result_score(fixture) if fixture_is_finished(fixture) else None,
             )
             imported += 1
             if kickoff_at:
@@ -208,3 +304,13 @@ def sync_pl_fixtures_to_db(
         season_label=season_label,
         timezone_name=timezone_name,
     )
+
+
+def sync_pl_results_to_db(
+    conn: sqlite3.Connection,
+    compseason_id: int | None = DEFAULT_PL_COMPSEASON_ID,
+    season_label: str = DEFAULT_PL_SEASON_LABEL,
+) -> ResultSyncResult:
+    client = PremierLeaguePublicClient()
+    resolved_id = compseason_id or client.resolve_compseason_id(season_label)
+    return import_pl_results(conn, client.fixtures(resolved_id))

@@ -336,6 +336,45 @@ def active_season_snapshot_tables(season_id: int) -> Iterable[SnapshotTable]:
         """,
         (season_id,),
     )
+    yield SnapshotTable(
+        "model_forecasts.csv",
+        """
+        SELECT
+            r.name AS round,
+            m.position,
+            m.home,
+            m.away,
+            f.model_key,
+            f.suggested_score,
+            f.confidence,
+            f.risk_level,
+            f.captured_at,
+            f.assessment_updated_at
+        FROM model_forecasts f
+        JOIN matches m ON m.id = f.match_id
+        JOIN rounds r ON r.id = m.round_id
+        WHERE r.season_id = ?
+        ORDER BY r.sort_order, m.position, f.model_key
+        """,
+        (season_id,),
+    )
+    yield SnapshotTable(
+        "round_reviews.csv",
+        """
+        SELECT
+            r.name AS round,
+            r.sort_order,
+            rr.completed_at,
+            rr.match_count,
+            rr.finished_count,
+            rr.payload_json
+        FROM round_reviews rr
+        JOIN rounds r ON r.id = rr.round_id
+        WHERE r.season_id = ?
+        ORDER BY r.sort_order
+        """,
+        (season_id,),
+    )
 
 
 def export_snapshot(conn: sqlite3.Connection, out_dir: str | Path, label: str | None = None) -> SnapshotResult:

@@ -31,8 +31,12 @@
 - `/quota`, `/sync_odds`, `/odds`: проверка квоты The Odds API, синк кэфов, просмотр снимков.
 - `/sources`: health-check всех подключенных источников данных.
 - `/sync_fixtures`: официальный календарь Premier League из public API сайта PL.
+- `/sync_results`: только финальные результаты из официального PL feed, затем автоматическое закрытие завершённого тура.
 - Сервисные сообщения: “принято”, “теперь кидай прогнозы участников”, “проверь аудит”.
-- Напоминания за 24 часа, 6 часов, 3 часа, 1 час и 20 минут до дедлайна.
+- Устойчивые напоминания за 24 часа, 6 часов, 3 часа, 1 час и 20 минут до дедлайна: доставки лежат в SQLite и переживают рестарт контейнера.
+- `/review <тур>`: пост-туровый разбор, туровая таблица и матчи-качели.
+- `/calibration [тур]`: честная калибровка замороженных до kickoff прогнозов модели.
+- `/rehearse`: изолированная репетиция полного тура без изменения живой базы.
 - Docker-деплой Telegram-бота.
 
 ## Быстрый Старт
@@ -41,6 +45,10 @@
 python -m brucebet.cli --db brucebet.sqlite load-sample
 python -m brucebet.cli --db brucebet.sqlite sync-fixtures
 python -m brucebet.cli --db brucebet.sqlite sync-variables
+python -m brucebet.cli --db brucebet.sqlite sync-results
+python -m brucebet.cli --db brucebet.sqlite review 1
+python -m brucebet.cli --db brucebet.sqlite calibration
+python -m brucebet.cli rehearse
 python -m brucebet.cli --db brucebet.sqlite snapshot --out-dir data/snapshots/current
 python -m brucebet.cli --db brucebet.sqlite hq
 python -m brucebet.cli --db brucebet.sqlite risk
@@ -98,6 +106,8 @@ PREMIER_LEAGUE_SEASON_LABEL=2026/2027
 BRUCEBET_AUTO_SYNC=1
 BRUCEBET_AUTO_SYNC_INTERVAL_HOURS=12
 BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES=5
+BRUCEBET_REMINDER_INTERVAL_MINUTES=5
+BRUCEBET_REMINDER_GRACE_MINUTES=35
 BRUCEBET_VARIABLE_DAYS_AHEAD=365
 BRUCEBET_WEATHER_DAYS_AHEAD=16
 BRUCEBET_SNAPSHOT_LABEL=server-auto
@@ -128,6 +138,7 @@ THESPORTSDB_KEY=123
 - `/quota`
 - `/sources`
 - `/sync_fixtures`
+- `/sync_results`
 - `/sync_variables`
 - `/sync_odds`
 - `/dossier <match>`
@@ -138,6 +149,9 @@ THESPORTSDB_KEY=123
 - `/deadlines`
 - `/schedule`
 - `/audit`
+- `/review <тур>`
+- `/calibration [тур]`
+- `/rehearse`
 
 ## CSV
 
@@ -168,6 +182,10 @@ Calendar commands:
 - `brucebet variables [team]` - latest player status/form snapshots.
 - `brucebet sync-fixtures` - fetch official Premier League fixtures into `matches`.
 - `brucebet sync-variables` - fetch FPL, ClubElo, context/weather, factors, and draft assessments.
+- `brucebet sync-results` - write only completed official results and save completed round reviews.
+- `brucebet review <тур>` - post-round scoreboard, score swings, and model performance.
+- `brucebet calibration [тур]` - accuracy/points for pre-kickoff frozen model forecasts.
+- `brucebet rehearse` - isolated end-to-end rehearsal without live database writes.
 - `brucebet snapshot` - export stable sanitized CSV/JSON files for server-side git snapshots.
 - `brucebet dossier <team>` - show the match variable card.
 - `brucebet quota` - check The Odds API key and remaining credits without spending odds quota.
@@ -202,9 +220,9 @@ python -m brucebet.cli --db brucebet.sqlite import --reset `
 - Team match factors: lineup confidence, absences impact, fatigue, baseline motivation.
 - Draft `match_assessments` based on Elo and latest stored odds when available.
 
-Telegram has `/sync_variables` and `/dossier <match>`. The bot also runs a quiet background sync every `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS` when `BRUCEBET_AUTO_SYNC=1`, after `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES` on startup.
+Telegram has `/sync_variables`, `/sync_results`, and `/dossier <match>`. The bot also runs a quiet background sync every `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS` when `BRUCEBET_AUTO_SYNC=1`, after `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES` on startup. It freezes available model drafts before kickoff and checks finished official results without spending Odds API credits.
 
-The background sync does not call The Odds API, so it does not spend odds credits. Use `/sync_odds` manually closer to deadline.
+The background sync does not call The Odds API, so it does not spend odds credits. Use `/sync_odds` manually closer to deadline. `/schedule` subscribes the current chat to persistent reminders; the dispatcher checks due deliveries every `BRUCEBET_REMINDER_INTERVAL_MINUTES` and retries failed sends inside the configured grace window.
 
 ## Runtime Data
 

@@ -227,6 +227,59 @@ CREATE TABLE IF NOT EXISTS match_assessments (
     notes TEXT,
     updated_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS result_sync_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    fixtures_seen INTEGER NOT NULL DEFAULT 0,
+    finished_seen INTEGER NOT NULL DEFAULT 0,
+    matched INTEGER NOT NULL DEFAULT 0,
+    updated INTEGER NOT NULL DEFAULT 0,
+    unmatched INTEGER NOT NULL DEFAULT 0,
+    notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS round_reviews (
+    round_id INTEGER PRIMARY KEY REFERENCES rounds(id) ON DELETE CASCADE,
+    completed_at TEXT NOT NULL,
+    match_count INTEGER NOT NULL,
+    finished_count INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS model_forecasts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+    model_key TEXT NOT NULL,
+    suggested_score TEXT NOT NULL,
+    confidence REAL,
+    risk_level TEXT,
+    captured_at TEXT NOT NULL,
+    assessment_updated_at TEXT,
+    UNIQUE(match_id, model_key)
+);
+
+CREATE TABLE IF NOT EXISTS reminder_subscriptions (
+    chat_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reminder_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    round_id INTEGER NOT NULL REFERENCES rounds(id) ON DELETE CASCADE,
+    reminder_key TEXT NOT NULL,
+    scheduled_at TEXT NOT NULL,
+    text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    sent_at TEXT,
+    error TEXT,
+    UNIQUE(chat_id, round_id, reminder_key)
+);
 """
 
 
@@ -250,6 +303,11 @@ def reset_db(conn: sqlite3.Connection) -> None:
         """
         PRAGMA foreign_keys = OFF;
         DROP TABLE IF EXISTS match_assessments;
+        DROP TABLE IF EXISTS reminder_deliveries;
+        DROP TABLE IF EXISTS reminder_subscriptions;
+        DROP TABLE IF EXISTS model_forecasts;
+        DROP TABLE IF EXISTS round_reviews;
+        DROP TABLE IF EXISTS result_sync_runs;
         DROP TABLE IF EXISTS team_match_factors;
         DROP TABLE IF EXISTS match_odds;
         DROP TABLE IF EXISTS match_contexts;
