@@ -1,9 +1,9 @@
 name,short_name,country,confederation,fifa_rank,elo_rating,market_value_m_eur,manager,preferred_formation,attack_rating,defense_rating,transition_rating,set_piece_rating,goalkeeper_rating,style_tags,notes,updated_at
-Belgium,BEL,Belgium,UEFA,8,1860,420,TBD,4-2-3-1,7.5,7.0,7.2,6.8,7.1,possession;patient;aging_core,Strong favorite on paper but not a 4:0 machine,2026-06-22T12:00:00+03:00
-Iran,IRN,Iran,AFC,20,1750,75,TBD,4-4-2,5.8,6.7,6.2,6.4,6.0,compact;low_block;set_pieces,Can drag favorites into ugly low-event games,2026-06-22T12:00:00+03:00
-Uruguay,URU,Uruguay,CONMEBOL,15,1825,310,TBD,4-3-3,7.1,6.9,7.4,6.5,6.8,pressing;vertical;physical,High ceiling but can leave transition space,2026-06-22T12:00:00+03:00
-Cape Verde,CPV,Cape Verde,CAF,65,1580,38,TBD,4-2-3-1,5.7,5.8,6.0,5.5,5.9,compact;counter;underdog,Dangerous if opponent overcommits,2026-06-22T12:00:00+03:00
-Ecuador,ECU,Ecuador,CONMEBOL,24,1775,245,TBD,4-3-3,6.6,7.2,7.0,6.1,6.7,athletic;pressing;low_scoring,Good defensive base,2026-06-22T12:00:00+03:00
-Curacao,CUW,Curacao,CONCACAF,82,1510,42,TBD,5-4-1,5.1,5.9,5.4,5.2,5.8,low_block;counter;deep_defense,Can make the game ugly,2026-06-22T12:00:00+03:00
-Portugal,POR,Portugal,UEFA,6,1885,980,TBD,4-3-3,8.4,7.4,7.8,7.0,7.3,technical;wide_attacks;depth,Favorite with enough depth for rotation,2026-06-22T12:00:00+03:00
-DR Congo,COD,DR Congo,CAF,58,1615,110,TBD,4-2-3-1,6.2,6.1,6.7,5.7,6.0,physical;transition;volatile,Can hurt favorites on counters,2026-06-22T12:00:00+03:00
+Arsenal,ARS,England,UEFA,,1885,1180,TBD,4-3-3,8.4,8.0,7.8,7.5,7.6,possession;pressing;home_strength,Strong home favorite but London derby volatility matters,2026-06-25T12:00:00+03:00
+Chelsea,CHE,England,UEFA,,1805,1040,TBD,4-2-3-1,7.7,7.1,7.5,6.9,7.0,young;volatile;transition,Can punish open games but still noisy away,2026-06-25T12:00:00+03:00
+Liverpool,LIV,England,UEFA,,1905,1100,TBD,4-3-3,8.6,7.8,8.2,7.2,7.5,pressing;wide_attacks;high_floor,Heavy favorite profile,2026-06-25T12:00:00+03:00
+Burnley,BUR,England,UEFA,,1620,180,TBD,4-4-2,5.8,6.1,5.5,6.2,6.0,low_block;set_pieces;underdog,Needs low-event game to survive,2026-06-25T12:00:00+03:00
+Brighton,BHA,England,UEFA,,1765,520,TBD,4-2-3-1,7.0,6.7,7.4,6.4,6.6,build_up;press_resistance;volatile,Good separator team,2026-06-25T12:00:00+03:00
+Newcastle,NEW,England,UEFA,,1810,680,TBD,4-3-3,7.5,7.2,7.7,6.8,7.1,physical;pressing;transition,Can turn equal games into chaos,2026-06-25T12:00:00+03:00
+Tottenham,TOT,England,UEFA,,1785,760,TBD,4-3-3,7.8,6.8,8.0,6.5,6.8,high_line;attacking;volatile,Great for goals and stress,2026-06-25T12:00:00+03:00
+Manchester United,MUN,England,UEFA,,1795,820,TBD,4-2-3-1,7.4,6.9,7.2,6.6,7.0,transition;inconsistent;big_six,Name value often distorts the field,2026-06-25T12:00:00+03:00

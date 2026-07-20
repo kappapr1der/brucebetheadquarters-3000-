@@ -1,0 +1,6 @@
+team,player,role,status,availability_pct,form_rating,minutes_last_5,starts_last_5,goals_last_5,assists_last_5,xg_last_5,xa_last_5,source,source_ref,notes,updated_at
+Arsenal,Example CF,striker,available,100,7.1,410,5,3,1,2.4,0.6,manual,,Hot finishing run,2026-06-25T12:00:00+03:00
+Arsenal,Example LB,left_back,doubtful,50,6.2,260,3,0,1,0.1,0.8,manual,,Overlap threat unclear,2026-06-25T12:00:00+03:00
+Chelsea,Example DM,defensive_midfielder,suspended,0,6.6,390,4,0,0,0.2,0.3,manual,,Midfield balance risk,2026-06-25T12:00:00+03:00
+Liverpool,Example RW,right_winger,questionable,75,7.4,350,4,2,2,1.8,1.1,manual,,Monitor late team news,2026-06-25T12:00:00+03:00
+Manchester United,Example CB,center_back,injured,0,6.4,180,2,0,0,0.0,0.0,manual,,Transition defense risk,2026-06-25T12:00:00+03:00

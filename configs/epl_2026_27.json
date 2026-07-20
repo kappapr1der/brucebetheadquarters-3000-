@@ -1,7 +1,7 @@
 {
   "competition": "epl",
-  "season": "YYYY/YY",
-  "display_name": "English Premier League Forecast Pool",
+  "season": "2026/27",
+  "display_name": "EPL 2026/27",
   "timezone": "Europe/Moscow",
   "deadline_rule": {
     "type": "before_first_match",
@@ -20,5 +20,8 @@
     "outcome": 1
   },
   "watch_participants": [],
-  "notes": "Copy this file for a new EPL season and replace season, participants, teams, and match calendar."
+  "hq": {
+    "risk_focus_limit": 6,
+    "strategy_default": "balanced"
+  }
 }

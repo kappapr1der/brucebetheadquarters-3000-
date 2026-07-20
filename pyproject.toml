@@ -7,6 +7,9 @@ dependencies = [
   "python-telegram-bot[job-queue]>=21,<23"
 ]
 
+[tool.setuptools]
+packages = ["brucebet"]
+
 [project.scripts]
 brucebet = "brucebet.cli:main"
 brucebet-telegram = "brucebet.telegram_app:main"

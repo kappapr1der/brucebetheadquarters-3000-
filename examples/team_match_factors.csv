@@ -1,7 +1,9 @@
 round,position,team,side,expected_lineup_confidence,absences_impact,fatigue,morale,tactical_fit,pressing_advantage,set_piece_edge,motivation,notes
-1,1,Belgium,home,0.75,0.20,0.20,0.55,0.55,0.45,0.50,0.80,Favorite but not explosive
-1,1,Iran,away,0.80,0.35,0.20,0.70,0.65,0.30,0.55,0.90,Good tactical fit for ugly draw
-1,2,Uruguay,home,0.70,0.10,0.30,0.65,0.60,0.75,0.50,0.80,Upside and volatility
-1,2,Cape Verde,away,0.85,0.05,0.25,0.75,0.58,0.40,0.45,0.95,Needs efficiency
-1,4,Portugal,home,0.65,0.15,0.25,0.70,0.62,0.70,0.55,0.70,Rotation lowers smash probability
-1,4,DR Congo,away,0.80,0.25,0.20,0.75,0.60,0.45,0.50,0.95,Counter-scenario live
+1,1,Arsenal,home,0.80,0.15,0.10,0.75,0.62,0.70,0.60,0.90,Home favorite but derby tempers confidence
+1,1,Chelsea,away,0.72,0.35,0.10,0.70,0.58,0.55,0.52,0.90,Transition path gives upset/draw outs
+1,2,Liverpool,home,0.85,0.10,0.10,0.82,0.78,0.82,0.62,0.95,Safe favorite profile
+1,2,Burnley,away,0.80,0.05,0.10,0.65,0.42,0.35,0.58,0.95,Needs set pieces or 0:0 survival
+1,3,Brighton,home,0.76,0.10,0.15,0.70,0.66,0.60,0.50,0.85,Can control phases but leaves space
+1,3,Newcastle,away,0.78,0.10,0.18,0.72,0.64,0.66,0.56,0.85,Good counter-pressing matchup
+1,4,Tottenham,home,0.70,0.10,0.20,0.74,0.60,0.72,0.48,0.90,High line makes both-score path strong
+1,4,Manchester United,away,0.72,0.30,0.18,0.68,0.56,0.58,0.52,0.90,Name value can overweight away win

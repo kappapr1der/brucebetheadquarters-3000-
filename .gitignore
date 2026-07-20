@@ -5,6 +5,7 @@ __pycache__/
 .env
 data/*.csv
 data/*.sqlite
+data/snapshots/
 data/audit_summary.md
 data/vk_parse_summary.txt
 !data/.gitkeep
