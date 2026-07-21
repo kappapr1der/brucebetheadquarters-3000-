@@ -116,7 +116,7 @@ def parse_participant_block(text: str) -> ParticipantImportReport:
         unpaid = UNPAID_MARKER_RE.search(line)
         paid = PAID_MARKER_RE.search(line) if unpaid is None else None
         marker = unpaid or paid
-        name = line[: marker.start()].rstrip(" ,;:-—–") if marker else line
+        name = line[: marker.start()].rstrip(" .,;:-—–") if marker else line.rstrip(" .")
         name = name.strip()
         if not name:
             continue

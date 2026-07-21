@@ -21,10 +21,13 @@ MATCHES = [
 class ForecastImportTest(unittest.TestCase):
     def test_participant_list_tracks_fee_markers_and_duplicates(self) -> None:
         report = parse_participant_block(
-            "Игорь Григорьев - 300р\nСтас Ручкин без взноса\nАнна Бухтеева\nИгорь Григорьев +"
+            "Игорь Григорьев - 300р\nСтас Ручкин без взноса\nАнна Бухтеева.\nМихаил Макаров. Взнос 300 рублей\nИгорь Григорьев +"
         )
 
-        self.assertEqual([(item.name, item.paid) for item in report.entries], [("Игорь Григорьев", True), ("Стас Ручкин", False), ("Анна Бухтеева", None)])
+        self.assertEqual(
+            [(item.name, item.paid) for item in report.entries],
+            [("Игорь Григорьев", True), ("Стас Ручкин", False), ("Анна Бухтеева", None), ("Михаил Макаров", True)],
+        )
         self.assertEqual(report.duplicate_names, ("Игорь Григорьев",))
 
     def test_unspecified_new_participant_is_not_added_to_the_prize_bank(self) -> None:
