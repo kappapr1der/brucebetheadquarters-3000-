@@ -25,6 +25,7 @@
 - Двузначные счета вроде `10:0` считаются невалидными и уходят в аудит.
 - Таблица с тай-брейками: очки, точные, разницы, очки последних туров.
 - `/hq`: штаб активного тура.
+- `/start`: короткий операторский старт: бот готов принять список участников или следующий блок прогнозов.
 - `/ready`: предтуровый preflight: дедлайн, покрытие прогнозами, готовность модели и свежесть источников.
 - `/risk`: риск-карта тура.
 - `/edge`: карта расхождений поля, рынка и модели; ранжирует матчи для точечных отличий, а не выдаёт «истину».
@@ -137,6 +138,7 @@ THESPORTSDB_KEY=123
 - `/hq`
 - `/ready`
 - `/load`
+- `/participants` + список с новой строки
 - `/forecast Имя участника | тур` + счета с новой строки
 - `/table`
 - `/field <матч>`
@@ -264,6 +266,26 @@ Liverpool - Burnley 2 - 0
 ```
 
 The named match is placed into its exact fixture position; unlabeled scores fill the remaining positions in template order. Valid scores are saved immediately. The reply separately reports normalized punctuation, missing positions, duplicates, ambiguous lines, and any scores beyond the end of the tour. The same flow also works without a command when the first line is `Прогноз: Игорь Григорьев | 1`.
+
+After `/start`, the shortest operator flow is even simpler. Send a roster first:
+
+```text
+Участники:
+Игорь Григорьев 300р
+Анна Бухтеева 300р
+Стас Ручкин без взноса
+```
+
+Then send a forecast with the participant name on the first line and scores below. The active upcoming round is chosen automatically:
+
+```text
+Игорь Григорьев
+2:1
+2 - 0
+1;1
+```
+
+New names without a payment marker are added outside the prize bank until they are resent with `300р`; this prevents accidental prize eligibility.
 
 ## Runtime Data
 

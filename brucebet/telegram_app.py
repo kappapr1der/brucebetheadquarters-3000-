@@ -42,8 +42,15 @@ from .analytics import (
     round_deadlines,
     round_review,
     strategy_summary,
+    target_round_name,
 )
-from .forecast_import import ForecastImportReport, import_forecast_block
+from .forecast_import import (
+    SCORE_TOKEN_RE,
+    ForecastImportReport,
+    ParticipantImportReport,
+    import_forecast_block,
+    import_participant_block,
+)
 from .odds_api import (
     DEFAULT_ODDS_BOOKMAKER,
     DEFAULT_ODDS_MARKETS,
@@ -241,6 +248,26 @@ def parse_forecast_header(raw: str, require_marker: bool = False) -> tuple[str, 
     return parts[0], round_name, block
 
 
+def parse_participant_header(raw: str) -> str | None:
+    header, separator, block = raw.strip().partition("\n")
+    if not separator or not block.strip():
+        return None
+    if re.match(r"^(?:участники|игроки)\s*:\s*$", header, flags=re.IGNORECASE) is None:
+        return None
+    return block
+
+
+def parse_plain_forecast(raw: str, round_name: str | None) -> tuple[str, str, str] | None:
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(lines) < 2 or round_name is None:
+        return None
+    participant = lines[0]
+    block = "\n".join(lines[1:])
+    if not participant or not SCORE_TOKEN_RE.search(block):
+        return None
+    return participant, round_name, block
+
+
 def render_rows(headers: list[str], rows: list[list[object]]) -> str:
     widths = [len(header) for header in headers]
     for row in rows:
@@ -331,6 +358,19 @@ def render_forecast_import(participant: str, round_name: str, report: ForecastIm
     else:
         sections.append("Блок чистый. Теперь кидай следующий прогноз или смотри /field и /edge.")
     return "\n".join(sections)
+
+
+def render_participant_import(report: ParticipantImportReport) -> str:
+    lines = [
+        f"Принято. Участников добавлено или обновлено: {report.accepted_count}.",
+        f"Взнос отмечен: {report.paid_count}; без взноса: {report.unpaid_count}; без отметки: {report.unspecified_count}.",
+    ]
+    if report.unspecified_count:
+        lines.append("Новые люди без отметки не включены в банк. Пришли их строкой с `300р`, когда оплатят.")
+    if report.duplicate_names:
+        lines.append("Повторы пропустил: " + ", ".join(report.duplicate_names) + ".")
+    lines.append("Теперь присылай прогнозы: первая строка - имя, ниже счета в порядке матчей.")
+    return "\n".join(lines)
 
 
 def render_calendar(items: list[object]) -> str:
@@ -650,9 +690,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         db_status(conn),
         f"Твой участник: {settings.user_participant}.",
         "",
-        "Команды: /hq, /ready, /calendar, /today, /week, /next, /round, /variables, /load, /forecast, /table, /field, /recommend, /edge, /odds, /quota, /sources, /sync_fixtures, /sync_results, /sync_odds, /risk, /strategy, /match, /vs, /deadlines, /schedule, /audit, /review, /calibration, /setresult, /resulthistory, /rehearse, /id.",
+        "Готов принимать участников и прогнозы.",
+        "Список: `Участники:` в первой строке, ниже имена; добавь `300р` или `без взноса` к нужным людям.",
+        "Прогноз: первая строка - имя участника, ниже счета в порядке матчей. Текущий тур подставлю сам.",
+        "Полный список команд: /help.",
     ]
-    lines.append("New: /sync_variables, /dossier <match>.")
+    lines.append("Быстрые команды: /forecast, /participants, /edge, /ready.")
     if not settings.allowed_chat_ids:
         lines.append("")
         if update.effective_chat is not None:
@@ -696,6 +739,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/dossier <match> - match variable card",
                 "/id - показать chat_id для whitelist",
                 "/load - пришли VK-пасту текстом или файлом",
+                "/participants + список с новой строки - загрузить участников и взносы",
                 "/forecast Имя | тур + счета с новой строки - загрузить один прогноз",
                 "/hq - штаб активного тура",
                 "/ready - предтуровый контроль перед отправкой прогнозов",
@@ -1607,6 +1651,15 @@ async def process_forecast_block(
     await send_text(update, render_forecast_import(participant, round_name, report))
 
 
+async def process_participant_block(update: Update, context: ContextTypes.DEFAULT_TYPE, block: str) -> None:
+    conn = conn_from_context(context)
+    report = import_participant_block(conn, block)
+    if not report.entries:
+        await send_text(update, "Не увидел имён. Пришли `Участники:` и каждое имя с новой строки.")
+        return
+    await send_text(update, render_participant_import(report))
+
+
 @require_access
 async def forecast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     parsed = parse_forecast_header(command_body(update))
@@ -1620,15 +1673,38 @@ async def forecast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 @require_access
+async def participants_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    block = command_body(update)
+    natural_header = parse_participant_header(block)
+    if natural_header is not None:
+        block = natural_header
+    if not block.strip():
+        await send_text(update, "Формат:\n/participants\nИгорь Григорьев 300р\nСтас Ручкин без взноса")
+        return
+    await process_participant_block(update, context, block)
+
+
+@require_access
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.effective_message.text if update.effective_message else ""
-    direct_forecast = parse_forecast_header(text, require_marker=True)
-    if direct_forecast is not None:
-        await process_forecast_block(update, context, *direct_forecast)
+    participant_block = parse_participant_header(text)
+    explicit_forecast = parse_forecast_header(text, require_marker=True) or parse_forecast_header(text)
+    settings = settings_from_context(context)
+    conn = conn_from_context(context)
+    inferred_forecast = parse_plain_forecast(text, target_round_name(conn, lock_minutes=settings.lock_minutes))
+    if participant_block is not None:
+        await process_participant_block(update, context, participant_block)
     elif "Шаблон" in text and "Дедлайн" in text:
         await process_vk_text(update, context, text)
+    elif explicit_forecast is not None and SCORE_TOKEN_RE.search(explicit_forecast[2]):
+        await process_forecast_block(update, context, *explicit_forecast)
+    elif inferred_forecast is not None:
+        await process_forecast_block(update, context, *inferred_forecast)
     else:
-        await send_text(update, "Не понял формат. Пришли VK-пасту с `Шаблон ... Дедлайн ...` или блок `Прогноз: Имя | тур` со счетами ниже.")
+        await send_text(
+            update,
+            "Не понял формат. Пришли `Участники:` со списком или имя в первой строке и счета ниже. Полная VK-паста тоже подходит.",
+        )
 
 
 @require_access
@@ -1772,6 +1848,7 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("id", id_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("load", load_cmd))
+    application.add_handler(CommandHandler("participants", participants_cmd))
     application.add_handler(CommandHandler("forecast", forecast_cmd))
     application.add_handler(CommandHandler("hq", hq_cmd))
     application.add_handler(CommandHandler("ready", ready_cmd))

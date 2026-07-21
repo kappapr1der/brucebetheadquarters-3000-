@@ -111,6 +111,8 @@ Liverpool - Burnley 2 - 0
 
 The bot normalizes accepted punctuation and reports missing, duplicate, ambiguous, or extra rows without silently guessing.
 
+After `/start`, it also accepts operator-friendly plain text. Send `Участники:` and one person per line; use `300р` or `без взноса` to set prize eligibility. For forecasts, send the participant name on the first line and scores below. The bot chooses the active upcoming round and replies with the accepted participant and an import report.
+
 The `data/` directory is mounted as a Docker volume, so database and parsed CSV files survive container rebuilds.
 
 ## Server snapshot autocommits

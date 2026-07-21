@@ -6,11 +6,13 @@ import re
 import sqlite3
 
 from .scoring import normalize_score
-from .storage import active_season_id, upsert_prediction
+from .storage import active_season_id, ensure_participant, upsert_prediction
 
 
 SCORE_TOKEN_RE = re.compile(r"(?<!\d)(\d+\s*[:;\-–—]\s*\d+)(?!\d)")
 LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*]|\d+[.)])\s*")
+UNPAID_MARKER_RE = re.compile(r"\b(?:без\s+(?:взноса|оплаты)|не\s+вносит|no\s+fee)\b", re.IGNORECASE)
+PAID_MARKER_RE = re.compile(r"(?:\bвзнос\b|\bоплат\w*\b|\b300\s*(?:р(?:уб)?\.?|₽)?\b|\+$)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,34 @@ class ForecastImportReport:
         return len(self.forecasts)
 
 
+@dataclass(frozen=True)
+class ParticipantEntry:
+    name: str
+    paid: bool | None
+
+
+@dataclass(frozen=True)
+class ParticipantImportReport:
+    entries: tuple[ParticipantEntry, ...]
+    duplicate_names: tuple[str, ...]
+
+    @property
+    def accepted_count(self) -> int:
+        return len(self.entries)
+
+    @property
+    def paid_count(self) -> int:
+        return sum(entry.paid is True for entry in self.entries)
+
+    @property
+    def unpaid_count(self) -> int:
+        return sum(entry.paid is False for entry in self.entries)
+
+    @property
+    def unspecified_count(self) -> int:
+        return sum(entry.paid is None for entry in self.entries)
+
+
 def expected_matches(conn: sqlite3.Connection, round_name: str) -> list[ExpectedMatch]:
     rows = list(
         conn.execute(
@@ -72,6 +102,31 @@ def expected_matches(conn: sqlite3.Connection, round_name: str) -> list[Expected
 
 def _clean_line(value: str) -> str:
     return LIST_PREFIX_RE.sub("", value.strip()).casefold()
+
+
+def parse_participant_block(text: str) -> ParticipantImportReport:
+    """Parse an operator-maintained list without guessing payment status."""
+    entries: list[ParticipantEntry] = []
+    duplicates: list[str] = []
+    seen: set[str] = set()
+    for raw_line in text.splitlines():
+        line = LIST_PREFIX_RE.sub("", raw_line.strip())
+        if not line:
+            continue
+        unpaid = UNPAID_MARKER_RE.search(line)
+        paid = PAID_MARKER_RE.search(line) if unpaid is None else None
+        marker = unpaid or paid
+        name = line[: marker.start()].rstrip(" ,;:-—–") if marker else line
+        name = name.strip()
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            duplicates.append(name)
+            continue
+        seen.add(key)
+        entries.append(ParticipantEntry(name, False if unpaid else True if paid else None))
+    return ParticipantImportReport(tuple(entries), tuple(duplicates))
 
 
 def _labelled_match(line: str, matches: list[ExpectedMatch]) -> ExpectedMatch | None:
@@ -165,5 +220,15 @@ def import_forecast_block(
             submitted_at=timestamp,
             source=f"{source}:line-{forecast.line_number}",
         )
+    conn.commit()
+    return report
+
+
+def import_participant_block(conn: sqlite3.Connection, text: str) -> ParticipantImportReport:
+    report = parse_participant_block(text)
+    for entry in report.entries:
+        existing = conn.execute("SELECT id FROM participants WHERE name = ?", (entry.name,)).fetchone()
+        paid = entry.paid if entry.paid is not None else None if existing else 0
+        ensure_participant(conn, entry.name, paid=paid)
     conn.commit()
     return report

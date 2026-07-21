@@ -1,7 +1,13 @@
 from datetime import datetime
 import unittest
 
-from brucebet.forecast_import import ExpectedMatch, import_forecast_block, parse_forecast_block
+from brucebet.forecast_import import (
+    ExpectedMatch,
+    import_forecast_block,
+    import_participant_block,
+    parse_forecast_block,
+    parse_participant_block,
+)
 from brucebet.storage import connect, reset_db, upsert_match
 
 
@@ -13,6 +19,24 @@ MATCHES = [
 
 
 class ForecastImportTest(unittest.TestCase):
+    def test_participant_list_tracks_fee_markers_and_duplicates(self) -> None:
+        report = parse_participant_block(
+            "Игорь Григорьев - 300р\nСтас Ручкин без взноса\nАнна Бухтеева\nИгорь Григорьев +"
+        )
+
+        self.assertEqual([(item.name, item.paid) for item in report.entries], [("Игорь Григорьев", True), ("Стас Ручкин", False), ("Анна Бухтеева", None)])
+        self.assertEqual(report.duplicate_names, ("Игорь Григорьев",))
+
+    def test_unspecified_new_participant_is_not_added_to_the_prize_bank(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+
+        report = import_participant_block(conn, "Анна Бухтеева")
+        row = conn.execute("SELECT paid FROM participants WHERE name = 'Анна Бухтеева'").fetchone()
+
+        self.assertEqual(report.unspecified_count, 1)
+        self.assertEqual(row["paid"], 0)
+
     def test_mixed_labelled_and_ordered_scores_are_normalized(self) -> None:
         report = parse_forecast_block(
             "Arsenal - Chelsea 2 - 1\n0;0\n3 : 1",
