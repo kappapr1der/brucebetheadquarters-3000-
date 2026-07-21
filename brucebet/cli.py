@@ -12,6 +12,7 @@ from .analytics import (
     capture_model_forecasts,
     compare_participants,
     compute_standings,
+    edge_map,
     field_summary,
     finalize_completed_rounds,
     hq_summary,
@@ -30,6 +31,7 @@ from .analytics import (
     strategy_summary,
     team_profile,
 )
+from .forecast_import import ForecastImportReport, import_forecast_block
 from .scoring import is_standard_score, normalize_score, parse_datetime, parse_score
 from .odds_api import (
     DEFAULT_ODDS_BOOKMAKER,
@@ -539,6 +541,79 @@ def cmd_result_history(args: argparse.Namespace) -> int:
 def cmd_risk(args: argparse.Namespace) -> int:
     conn = open_db(args)
     print_risk_map(risk_map(conn, args.round))
+    return 0
+
+
+def print_edge_map(item: dict[str, object]) -> None:
+    print(f"Round: {clean(item['round_name'])}")
+    rows = item["opportunities"]
+    if rows:
+        print("\nDisagreement opportunities:")
+        print_rows(
+            ["#", "match", "model", "market", "field", "edge", "signals"],
+            [
+                [
+                    row["position"],
+                    row["label"],
+                    f"{row['model_score']} {row['model_outcome']}".strip(),
+                    f"{row['market_outcome']} {clean(row['market_share'])}",
+                    f"{row['field_outcome']} {clean(row['field_share'])}",
+                    row["edge_score"],
+                    ",".join(row["signals"]),
+                ]
+                for row in rows
+            ],
+        )
+    missing = item["needs_data"]
+    if missing:
+        print("\nNeeds data before it can be ranked:")
+        print_rows(
+            ["#", "match", "missing"],
+            [[row["position"], row["label"], ",".join(row["missing"])] for row in missing],
+        )
+
+
+def cmd_edge(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    print_edge_map(edge_map(conn, args.round))
+    return 0
+
+
+def print_forecast_import_report(participant: str, round_name: str, report: ForecastImportReport) -> None:
+    print(f"Saved forecasts: participant={participant}, round={round_name}, accepted={report.accepted_count}/{report.expected_count}")
+    if report.normalized:
+        print("Normalized:")
+        print_rows(
+            ["position", "raw", "stored"],
+            [[item.position, item.raw_score, item.score] for item in report.normalized],
+        )
+    if report.missing_positions:
+        print("Missing positions: " + ", ".join(str(item) for item in report.missing_positions))
+    if report.duplicate_positions:
+        print("Duplicate positions skipped: " + ", ".join(str(item) for item in report.duplicate_positions))
+    if report.invalid_lines:
+        print("Invalid lines:")
+        for item in report.invalid_lines:
+            print(f"- {item}")
+    if report.extra_lines:
+        print("Extra lines:")
+        for item in report.extra_lines:
+            print(f"- {item}")
+
+
+def cmd_import_forecast(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    text = Path(args.source).read_text(encoding="utf-8-sig")
+    submitted_at = parse_datetime(args.submitted_at) if args.submitted_at else datetime.now().astimezone()
+    report = import_forecast_block(
+        conn,
+        participant=args.participant,
+        round_name=args.round,
+        text=text,
+        submitted_at=submitted_at,
+        source="cli-forecast",
+    )
+    print_forecast_import_report(args.participant, args.round, report)
     return 0
 
 
@@ -1331,6 +1406,10 @@ def build_parser() -> argparse.ArgumentParser:
     risk.add_argument("round", nargs="?")
     risk.set_defaults(func=cmd_risk)
 
+    edge = sub.add_parser("edge", help="Rank matches where model, market, and field disagree.")
+    edge.add_argument("round", nargs="?")
+    edge.set_defaults(func=cmd_edge)
+
     strategy = sub.add_parser("strategy", help="Show season strategy against the table.")
     strategy.set_defaults(func=cmd_strategy)
 
@@ -1443,6 +1522,13 @@ def build_parser() -> argparse.ArgumentParser:
     parse_vk.add_argument("source")
     parse_vk.add_argument("--out-dir", required=True)
     parse_vk.set_defaults(func=cmd_parse_vk)
+
+    import_forecast = sub.add_parser("import-forecast", help="Import one participant's pasted forecast block.")
+    import_forecast.add_argument("participant")
+    import_forecast.add_argument("round")
+    import_forecast.add_argument("source", help="UTF-8 text file with scores in match order or labelled lines.")
+    import_forecast.add_argument("--submitted-at", help="ISO timestamp; defaults to now in the local timezone.")
+    import_forecast.set_defaults(func=cmd_import_forecast)
     return parser
 
 

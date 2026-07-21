@@ -524,6 +524,139 @@ def risk_map(conn: sqlite3.Connection, round_name: str | None = None) -> dict[st
     return {"round_name": matches[0]["round_name"], **categories}
 
 
+def _outcome_for_score(raw: str | None) -> str | None:
+    score = parse_score(raw)
+    if score is None:
+        return None
+    return "P1" if score.outcome > 0 else "P2" if score.outcome < 0 else "X"
+
+
+def _top_probability(values: dict[str, float]) -> tuple[str | None, float | None]:
+    if not values:
+        return None, None
+    label, probability = max(values.items(), key=lambda item: item[1])
+    return label, round(probability, 2)
+
+
+def _normalised_market_probabilities(row: sqlite3.Row | None) -> dict[str, float]:
+    if row is None:
+        return {}
+    raw = {"P1": row["home_win"], "X": row["draw"], "P2": row["away_win"]}
+    implied: dict[str, float] = {}
+    for label, odds in raw.items():
+        try:
+            value = float(odds)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            implied[label] = 1 / value
+    total = sum(implied.values())
+    if total == 0 or len(implied) != 3:
+        return {}
+    return {label: value / total for label, value in implied.items()}
+
+
+def edge_map(conn: sqlite3.Connection, round_name: str | None = None) -> dict[str, object]:
+    """Rank contest matches where field, market, and model disagree.
+
+    This is a contest-strategy map, not a claim that one of the three sources is
+    objectively right. Missing signals are reported separately instead of being
+    treated as a contrarian opportunity.
+    """
+    matches = match_rows_for_round(conn, round_name)
+    if not matches:
+        return {"round_name": round_name, "opportunities": [], "needs_data": []}
+
+    opportunities: list[dict[str, object]] = []
+    needs_data: list[dict[str, object]] = []
+    for match in matches:
+        match_id = int(match["id"])
+        field = field_summary(conn, match_id)["outcomes"]
+        field_total = sum(field.values())
+        field_outcome, field_share = (None, None)
+        if field_total:
+            top = field.most_common(1)[0]
+            field_outcome, field_share = top[0], round(top[1] / field_total, 2)
+
+        assessment = conn.execute("SELECT * FROM match_assessments WHERE match_id = ?", (match_id,)).fetchone()
+        model_score = assessment["suggested_score"] if assessment else None
+        model_outcome = _outcome_for_score(model_score)
+        model_probabilities: dict[str, float] = {}
+        if assessment:
+            for label, key in (("P1", "home_edge"), ("X", "draw_edge"), ("P2", "away_edge")):
+                try:
+                    value = float(assessment[key])
+                except (TypeError, ValueError):
+                    continue
+                if value >= 0:
+                    model_probabilities[label] = value
+        model_top, model_share = _top_probability(model_probabilities)
+        model_outcome = model_outcome or model_top
+
+        odds = conn.execute(
+            "SELECT * FROM match_odds WHERE match_id = ? ORDER BY captured_at DESC, id DESC LIMIT 1",
+            (match_id,),
+        ).fetchone()
+        market_probabilities = _normalised_market_probabilities(odds)
+        market_outcome, market_share = _top_probability(market_probabilities)
+
+        missing: list[str] = []
+        if field_outcome is None:
+            missing.append("field")
+        if model_outcome is None:
+            missing.append("model")
+        if market_outcome is None:
+            missing.append("market")
+
+        row: dict[str, object] = {
+            "match_id": match_id,
+            "position": int(match["position"]),
+            "label": f"{match['home']} - {match['away']}",
+            "model_score": model_score or "",
+            "model_outcome": model_outcome or "",
+            "model_share": model_share,
+            "market_outcome": market_outcome or "",
+            "market_share": market_share,
+            "field_outcome": field_outcome or "",
+            "field_share": field_share,
+            "field_predictions": field_total,
+            "volatility": assessment["volatility"] if assessment else None,
+            "missing": missing,
+            "signals": [],
+            "edge_score": None,
+            "note": assessment["contrarian_note"] if assessment else "",
+        }
+        if missing:
+            needs_data.append(row)
+            continue
+
+        signals: list[str] = []
+        if model_outcome != field_outcome:
+            signals.append("model-field")
+        if model_outcome != market_outcome:
+            signals.append("model-market")
+        if field_outcome != market_outcome:
+            signals.append("field-market")
+        try:
+            volatility = max(0.0, min(1.0, float(assessment["volatility"]))) if assessment else 0.0
+        except (TypeError, ValueError):
+            volatility = 0.0
+        model_market_gap = abs(model_probabilities.get(model_outcome, 0.0) - market_probabilities.get(model_outcome, 0.0))
+        edge_score = (
+            0.35 * (len(signals) / 3)
+            + 0.30 * (1 - float(field_share))
+            + 0.20 * volatility
+            + 0.15 * model_market_gap
+        )
+        row["signals"] = signals
+        row["edge_score"] = round(edge_score, 2)
+        opportunities.append(row)
+
+    opportunities.sort(key=lambda item: (-float(item["edge_score"]), int(item["position"])))
+    needs_data.sort(key=lambda item: int(item["position"]))
+    return {"round_name": matches[0]["round_name"], "opportunities": opportunities, "needs_data": needs_data}
+
+
 def _freshness_item(raw: str | None, now: datetime) -> dict[str, object]:
     updated_at = parse_datetime(raw)
     comparable = _aware_for_compare(updated_at, now)

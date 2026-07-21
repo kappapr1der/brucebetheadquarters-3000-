@@ -6,7 +6,7 @@ import re
 
 
 STRICT_SCORE_RE = re.compile(r"^([0-9]):([0-9])$")
-FLEX_SCORE_RE = re.compile(r"^([0-9])\s*[:;\-]\s*([0-9])$")
+FLEX_SCORE_RE = re.compile(r"^([0-9])\s*[:;\-–—]\s*([0-9])$")
 
 
 @dataclass(frozen=True)

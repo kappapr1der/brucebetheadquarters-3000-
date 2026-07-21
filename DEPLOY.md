@@ -81,6 +81,7 @@ In Telegram:
 /audit
 /field Arsenal
 /recommend Arsenal
+/edge
 /risk
 /strategy
 /schedule
@@ -98,6 +99,17 @@ In Telegram:
 ## Updating data
 
 Send the VK pasted text as a message or `.txt` file. The bot will parse it, update `data/vk_matches.csv`, `data/vk_predictions.csv`, and import into SQLite.
+
+For one participant, use a direct multiline command:
+
+```text
+/forecast Igor | 1
+2:1
+Liverpool - Burnley 2 - 0
+1;1
+```
+
+The bot normalizes accepted punctuation and reports missing, duplicate, ambiguous, or extra rows without silently guessing.
 
 The `data/` directory is mounted as a Docker volume, so database and parsed CSV files survive container rebuilds.
 

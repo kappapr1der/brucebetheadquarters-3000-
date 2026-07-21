@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import logging
 import os
 from pathlib import Path
+import re
 import sqlite3
 import tempfile
 from typing import Callable, Iterable
@@ -25,6 +26,7 @@ from .analytics import (
     capture_model_forecasts,
     compare_participants,
     compute_standings,
+    edge_map,
     field_summary,
     finalize_completed_rounds,
     hq_summary,
@@ -41,6 +43,7 @@ from .analytics import (
     round_review,
     strategy_summary,
 )
+from .forecast_import import ForecastImportReport, import_forecast_block
 from .odds_api import (
     DEFAULT_ODDS_BOOKMAKER,
     DEFAULT_ODDS_MARKETS,
@@ -217,6 +220,27 @@ def query_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     return " ".join(context.args).strip()
 
 
+def command_body(update: Update) -> str:
+    text = update.effective_message.text if update.effective_message else ""
+    return re.sub(r"^/[^\s@]+(?:@[^\s]+)?\s*", "", text, count=1)
+
+
+def parse_forecast_header(raw: str, require_marker: bool = False) -> tuple[str, str, str] | None:
+    header, separator, block = raw.strip().partition("\n")
+    if not separator or not block.strip():
+        return None
+    if require_marker:
+        marker = re.match(r"^прогноз(?:ы)?\s*:\s*(.+)$", header, flags=re.IGNORECASE)
+        if marker is None:
+            return None
+        header = marker.group(1)
+    parts = [part.strip() for part in header.split("|")]
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return None
+    round_name = re.sub(r"^(?:тур|round)\s*", "", parts[1], flags=re.IGNORECASE).strip()
+    return parts[0], round_name, block
+
+
 def render_rows(headers: list[str], rows: list[list[object]]) -> str:
     widths = [len(header) for header in headers]
     for row in rows:
@@ -245,6 +269,68 @@ def render_risk_map(item: dict[str, object]) -> str:
         ]
         sections.append(title + ":\n" + render_rows(["#", "match", "top", "share", "n", "base"], rows))
     return "\n\n".join(sections)
+
+
+def render_edge_map(item: dict[str, object]) -> str:
+    sections = [f"Карта расхождений: тур {clean(item['round_name'])}"]
+    opportunities = item["opportunities"]
+    if opportunities:
+        sections.append(
+            "Поле, рынок и модель:\n"
+            + render_rows(
+                ["#", "match", "model", "market", "field", "edge", "signals"],
+                [
+                    [
+                        row["position"],
+                        row["label"],
+                        f"{row['model_score']} {row['model_outcome']}".strip(),
+                        f"{row['market_outcome']} {clean(row['market_share'])}",
+                        f"{row['field_outcome']} {clean(row['field_share'])}",
+                        row["edge_score"],
+                        ",".join(row["signals"]) or "same call",
+                    ]
+                    for row in opportunities
+                ],
+            )
+        )
+        notes = [f"#{row['position']} {row['note']}" for row in opportunities[:3] if row["note"]]
+        if notes:
+            sections.append("Контр-сценарии:\n" + "\n".join(notes))
+    else:
+        sections.append("Пока нет матчей с полным набором поля, рынка и модели.")
+    missing = item["needs_data"]
+    if missing:
+        sections.append(
+            "Нужно добрать данные:\n"
+            + render_rows(
+                ["#", "match", "missing"],
+                [[row["position"], row["label"], ",".join(row["missing"])] for row in missing],
+            )
+        )
+    sections.append("edge не предсказывает истину: он ранжирует матчи для осознанных отличий от поля.")
+    return "\n\n".join(sections)
+
+
+def render_forecast_import(participant: str, round_name: str, report: ForecastImportReport) -> str:
+    sections = [
+        f"Принято, {participant}. Тур {round_name}: сохранено {report.accepted_count}/{report.expected_count} прогнозов.",
+    ]
+    if report.normalized:
+        examples = ", ".join(f"#{row.position} {row.raw_score}->{row.score}" for row in report.normalized[:6])
+        sections.append(f"Нормализовал форматы: {len(report.normalized)} ({examples}).")
+    if report.missing_positions:
+        sections.append("Не хватает позиций: " + ", ".join(str(row) for row in report.missing_positions) + ".")
+    if report.duplicate_positions:
+        sections.append("Дубли пропустил: " + ", ".join(str(row) for row in report.duplicate_positions) + ".")
+    if report.invalid_lines:
+        sections.append("Нечитаемые строки: " + "; ".join(report.invalid_lines[:4]) + ".")
+    if report.extra_lines:
+        sections.append("Лишние строки после конца тура: " + "; ".join(report.extra_lines[:3]) + ".")
+    if report.missing_positions or report.duplicate_positions or report.invalid_lines or report.extra_lines:
+        sections.append("Корректные строки уже сохранены. Исправь отмеченное и пришли блок повторно: он обновит только эти позиции.")
+    else:
+        sections.append("Блок чистый. Теперь кидай следующий прогноз или смотри /field и /edge.")
+    return "\n".join(sections)
 
 
 def render_calendar(items: list[object]) -> str:
@@ -564,7 +650,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         db_status(conn),
         f"Твой участник: {settings.user_participant}.",
         "",
-        "Команды: /hq, /ready, /calendar, /today, /week, /next, /round, /variables, /load, /table, /field, /recommend, /odds, /quota, /sources, /sync_fixtures, /sync_results, /sync_odds, /risk, /strategy, /match, /vs, /deadlines, /schedule, /audit, /review, /calibration, /setresult, /resulthistory, /rehearse, /id.",
+        "Команды: /hq, /ready, /calendar, /today, /week, /next, /round, /variables, /load, /forecast, /table, /field, /recommend, /edge, /odds, /quota, /sources, /sync_fixtures, /sync_results, /sync_odds, /risk, /strategy, /match, /vs, /deadlines, /schedule, /audit, /review, /calibration, /setresult, /resulthistory, /rehearse, /id.",
     ]
     lines.append("New: /sync_variables, /dossier <match>.")
     if not settings.allowed_chat_ids:
@@ -610,6 +696,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/dossier <match> - match variable card",
                 "/id - показать chat_id для whitelist",
                 "/load - пришли VK-пасту текстом или файлом",
+                "/forecast Имя | тур + счета с новой строки - загрузить один прогноз",
                 "/hq - штаб активного тура",
                 "/ready - предтуровый контроль перед отправкой прогнозов",
                 "/table - таблица конкурса",
@@ -621,6 +708,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/sync_fixtures - подтянуть официальный календарь PL",
                 "/sync_odds - подтянуть кэфы The Odds API в базу",
                 "/risk [тур] - риск-карта тура",
+                "/edge [тур] - где расходятся поле, рынок и модель",
                 "/strategy - стратегия относительно таблицы",
                 "/calendar - календарь ближайших матчей",
                 "/today - матчи сегодня",
@@ -647,7 +735,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def load_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_text(
         update,
-        "Кидай VK-пасту текстом или .txt файлом. Я распарсю туры, прогнозы участников, обновлю базу и отвечу отчётом.",
+        "Кидай полную VK-пасту текстом или .txt файлом. Для одного участника используй /forecast: имя | тур, затем счета с новой строки.",
     )
 
 
@@ -779,6 +867,12 @@ async def resulthistory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     conn = conn_from_context(context)
     await send_text(update, render_risk_map(risk_map(conn, query_text(context) or None)))
+
+
+@require_access
+async def edge_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = conn_from_context(context)
+    await send_text(update, render_edge_map(edge_map(conn, query_text(context) or None)))
 
 
 @require_access
@@ -1489,13 +1583,52 @@ async def process_vk_text(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     await send_text(update, "\n".join(reply))
 
 
+async def process_forecast_block(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    participant: str,
+    round_name: str,
+    block: str,
+) -> None:
+    conn = conn_from_context(context)
+    submitted_at = update.effective_message.date if update.effective_message else datetime.now().astimezone()
+    try:
+        report = import_forecast_block(
+            conn,
+            participant=participant,
+            round_name=round_name,
+            text=block,
+            submitted_at=submitted_at,
+            source="telegram-forecast",
+        )
+    except ValueError as exc:
+        await send_text(update, str(exc))
+        return
+    await send_text(update, render_forecast_import(participant, round_name, report))
+
+
+@require_access
+async def forecast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parsed = parse_forecast_header(command_body(update))
+    if parsed is None:
+        await send_text(
+            update,
+            "Формат:\n/forecast Имя участника | тур\n2:1\n1 - 0\nМожно смешивать с подписанными строками матчей.",
+        )
+        return
+    await process_forecast_block(update, context, *parsed)
+
+
 @require_access
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.effective_message.text if update.effective_message else ""
-    if "Шаблон" in text and "Дедлайн" in text:
+    direct_forecast = parse_forecast_header(text, require_marker=True)
+    if direct_forecast is not None:
+        await process_forecast_block(update, context, *direct_forecast)
+    elif "Шаблон" in text and "Дедлайн" in text:
         await process_vk_text(update, context, text)
     else:
-        await send_text(update, "Не понял формат. Если это тур/прогнозы, пришли VK-пасту с заголовком `Шаблон ... Дедлайн ...`.")
+        await send_text(update, "Не понял формат. Пришли VK-пасту с `Шаблон ... Дедлайн ...` или блок `Прогноз: Имя | тур` со счетами ниже.")
 
 
 @require_access
@@ -1639,6 +1772,7 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("id", id_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("load", load_cmd))
+    application.add_handler(CommandHandler("forecast", forecast_cmd))
     application.add_handler(CommandHandler("hq", hq_cmd))
     application.add_handler(CommandHandler("ready", ready_cmd))
     application.add_handler(CommandHandler("table", table_cmd))
@@ -1652,6 +1786,7 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("sync_odds", sync_odds_cmd))
     application.add_handler(CommandHandler("sync_variables", sync_variables_cmd))
     application.add_handler(CommandHandler("risk", risk_cmd))
+    application.add_handler(CommandHandler("edge", edge_cmd))
     application.add_handler(CommandHandler("strategy", strategy_cmd))
     application.add_handler(CommandHandler("calendar", calendar_cmd))
     application.add_handler(CommandHandler("today", today_cmd))

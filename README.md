@@ -21,12 +21,13 @@
 
 - SQLite-ядро для сезонов, участников, взносов, туров, матчей, прогнозов и результатов.
 - Сезонные взносы: один и тот же участник может играть в разных сезонах с разным статусом оплаты.
-- Гибкий парсер счёта: `2:1`, `2-1`, `2;1`, `2 : 1` принимаются и нормализуются.
+- Гибкий парсер счёта: `2:1`, `2-1`, `2—1`, `2;1`, `2 : 1` принимаются и нормализуются.
 - Двузначные счета вроде `10:0` считаются невалидными и уходят в аудит.
 - Таблица с тай-брейками: очки, точные, разницы, очки последних туров.
 - `/hq`: штаб активного тура.
 - `/ready`: предтуровый preflight: дедлайн, покрытие прогнозами, готовность модели и свежесть источников.
 - `/risk`: риск-карта тура.
+- `/edge`: карта расхождений поля, рынка и модели; ранжирует матчи для точечных отличий, а не выдаёт «истину».
 - `/strategy`: режим игры относительно лидера.
 - `/field`, `/recommend`, `/match`, `/vs`, `/audit`, `/deadlines`.
 - `/quota`, `/sync_odds`, `/odds`: проверка квоты The Odds API, синк кэфов, просмотр снимков.
@@ -55,6 +56,7 @@ python -m brucebet.cli --db brucebet.sqlite snapshot --out-dir data/snapshots/cu
 python -m brucebet.cli --db brucebet.sqlite hq
 python -m brucebet.cli --db brucebet.sqlite ready
 python -m brucebet.cli --db brucebet.sqlite risk
+python -m brucebet.cli --db brucebet.sqlite edge
 python -m brucebet.cli --db brucebet.sqlite strategy
 python -m brucebet.cli --db brucebet.sqlite calendar
 python -m brucebet.cli --db brucebet.sqlite next
@@ -135,9 +137,11 @@ THESPORTSDB_KEY=123
 - `/hq`
 - `/ready`
 - `/load`
+- `/forecast Имя участника | тур` + счета с новой строки
 - `/table`
 - `/field <матч>`
 - `/recommend <матч>`
+- `/edge [тур]`
 - `/odds <матч>`
 - `/quota`
 - `/sources`
@@ -190,6 +194,8 @@ Calendar commands:
 - `brucebet sync-variables` - fetch FPL, ClubElo, context/weather, factors, and draft assessments.
 - `brucebet sync-results` - write only completed official results and save completed round reviews.
 - `brucebet ready` - preflight the active round: deadline, coverage, model, and data freshness.
+- `brucebet edge [тур]` - rank matches where field consensus, market implied outcome, and model disagree.
+- `brucebet import-forecast <участник> <тур> <файл>` - import one participant's raw forecast block.
 - `brucebet set-result <match> <score> --reason <text>` - manually record a fallback final score with an audit trail.
 - `brucebet result-history <match>` - inspect the manual result override journal.
 - `brucebet review <тур>` - post-round scoreboard, score swings, and model performance.
@@ -244,6 +250,20 @@ If the official results feed lags, use the restricted command:
 ```
 
 The score is normalized, current standings/reviews are recalculated, and the previous score, time, chat, and reason are retained in the SQLite audit log. Inspect it with `/resulthistory Arsenal`.
+
+## Quick Forecast Import
+
+For a full VK export, use `/load` or send the `.txt` file as before. For one participant's raw block, send this directly to the bot:
+
+```text
+/forecast Игорь Григорьев | 1
+2:1
+Liverpool - Burnley 2 - 0
+1;1
+2—2
+```
+
+The named match is placed into its exact fixture position; unlabeled scores fill the remaining positions in template order. Valid scores are saved immediately. The reply separately reports normalized punctuation, missing positions, duplicates, ambiguous lines, and any scores beyond the end of the tour. The same flow also works without a command when the first line is `Прогноз: Игорь Григорьев | 1`.
 
 ## Runtime Data
 
