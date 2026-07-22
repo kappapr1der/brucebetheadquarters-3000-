@@ -196,8 +196,11 @@ Calendar commands:
 - `brucebet sync-variables` - fetch FPL, ClubElo, context/weather, factors, and draft assessments.
 - `brucebet sync-results` - write only completed official results and save completed round reviews.
 - `brucebet ready` - preflight the active round: deadline, coverage, model, and data freshness.
+- `brucebet missing [тур]` - names and missing match positions for incomplete forecast blocks.
 - `brucebet edge [тур]` - rank matches where field consensus, market implied outcome, and model disagree.
 - `brucebet import-forecast <участник> <тур> <файл>` - import one participant's raw forecast block.
+
+After the deadline, a normal import can add a previously absent line but cannot replace an already stored score. Use the whitelisted Telegram command `/overrideforecast Участник | Матч | 2:1 | причина` only for an intentional correction; every correction is written to the audit log and exported in snapshots.
 - `brucebet set-result <match> <score> --reason <text>` - manually record a fallback final score with an audit trail.
 - `brucebet result-history <match>` - inspect the manual result override journal.
 - `brucebet review <тур>` - post-round scoreboard, score swings, and model performance.

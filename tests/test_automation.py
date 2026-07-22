@@ -1,13 +1,16 @@
 from datetime import datetime
 import unittest
 
-from brucebet.analytics import capture_model_forecasts, model_calibration_summary, ready_summary, round_review
+from brucebet.analytics import capture_model_forecasts, missing_forecasts_summary, model_calibration_summary, ready_summary, round_review
 from brucebet.pl_fixtures import import_pl_fixtures, import_pl_results
+from brucebet.rehearsal import run_rehearsal
 from brucebet.reminders import due_reminders, mark_delivery_sent, subscribe_chat
 from brucebet.storage import (
     connect,
     manual_result_history,
+    manual_prediction_history,
     reset_db,
+    set_manual_prediction_override,
     set_manual_match_result,
     upsert_match,
     upsert_match_assessment,
@@ -143,6 +146,55 @@ class AutomationTest(unittest.TestCase):
         self.assertEqual(history[0]["previous_result"], "1:1")
         self.assertEqual(history[0]["new_result"], "2:1")
         self.assertEqual(history[0]["reason"], "official feed delay")
+
+    def test_missing_summary_names_partial_and_empty_forecasts(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2026-08-15T18:00:00+03:00", None)
+        upsert_match(conn, "1", 2, "Liverpool", "Everton", "2026-08-15T20:30:00+03:00", None)
+        upsert_prediction(conn, "Bruce Wayne", "1", 1, "2:1", "2026-08-15T14:00:00+03:00", "test")
+        upsert_prediction(conn, "Igor", "1", 1, "1:0", "2026-08-15T14:00:00+03:00", "test")
+        upsert_prediction(conn, "Igor", "1", 2, "1:1", "2026-08-15T14:00:00+03:00", "test")
+        from brucebet.storage import ensure_participant
+
+        ensure_participant(conn, "Anna", paid=1)
+
+        item = missing_forecasts_summary(conn, "1")
+
+        self.assertEqual(item["complete_count"], 1)
+        self.assertEqual(
+            [(row["participant"], row["missing_positions"]) for row in item["incomplete"]],
+            [("Anna", (1, 2)), ("Bruce Wayne", (2,))],
+        )
+
+    def test_manual_forecast_override_preserves_submission_and_audits(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        match_id = upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2026-08-15T18:00:00+03:00", None)
+        upsert_prediction(conn, "Igor", "1", 1, "1:0", "2026-08-15T14:00:00+03:00", "test")
+
+        previous, current = set_manual_prediction_override(
+            conn,
+            "Igor",
+            match_id,
+            "2-1",
+            actor_chat_id=42,
+            reason="confirmed typo",
+            changed_at="2026-08-15T17:00:00+03:00",
+        )
+        stored = conn.execute("SELECT score, submitted_at, source FROM predictions").fetchone()
+        history = manual_prediction_history(conn, "Igor", match_id)
+
+        self.assertEqual((previous, current), ("1:0", "2:1"))
+        self.assertEqual((stored["score"], stored["submitted_at"], stored["source"]), ("2:1", "2026-08-15T14:00:00+03:00", "manual-override"))
+        self.assertEqual(history[0]["reason"], "confirmed typo")
+
+    def test_rehearsal_covers_operator_flow_without_live_data(self) -> None:
+        item = run_rehearsal()
+
+        self.assertTrue(all(bool(row["passed"]) for row in item["checks"]))
+        self.assertEqual(item["missing"]["complete_count"], 5)
+        self.assertEqual(len(item["standings"]), 5)
 
 
 if __name__ == "__main__":

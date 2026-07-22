@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import sqlite3
 
@@ -252,6 +252,19 @@ CREATE TABLE IF NOT EXISTS manual_result_overrides (
     reason TEXT
 );
 
+CREATE TABLE IF NOT EXISTS manual_prediction_overrides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prediction_id INTEGER NOT NULL REFERENCES predictions(id) ON DELETE CASCADE,
+    previous_score TEXT NOT NULL,
+    previous_submitted_at TEXT,
+    previous_source TEXT,
+    new_score TEXT NOT NULL,
+    new_submitted_at TEXT,
+    changed_at TEXT NOT NULL,
+    actor_chat_id INTEGER,
+    reason TEXT
+);
+
 CREATE TABLE IF NOT EXISTS round_reviews (
     round_id INTEGER PRIMARY KEY REFERENCES rounds(id) ON DELETE CASCADE,
     completed_at TEXT NOT NULL,
@@ -320,6 +333,7 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS round_reviews;
         DROP TABLE IF EXISTS result_sync_runs;
         DROP TABLE IF EXISTS manual_result_overrides;
+        DROP TABLE IF EXISTS manual_prediction_overrides;
         DROP TABLE IF EXISTS team_match_factors;
         DROP TABLE IF EXISTS match_odds;
         DROP TABLE IF EXISTS match_contexts;
@@ -739,6 +753,151 @@ def manual_result_history(conn: sqlite3.Connection, match_id: int) -> list[sqlit
             ORDER BY id DESC
             """,
             (match_id,),
+        )
+    )
+
+
+def effective_round_deadline(
+    conn: sqlite3.Connection,
+    round_name: str,
+    lock_minutes: int = 90,
+) -> datetime | None:
+    """Match the contest rule: the round closes before its first kickoff."""
+    row = conn.execute(
+        """
+        SELECT r.deadline_at, MIN(m.kickoff_at) AS first_kickoff_at
+        FROM rounds r
+        LEFT JOIN matches m ON m.round_id = r.id
+        WHERE r.season_id = ? AND r.name = ?
+        GROUP BY r.id
+        """,
+        (active_season_id(conn), round_name.strip()),
+    ).fetchone()
+    if row is None:
+        return None
+    first_kickoff_at = parse_datetime(row["first_kickoff_at"])
+    if first_kickoff_at is not None:
+        return first_kickoff_at - timedelta(minutes=lock_minutes)
+    return parse_datetime(row["deadline_at"])
+
+
+def prediction_update_is_locked(
+    conn: sqlite3.Connection,
+    participant: str,
+    round_name: str,
+    position: int,
+    submitted_at: datetime | str | None,
+    lock_minutes: int = 90,
+) -> bool:
+    """Keep a stored forecast intact when a replacement arrives after the lock.
+
+    New late forecasts remain visible for the contest's partial-late handling.
+    Only replacing an existing forecast is blocked here; a deliberate correction
+    must go through ``set_manual_prediction_override`` and leaves an audit row.
+    """
+    raw_timestamp = submitted_at.isoformat() if isinstance(submitted_at, datetime) else submitted_at
+    incoming = parse_datetime(raw_timestamp)
+    deadline = effective_round_deadline(conn, round_name, lock_minutes=lock_minutes)
+    if incoming is None or deadline is None or incoming <= deadline:
+        return False
+    row = conn.execute(
+        """
+        SELECT pr.id
+        FROM predictions pr
+        JOIN participants p ON p.id = pr.participant_id
+        JOIN matches m ON m.id = pr.match_id
+        JOIN rounds r ON r.id = m.round_id
+        WHERE r.season_id = ?
+          AND r.name = ?
+          AND m.position = ?
+          AND lower(p.name) = lower(?)
+        """,
+        (active_season_id(conn), round_name.strip(), position, participant.strip()),
+    ).fetchone()
+    return row is not None
+
+
+def set_manual_prediction_override(
+    conn: sqlite3.Connection,
+    participant: str,
+    match_id: int,
+    score: str,
+    actor_chat_id: int | None = None,
+    reason: str | None = None,
+    changed_at: str | None = None,
+    submitted_at: str | None = None,
+) -> tuple[str, str]:
+    """Correct one stored forecast explicitly and retain the full correction trail."""
+    parsed = parse_score(score)
+    if parsed is None:
+        raise ValueError("Forecast must be a one-digit score such as 2:1")
+    row = conn.execute(
+        """
+        SELECT pr.id, pr.score, pr.submitted_at, pr.source
+        FROM predictions pr
+        JOIN participants p ON p.id = pr.participant_id
+        WHERE pr.match_id = ? AND lower(p.name) = lower(?)
+        """,
+        (match_id, participant.strip()),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"Stored forecast not found for {participant}")
+
+    normalized = parsed.label()
+    timestamp = parse_datetime(changed_at).isoformat() if changed_at else datetime.now().astimezone().isoformat()
+    preserved_submission = parse_datetime(submitted_at).isoformat() if submitted_at else row["submitted_at"]
+    conn.execute(
+        """
+        UPDATE predictions
+        SET score = ?, submitted_at = ?, source = ?
+        WHERE id = ?
+        """,
+        (normalized, preserved_submission, "manual-override", int(row["id"])),
+    )
+    conn.execute(
+        """
+        INSERT INTO manual_prediction_overrides(
+            prediction_id, previous_score, previous_submitted_at, previous_source,
+            new_score, new_submitted_at, changed_at, actor_chat_id, reason
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(row["id"]),
+            row["score"],
+            row["submitted_at"],
+            row["source"],
+            normalized,
+            preserved_submission,
+            timestamp,
+            actor_chat_id,
+            optional_text(reason) or "manual forecast correction",
+        ),
+    )
+    conn.commit()
+    return str(row["score"]), normalized
+
+
+def manual_prediction_history(conn: sqlite3.Connection, participant: str, match_id: int) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            """
+            SELECT
+                mpo.previous_score,
+                mpo.previous_submitted_at,
+                mpo.previous_source,
+                mpo.new_score,
+                mpo.new_submitted_at,
+                mpo.changed_at,
+                mpo.actor_chat_id,
+                mpo.reason
+            FROM manual_prediction_overrides mpo
+            JOIN predictions pr ON pr.id = mpo.prediction_id
+            JOIN participants p ON p.id = pr.participant_id
+            WHERE pr.match_id = ? AND lower(p.name) = lower(?)
+            ORDER BY mpo.id DESC
+            """,
+            (match_id, participant.strip()),
         )
     )
 

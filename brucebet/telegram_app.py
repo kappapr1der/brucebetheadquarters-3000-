@@ -32,6 +32,7 @@ from .analytics import (
     hq_summary,
     match_dossier,
     match_header,
+    missing_forecasts_summary,
     model_calibration_summary,
     next_calendar_match,
     player_status_summary,
@@ -91,7 +92,9 @@ from .storage import (
     import_participants,
     import_predictions,
     init_db,
+    manual_prediction_history,
     manual_result_history,
+    set_manual_prediction_override,
     set_manual_match_result,
 )
 from .variable_sync import VariableSyncResult, sync_match_variables
@@ -340,7 +343,7 @@ def render_edge_map(item: dict[str, object]) -> str:
 
 def render_forecast_import(participant: str, round_name: str, report: ForecastImportReport) -> str:
     sections = [
-        f"Принято, {participant}. Тур {round_name}: сохранено {report.accepted_count}/{report.expected_count} прогнозов.",
+        f"Принято, {participant}. Тур {round_name}: разобрано {report.accepted_count}/{report.expected_count}; сохранено {report.stored_count}/{report.expected_count} прогнозов.",
     ]
     if report.normalized:
         examples = ", ".join(f"#{row.position} {row.raw_score}->{row.score}" for row in report.normalized[:6])
@@ -353,8 +356,16 @@ def render_forecast_import(participant: str, round_name: str, report: ForecastIm
         sections.append("Нечитаемые строки: " + "; ".join(report.invalid_lines[:4]) + ".")
     if report.extra_lines:
         sections.append("Лишние строки после конца тура: " + "; ".join(report.extra_lines[:3]) + ".")
+    if report.protected_positions:
+        sections.append(
+            "Защита дедлайна: не заменил уже сохранённые позиции "
+            + ", ".join(str(row) for row in report.protected_positions)
+            + ". Для осознанной правки используй /overrideforecast - она попадёт в журнал."
+        )
     if report.missing_positions or report.duplicate_positions or report.invalid_lines or report.extra_lines:
-        sections.append("Корректные строки уже сохранены. Исправь отмеченное и пришли блок повторно: он обновит только эти позиции.")
+        sections.append("Корректные строки уже сохранены. Исправь отмеченное и пришли блок повторно до дедлайна.")
+    elif report.protected_positions:
+        sections.append("Ранние прогнозы оставлены как есть; поздняя вставка не перетёрла их.")
     else:
         sections.append("Блок чистый. Теперь кидай следующий прогноз или смотри /field и /edge.")
     return "\n".join(sections)
@@ -506,6 +517,29 @@ def render_ready(item: dict[str, object]) -> str:
         sections.append("Проверь:\n" + "\n".join(f"- {row}" for row in item["warnings"]))
     sections.append("Свежесть данных:\n" + render_freshness(item["freshness"]))
     return "\n\n".join(sections)
+
+
+def render_missing_forecasts(item: dict[str, object]) -> str:
+    if not item["round_name"]:
+        return "Не нашёл активный тур. Сначала загрузи календарь или шаблон тура."
+    header = (
+        f"Прогнозы на тур {item['round_name']}: готовы {item['complete_count']}/{item['participant_count']}.\n"
+        + f"Матчей: {item['match_count']}. Дедлайн: {clean(item['deadline'])}."
+    )
+    incomplete = item["incomplete"]
+    if not incomplete:
+        return header + "\n\nВсе участники прислали полный блок."
+    return header + "\n\n" + render_rows(
+        ["participant", "saved", "missing positions"],
+        [
+            [
+                row["participant"],
+                f"{row['submitted_count']}/{item['match_count']}",
+                ",".join(str(position) for position in row["missing_positions"]),
+            ]
+            for row in incomplete
+        ],
+    )
 
 
 def render_calibration(item: dict[str, object]) -> str:
@@ -743,6 +777,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/forecast Имя | тур + счета с новой строки - загрузить один прогноз",
                 "/hq - штаб активного тура",
                 "/ready - предтуровый контроль перед отправкой прогнозов",
+                "/missing [тур] - кто не прислал или недоприслал прогноз",
                 "/table - таблица конкурса",
                 "/field <матч> - поле прогнозов",
                 "/recommend <матч> - рекомендация по матчу",
@@ -770,6 +805,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/rehearse - изолированная репетиция полного тура",
                 "/setresult Матч | 2:1 | причина - ручной резервный результат с журналом",
                 "/resulthistory <матч> - история ручных исправлений результата",
+                "/overrideforecast Участник | Матч | 2:1 | причина - ручная правка прогноза с журналом",
+                "/forecasthistory Участник | Матч - история ручных правок прогноза",
             ]
         ),
     )
@@ -842,12 +879,39 @@ async def ready_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_text(update, render_ready(ready_summary(conn, user_participant=settings.user_participant, lock_minutes=settings.lock_minutes)))
 
 
+@require_access
+async def missing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    conn = conn_from_context(context)
+    try:
+        item = missing_forecasts_summary(conn, query_text(context) or None, lock_minutes=settings.lock_minutes)
+    except ValueError as exc:
+        await send_text(update, str(exc))
+        return
+    await send_text(update, render_missing_forecasts(item))
+
+
 def parse_result_override(raw: str) -> tuple[str, str, str | None] | None:
     parts = [part.strip() for part in raw.split("|")]
     if len(parts) < 2 or not parts[0] or not parts[1]:
         return None
     reason = " | ".join(part for part in parts[2:] if part) or None
     return parts[0], parts[1], reason
+
+
+def parse_forecast_override(raw: str) -> tuple[str, str, str, str | None] | None:
+    parts = [part.strip() for part in raw.split("|")]
+    if len(parts) < 3 or not parts[0] or not parts[1] or not parts[2]:
+        return None
+    reason = " | ".join(part for part in parts[3:] if part) or None
+    return parts[0], parts[1], parts[2], reason
+
+
+def parse_forecast_history(raw: str) -> tuple[str, str] | None:
+    parts = [part.strip() for part in raw.split("|", maxsplit=1)]
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return None
+    return parts[0], parts[1]
 
 
 @require_access
@@ -903,6 +967,69 @@ async def resulthistory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         + render_rows(
             ["previous", "new", "changed_at", "chat_id", "reason"],
             [[clean(row["previous_result"]), row["new_result"], row["changed_at"], clean(row["actor_chat_id"]), clean(row["reason"])] for row in rows],
+        ),
+    )
+
+
+@require_access
+async def overrideforecast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parsed = parse_forecast_override(query_text(context))
+    if parsed is None:
+        await send_text(update, "Формат: /overrideforecast Участник | Arsenal - Chelsea | 2:1 | причина")
+        return
+    participant, query, score, reason = parsed
+    conn = conn_from_context(context)
+    try:
+        match = find_match(conn, query)
+        previous, current = set_manual_prediction_override(
+            conn,
+            participant=participant,
+            match_id=int(match["id"]),
+            score=score,
+            actor_chat_id=update.effective_chat.id if update.effective_chat else None,
+            reason=reason,
+        )
+    except ValueError as exc:
+        await send_text(update, str(exc))
+        return
+    await send_text(
+        update,
+        "Ручная правка прогноза сохранена и записана в журнал.\n"
+        + f"{participant}: {match_header(match)}\n"
+        + f"Было: {previous}\nСтало: {current}\n"
+        + "История: /forecasthistory "
+        + participant
+        + " | "
+        + query,
+    )
+
+
+@require_access
+async def forecasthistory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    parsed = parse_forecast_history(query_text(context))
+    if parsed is None:
+        await send_text(update, "Формат: /forecasthistory Участник | Arsenal - Chelsea")
+        return
+    participant, query = parsed
+    conn = conn_from_context(context)
+    try:
+        match = find_match(conn, query)
+    except ValueError as exc:
+        await send_text(update, str(exc))
+        return
+    rows = manual_prediction_history(conn, participant, int(match["id"]))
+    if not rows:
+        await send_text(update, f"Ручных правок для {participant} по этому матчу пока нет.")
+        return
+    await send_text(
+        update,
+        f"{participant}: {match_header(match)}\n\n"
+        + render_rows(
+            ["previous", "new", "changed_at", "chat_id", "reason"],
+            [
+                [row["previous_score"], row["new_score"], row["changed_at"], clean(row["actor_chat_id"]), clean(row["reason"])]
+                for row in rows
+            ],
         ),
     )
 
@@ -1244,6 +1371,12 @@ async def rehearse_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await send_text(
         update,
         "Репетиция прошла в изолированной базе, живые данные не тронуты.\n\n"
+        + "Проверки:\n"
+        + "\n".join(
+            f"{'OK' if row['passed'] else 'FAIL'} - {row['name']}: {row['detail']}"
+            for row in item["checks"]
+        )
+        + "\n\n"
         + standings
         + "\n\n"
         + render_round_review(item["review"]),
@@ -1644,6 +1777,7 @@ async def process_forecast_block(
             text=block,
             submitted_at=submitted_at,
             source="telegram-forecast",
+            lock_minutes=settings.lock_minutes,
         )
     except ValueError as exc:
         await send_text(update, str(exc))
@@ -1852,6 +1986,7 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("forecast", forecast_cmd))
     application.add_handler(CommandHandler("hq", hq_cmd))
     application.add_handler(CommandHandler("ready", ready_cmd))
+    application.add_handler(CommandHandler("missing", missing_cmd))
     application.add_handler(CommandHandler("table", table_cmd))
     application.add_handler(CommandHandler("field", field_cmd))
     application.add_handler(CommandHandler("recommend", recommend_cmd))
@@ -1880,6 +2015,8 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("rehearse", rehearse_cmd))
     application.add_handler(CommandHandler("setresult", setresult_cmd))
     application.add_handler(CommandHandler("resulthistory", resulthistory_cmd))
+    application.add_handler(CommandHandler("overrideforecast", overrideforecast_cmd))
+    application.add_handler(CommandHandler("forecasthistory", forecasthistory_cmd))
     application.add_handler(CommandHandler("deadline", deadlines_cmd))
     application.add_handler(CommandHandler("deadlines", deadlines_cmd))
     application.add_handler(CommandHandler("schedule", schedule_cmd))

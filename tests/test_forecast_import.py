@@ -82,6 +82,34 @@ class ForecastImportTest(unittest.TestCase):
         self.assertEqual(report.missing_positions, (2,))
         self.assertEqual([(row["score"], row["submitted_at"], row["source"]) for row in rows], [("2:1", "2026-08-15T14:00:00+03:00", "test:line-1")])
 
+    def test_late_import_cannot_replace_an_existing_forecast(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2026-08-15T18:00:00+03:00", None)
+        upsert_match(conn, "1", 2, "Liverpool", "Burnley", "2026-08-15T20:30:00+03:00", None)
+        import_forecast_block(
+            conn,
+            participant="Igor",
+            round_name="1",
+            text="2:1\n1:0",
+            submitted_at=datetime.fromisoformat("2026-08-15T14:00:00+03:00"),
+            source="test",
+        )
+
+        report = import_forecast_block(
+            conn,
+            participant="Igor",
+            round_name="1",
+            text="3:0",
+            submitted_at=datetime.fromisoformat("2026-08-15T16:31:00+03:00"),
+            source="test",
+        )
+        rows = list(conn.execute("SELECT score FROM predictions ORDER BY match_id"))
+
+        self.assertEqual(report.stored_count, 0)
+        self.assertEqual(report.protected_positions, (1,))
+        self.assertEqual([row["score"] for row in rows], ["2:1", "1:0"])
+
 
 if __name__ == "__main__":
     unittest.main()

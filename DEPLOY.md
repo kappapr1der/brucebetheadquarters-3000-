@@ -65,6 +65,7 @@ In Telegram:
 /id
 /hq
 /ready
+/missing
 /calendar
 /next
 /variables
@@ -90,11 +91,13 @@ In Telegram:
 /rehearse
 /setresult Arsenal - Chelsea | 2:1 | official feed delay
 /resulthistory Arsenal
+/overrideforecast Igor | Arsenal - Chelsea | 2:1 | confirmed typo
+/forecasthistory Igor | Arsenal - Chelsea
 ```
 
 `/schedule` subscribes the current chat to persistent deadline reminders. Delivery state is stored in SQLite, so a container restart does not lose the schedule or resend reminders already delivered.
 
-`/ready` is the operational preflight before a round. It surfaces missing forecasts, unknown kickoff times, incomplete model coverage, and source freshness. `/setresult <match> | <score> | <reason>` is restricted by the Telegram whitelist and writes every manual fallback into an audit log; use it only while the official result feed is delayed or being corrected.
+`/ready` is the operational preflight before a round. `/missing [тур]` adds the named follow-up list: people with a partial or missing block and the exact positions to chase. `/setresult <match> | <score> | <reason>` is restricted by the Telegram whitelist and writes every manual fallback into an audit log; use it only while the official result feed is delayed or being corrected.
 
 ## Updating data
 
@@ -110,6 +113,8 @@ Liverpool - Burnley 2 - 0
 ```
 
 The bot normalizes accepted punctuation and reports missing, duplicate, ambiguous, or extra rows without silently guessing.
+
+Once a deadline has passed, a normal direct forecast paste cannot replace an existing stored score. For a deliberate correction, use `/overrideforecast Участник | Матч | 2:1 | причина`; it preserves the original submission time and writes an audit record. `/forecasthistory Участник | Матч` shows that trail.
 
 After `/start`, it also accepts operator-friendly plain text. Send `Участники:` and one person per line; use `300р` or `без взноса` to set prize eligibility. For forecasts, send the participant name on the first line and scores below. The bot chooses the active upcoming round and replies with the accepted participant and an import report.
 

@@ -17,6 +17,7 @@ from .analytics import (
     finalize_completed_rounds,
     hq_summary,
     match_header,
+    missing_forecasts_summary,
     model_calibration_summary,
     match_dossier,
     next_calendar_match,
@@ -507,6 +508,38 @@ def cmd_ready(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_missing(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    item = missing_forecasts_summary(conn, args.round, lock_minutes=args.lock_minutes)
+    if not item["round_name"]:
+        print("No active round found.")
+        return 0
+    print_key_values(
+        [
+            ("round", item["round_name"]),
+            ("deadline", item["deadline"].isoformat() if item["deadline"] else None),
+            ("matches", item["match_count"]),
+            ("complete", f"{item['complete_count']}/{item['participant_count']}"),
+        ]
+    )
+    if not item["incomplete"]:
+        print("All participants have a complete forecast block.")
+        return 0
+    print()
+    print_rows(
+        ["participant", "saved", "missing positions"],
+        [
+            [
+                row["participant"],
+                f"{row['submitted_count']}/{item['match_count']}",
+                ",".join(str(position) for position in row["missing_positions"]),
+            ]
+            for row in item["incomplete"]
+        ],
+    )
+    return 0
+
+
 def cmd_set_result(args: argparse.Namespace) -> int:
     conn = open_db(args)
     match = find_match(conn, args.query)
@@ -580,7 +613,10 @@ def cmd_edge(args: argparse.Namespace) -> int:
 
 
 def print_forecast_import_report(participant: str, round_name: str, report: ForecastImportReport) -> None:
-    print(f"Saved forecasts: participant={participant}, round={round_name}, accepted={report.accepted_count}/{report.expected_count}")
+    print(
+        f"Forecast import: participant={participant}, round={round_name}, "
+        f"parsed={report.accepted_count}/{report.expected_count}, stored={report.stored_count}/{report.expected_count}"
+    )
     if report.normalized:
         print("Normalized:")
         print_rows(
@@ -599,6 +635,8 @@ def print_forecast_import_report(participant: str, round_name: str, report: Fore
         print("Extra lines:")
         for item in report.extra_lines:
             print(f"- {item}")
+    if report.protected_positions:
+        print("Deadline-protected positions: " + ", ".join(str(item) for item in report.protected_positions))
 
 
 def cmd_import_forecast(args: argparse.Namespace) -> int:
@@ -612,6 +650,7 @@ def cmd_import_forecast(args: argparse.Namespace) -> int:
         text=text,
         submitted_at=submitted_at,
         source="cli-forecast",
+        lock_minutes=args.lock_minutes,
     )
     print_forecast_import_report(args.participant, args.round, report)
     return 0
@@ -1144,6 +1183,12 @@ def cmd_rehearse(args: argparse.Namespace) -> int:
     print("Rehearsal completed without touching the live database.")
     print_key_values([("model_forecasts_captured", item["captured"]), ("reviews_saved", item["reviews_saved"])])
     print()
+    print("Checks:")
+    print_rows(
+        ["status", "check", "detail"],
+        [["OK" if row["passed"] else "FAIL", row["name"], row["detail"]] for row in item["checks"]],
+    )
+    print()
     print("Final standings:")
     print_rows([["#", "participant", "points"][index] for index in range(3)], [[row["rank"], row["name"], row["points"]] for row in item["standings"]])
     print()
@@ -1401,6 +1446,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     ready = sub.add_parser("ready", help="Run a preflight check for the active round.")
     ready.set_defaults(func=cmd_ready)
+
+    missing = sub.add_parser("missing", help="List participants with missing forecasts for a round.")
+    missing.add_argument("round", nargs="?")
+    missing.set_defaults(func=cmd_missing)
 
     risk = sub.add_parser("risk", help="Show the risk map for a round.")
     risk.add_argument("round", nargs="?")

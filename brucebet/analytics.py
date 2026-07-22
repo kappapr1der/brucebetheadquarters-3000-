@@ -846,6 +846,71 @@ def ready_summary(
     }
 
 
+def missing_forecasts_summary(
+    conn: sqlite3.Connection,
+    round_name: str | None = None,
+    lock_minutes: int = 90,
+) -> dict[str, object]:
+    """Return an operator-friendly per-person coverage view for one round."""
+    selected_round = round_name.strip() if round_name else target_round_name(conn, lock_minutes=lock_minutes)
+    if not selected_round:
+        return {
+            "round_name": None,
+            "deadline": None,
+            "match_count": 0,
+            "participant_count": 0,
+            "complete_count": 0,
+            "incomplete": [],
+        }
+
+    season_id = active_season_id(conn)
+    matches = match_rows_for_round(conn, selected_round)
+    if not matches:
+        raise ValueError(f"No matches found for round {selected_round!r}")
+    deadline_by_round = {item.round_name: item for item in round_deadlines(conn, lock_minutes=lock_minutes)}
+    participants = _participants(conn)
+    rows = list(
+        conn.execute(
+            """
+            SELECT
+                p.name AS participant,
+                COUNT(pr.id) AS submitted_count,
+                GROUP_CONCAT(CASE WHEN pr.id IS NULL THEN m.position END, ',') AS missing_positions
+            FROM season_participants sp
+            JOIN participants p ON p.id = sp.participant_id
+            CROSS JOIN matches m
+            JOIN rounds r ON r.id = m.round_id
+            LEFT JOIN predictions pr ON pr.participant_id = p.id AND pr.match_id = m.id
+            WHERE sp.season_id = ?
+              AND sp.active = 1
+              AND r.season_id = ?
+              AND r.name = ?
+            GROUP BY p.id
+            ORDER BY submitted_count ASC, p.name
+            """,
+            (season_id, season_id, selected_round),
+        )
+    )
+    incomplete = [
+        {
+            "participant": row["participant"],
+            "submitted_count": int(row["submitted_count"]),
+            "missing_positions": tuple(int(value) for value in (row["missing_positions"] or "").split(",") if value),
+        }
+        for row in rows
+        if int(row["submitted_count"]) < len(matches)
+    ]
+    deadline = deadline_by_round.get(selected_round)
+    return {
+        "round_name": selected_round,
+        "deadline": deadline.effective_deadline_at if deadline else None,
+        "match_count": len(matches),
+        "participant_count": len(participants),
+        "complete_count": len(participants) - len(incomplete),
+        "incomplete": incomplete,
+    }
+
+
 def strategy_summary(
     conn: sqlite3.Connection,
     user_participant: str = "Bruce Wayne",

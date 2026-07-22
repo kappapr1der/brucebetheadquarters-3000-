@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import re
 import sqlite3
 
 from .scoring import normalize_score
-from .storage import active_season_id, ensure_participant, upsert_prediction
+from .storage import active_season_id, ensure_participant, prediction_update_is_locked, upsert_prediction
 
 
 SCORE_TOKEN_RE = re.compile(r"(?<!\d)(\d+\s*[:;\-–—]\s*\d+)(?!\d)")
@@ -44,6 +44,8 @@ class ForecastImportReport:
     duplicate_positions: tuple[int, ...]
     extra_lines: tuple[str, ...]
     missing_positions: tuple[int, ...]
+    stored_positions: tuple[int, ...] = ()
+    protected_positions: tuple[int, ...] = ()
 
     @property
     def expected_count(self) -> int:
@@ -52,6 +54,10 @@ class ForecastImportReport:
     @property
     def accepted_count(self) -> int:
         return len(self.forecasts)
+
+    @property
+    def stored_count(self) -> int:
+        return len(self.stored_positions)
 
 
 @dataclass(frozen=True)
@@ -206,22 +212,42 @@ def import_forecast_block(
     text: str,
     submitted_at: datetime | str | None = None,
     source: str = "direct-import",
+    lock_minutes: int = 90,
 ) -> ForecastImportReport:
     matches = expected_matches(conn, round_name)
     report = parse_forecast_block(text, matches)
     timestamp = submitted_at.isoformat() if isinstance(submitted_at, datetime) else submitted_at
+    participant_name = participant.strip()
+    ensure_participant(conn, participant_name, paid=None)
+    stored_positions: list[int] = []
+    protected_positions: list[int] = []
     for forecast in report.forecasts:
+        if prediction_update_is_locked(
+            conn,
+            participant=participant_name,
+            round_name=round_name,
+            position=forecast.position,
+            submitted_at=timestamp,
+            lock_minutes=lock_minutes,
+        ):
+            protected_positions.append(forecast.position)
+            continue
         upsert_prediction(
             conn,
-            participant=participant.strip(),
+            participant=participant_name,
             round_name=round_name.strip(),
             position=forecast.position,
             score=forecast.score,
             submitted_at=timestamp,
             source=f"{source}:line-{forecast.line_number}",
         )
+        stored_positions.append(forecast.position)
     conn.commit()
-    return report
+    return replace(
+        report,
+        stored_positions=tuple(stored_positions),
+        protected_positions=tuple(protected_positions),
+    )
 
 
 def import_participant_block(conn: sqlite3.Connection, text: str) -> ParticipantImportReport:

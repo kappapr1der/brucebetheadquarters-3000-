@@ -68,6 +68,7 @@ class SnapshotTest(unittest.TestCase):
             self.assertIn("model_forecasts.csv", filenames)
             self.assertIn("round_reviews.csv", filenames)
             self.assertIn("manual_result_overrides.csv", filenames)
+            self.assertIn("manual_prediction_overrides.csv", filenames)
             self.assertFalse(any(path.suffix == ".sqlite" for path in out_dir.iterdir()))
 
 
