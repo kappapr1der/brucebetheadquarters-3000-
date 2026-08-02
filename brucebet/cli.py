@@ -16,6 +16,7 @@ from .analytics import (
     field_summary,
     finalize_completed_rounds,
     hq_summary,
+    intelligence_readiness,
     match_header,
     missing_forecasts_summary,
     model_calibration_summary,
@@ -73,8 +74,9 @@ from .storage import (
     manual_result_history,
     reset_db,
     set_manual_match_result,
+    upsert_absence,
 )
-from .variable_sync import VariableSyncResult, sync_match_variables
+from .variable_sync import VariableSyncResult, sync_match_assessments, sync_match_contexts_and_factors, sync_match_variables
 from .vk_parser import parse_file as parse_vk_file
 
 
@@ -505,6 +507,82 @@ def cmd_ready(args: argparse.Namespace) -> int:
             print(f"- {row}")
     print("\nData freshness:")
     print_rows(["source", "updated_at", "age_minutes"], freshness_rows(item["freshness"]))
+    return 0
+
+
+def cmd_intel(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    item = intelligence_readiness(conn, args.round, lock_minutes=args.lock_minutes)
+    if not item["items"]:
+        print("No matches found for the selected round.")
+        return 0
+    print_key_values(
+        [
+            ("round", item["round_name"]),
+            ("ready", item["ready_count"]),
+            ("attention", item["attention_count"]),
+            ("blocked", item["blocked_count"]),
+        ]
+    )
+    print()
+    print_rows(
+        ["#", "match", "status", "signals", "priority"],
+        [
+            [
+                row["match"]["position"],
+                f"{row['match']['home']} - {row['match']['away']}",
+                row["status"],
+                f"{row['ready_signals']}/{row['total_signals']}",
+                ", ".join(signal["title"] for signal in row["follow_up"][:3]) or "-",
+            ]
+            for row in item["items"]
+        ],
+    )
+    return 0
+
+
+def cmd_absence(args: argparse.Namespace) -> int:
+    if args.impact is not None and not 0 <= args.impact <= 1:
+        print("impact must be between 0 and 1", file=sys.stderr)
+        return 2
+    conn = open_db(args)
+    now = datetime.now().astimezone()
+    absence_id = upsert_absence(
+        conn,
+        {
+            "team": args.team,
+            "player": args.player,
+            "status": args.status,
+            "impact_rating": "" if args.impact is None else str(args.impact),
+            "source": args.source,
+            "notes": args.note or "",
+            "updated_at": now.isoformat(),
+        },
+    )
+    sync_match_contexts_and_factors(
+        conn,
+        now=now,
+        days_ahead=args.days,
+        weather_days=0,
+        timezone_name=args.timezone,
+    )
+    assessments = sync_match_assessments(
+        conn,
+        now.isoformat(),
+        now=now,
+        days_ahead=args.days,
+        timezone_name=args.timezone,
+    )
+    conn.commit()
+    print_key_values(
+        [
+            ("action", "cleared" if absence_id == 0 else "saved"),
+            ("team", args.team),
+            ("player", args.player),
+            ("status", args.status),
+            ("assessments_recalculated", assessments),
+        ]
+    )
     return 0
 
 
@@ -1446,6 +1524,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     ready = sub.add_parser("ready", help="Run a preflight check for the active round.")
     ready.set_defaults(func=cmd_ready)
+
+    intel = sub.add_parser("intel", help="Show per-match analytical readiness and missing signals.")
+    intel.add_argument("round", nargs="?")
+    intel.set_defaults(func=cmd_intel)
+
+    absence = sub.add_parser("absence", help="Save a confirmed absence and recalculate relevant variables.")
+    absence.add_argument("team")
+    absence.add_argument("player")
+    absence.add_argument("status", help="injured, doubtful, suspended, fit, or available")
+    absence.add_argument("--impact", type=float, help="importance from 0 to 1")
+    absence.add_argument("--source", default="manual CLI")
+    absence.add_argument("--note")
+    absence.add_argument("--days", type=int, default=int(env_default("BRUCEBET_VARIABLE_DAYS_AHEAD", "365")))
+    absence.add_argument("--timezone", default=env_default("BRUCEBET_TIMEZONE", "Europe/Moscow"))
+    absence.set_defaults(func=cmd_absence)
 
     missing = sub.add_parser("missing", help="List participants with missing forecasts for a round.")
     missing.add_argument("round", nargs="?")

@@ -697,6 +697,208 @@ def data_freshness(conn: sqlite3.Connection, now: datetime | None = None) -> dic
     return {key: _freshness_item(value, now) for key, value in values.items()}
 
 
+def _readiness_signal(
+    key: str,
+    title: str,
+    present: bool,
+    detail: str,
+    updated_at: str | None = None,
+    max_age_hours: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    if not present:
+        return {"key": key, "title": title, "state": "missing", "detail": detail, "updated_at": updated_at}
+    if max_age_hours is not None and now is not None:
+        comparable = _aware_for_compare(parse_datetime(updated_at), now)
+        if comparable is None:
+            return {"key": key, "title": title, "state": "missing", "detail": detail, "updated_at": updated_at}
+        age_hours = max(0, int((now - comparable).total_seconds() // 3600))
+        if age_hours > max_age_hours:
+            return {
+                "key": key,
+                "title": title,
+                "state": "stale",
+                "detail": f"{detail}; age={age_hours}h",
+                "updated_at": updated_at,
+            }
+    return {"key": key, "title": title, "state": "ok", "detail": detail, "updated_at": updated_at}
+
+
+def match_intelligence_readiness(
+    conn: sqlite3.Connection,
+    match_id: int,
+    now: datetime | None = None,
+    lock_minutes: int = 90,
+) -> dict[str, object]:
+    """Explain whether a match has enough fresh information for a responsible pick."""
+    now = now or datetime.now().astimezone()
+    dossier = match_dossier(conn, match_id)
+    match = dossier["match"]
+    kickoff = parse_datetime(match["kickoff_at"])
+    deadline = _match_deadline(kickoff, parse_datetime(match["round_deadline_at"]), lock_minutes)
+    comparable_kickoff = _aware_for_compare(kickoff, now)
+    within_weather_window = comparable_kickoff is not None and timedelta(0) <= comparable_kickoff - now <= timedelta(days=16)
+    within_odds_window = deadline is not None and _aware_for_compare(deadline, now) is not None and _aware_for_compare(deadline, now) - now <= timedelta(hours=72)
+
+    teams = [dossier["home"], dossier["away"]]
+    team_ids = [int(team["id"]) for team in teams]
+    status_rows = list(
+        conn.execute(
+            """
+            SELECT team_id, COUNT(DISTINCT player) AS player_count, MAX(updated_at) AS updated_at
+            FROM player_status_snapshots
+            WHERE team_id IN (?, ?)
+            GROUP BY team_id
+            """,
+            team_ids,
+        )
+    )
+    status_by_team = {int(row["team_id"]): row for row in status_rows}
+    player_counts = [int(status_by_team.get(team_id, {"player_count": 0})["player_count"]) for team_id in team_ids]
+    player_updates = [status_by_team.get(team_id, {"updated_at": None})["updated_at"] for team_id in team_ids]
+    player_updated_at = min((value for value in player_updates if value), default=None)
+
+    form_rows = list(
+        conn.execute(
+            """
+            SELECT team_id, COUNT(*) AS form_count, MAX(match_date) AS latest_match_at
+            FROM team_form
+            WHERE team_id IN (?, ?)
+            GROUP BY team_id
+            """,
+            team_ids,
+        )
+    )
+    form_by_team = {int(row["team_id"]): row for row in form_rows}
+    form_counts = [int(form_by_team.get(team_id, {"form_count": 0})["form_count"]) for team_id in team_ids]
+    form_updated_at = min(
+        (row["latest_match_at"] for row in form_rows if row["latest_match_at"]),
+        default=None,
+    )
+    absence_row = conn.execute(
+        "SELECT COUNT(*) AS count, MAX(updated_at) AS updated_at FROM absences WHERE team_id IN (?, ?)",
+        team_ids,
+    ).fetchone()
+    context = dossier["context"]
+    factors = dossier["factors"]
+    assessment = dossier["assessment"]
+    latest_odds = dossier["odds"][0] if dossier["odds"] else None
+
+    signals = [
+        _readiness_signal("kickoff", "Kickoff", kickoff is not None, "kickoff is set" if kickoff else "no kickoff", now=now),
+        _readiness_signal(
+            "strength",
+            "Elo strength",
+            all(team["elo_rating"] is not None for team in teams),
+            "both team Elo ratings loaded",
+            min((team["updated_at"] for team in teams if team["updated_at"]), default=None),
+            max_age_hours=14 * 24,
+            now=now,
+        ),
+        _readiness_signal(
+            "players",
+            "Player availability",
+            min(player_counts, default=0) >= 11,
+            f"snapshots home/away={player_counts[0]}/{player_counts[1]}",
+            player_updated_at,
+            max_age_hours=48,
+            now=now,
+        ),
+        _readiness_signal(
+            "form",
+            "Recent form/xG",
+            min(form_counts, default=0) >= 3,
+            f"recent form rows home/away={form_counts[0]}/{form_counts[1]}",
+            form_updated_at,
+            max_age_hours=30 * 24,
+            now=now,
+        ),
+        _readiness_signal(
+            "context",
+            "Match context",
+            context is not None,
+            "venue/rest context loaded" if context else "context is absent",
+            now=now,
+        ),
+        _readiness_signal(
+            "factors",
+            "Lineup/rest factors",
+            len(factors) == 2,
+            f"team factor rows={len(factors)}/2",
+            now=now,
+        ),
+        _readiness_signal(
+            "model",
+            "Model assessment",
+            assessment is not None and assessment["suggested_score"] is not None,
+            "assessment is generated" if assessment else "assessment is absent",
+            assessment["updated_at"] if assessment else None,
+            max_age_hours=48,
+            now=now,
+        ),
+        _readiness_signal(
+            "odds",
+            "Odds market",
+            latest_odds is not None,
+            "latest odds snapshot loaded" if latest_odds else "sync odds near deadline",
+            latest_odds["captured_at"] if latest_odds else None,
+            max_age_hours=36 if within_odds_window else None,
+            now=now,
+        ),
+        _readiness_signal(
+            "weather",
+            "Weather",
+            not within_weather_window or (context is not None and bool(context["weather"])),
+            "outside forecast window" if not within_weather_window else "weather is loaded",
+            now=now,
+        ),
+    ]
+    absence_count = int(absence_row["count"] or 0) if absence_row else 0
+    absence_detail = f"manual absences logged={absence_count}" if absence_count else "manual injury/news review still needed"
+    signals.append(
+        {
+            "key": "absences",
+            "title": "Manual injury review",
+            "state": "ok" if absence_count else "review",
+            "detail": absence_detail,
+            "updated_at": absence_row["updated_at"] if absence_row else None,
+        }
+    )
+    core_keys = {"kickoff", "strength", "players", "context", "factors", "model"}
+    core_issues = [item for item in signals if item["key"] in core_keys and item["state"] != "ok"]
+    follow_up = [item for item in signals if item["state"] in {"missing", "stale", "review"}]
+    data_gaps = [item for item in follow_up if item["state"] != "review"]
+    status = "blocked" if any(item["key"] == "kickoff" for item in core_issues) else "attention" if data_gaps else "ready"
+    return {
+        "match": match,
+        "deadline": deadline,
+        "status": status,
+        "signals": signals,
+        "ready_signals": sum(item["state"] == "ok" for item in signals),
+        "total_signals": len(signals),
+        "follow_up": follow_up,
+    }
+
+
+def intelligence_readiness(
+    conn: sqlite3.Connection,
+    round_name: str | None = None,
+    now: datetime | None = None,
+    lock_minutes: int = 90,
+) -> dict[str, object]:
+    matches = match_rows_for_round(conn, round_name)
+    items = [match_intelligence_readiness(conn, int(match["id"]), now=now, lock_minutes=lock_minutes) for match in matches]
+    order = {"blocked": 0, "attention": 1, "ready": 2}
+    items.sort(key=lambda item: (order[str(item["status"])], int(item["match"]["position"])))
+    return {
+        "round_name": matches[0]["round_name"] if matches else round_name,
+        "items": items,
+        "ready_count": sum(item["status"] == "ready" for item in items),
+        "attention_count": sum(item["status"] == "attention" for item in items),
+        "blocked_count": sum(item["status"] == "blocked" for item in items),
+    }
+
+
 def hq_summary(
     conn: sqlite3.Connection,
     user_participant: str = "Bruce Wayne",
@@ -790,6 +992,11 @@ def ready_summary(
         """,
         (active_season_id(conn), round_name),
     ).fetchone()
+    intelligence = intelligence_readiness(conn, round_name, now=now, lock_minutes=lock_minutes) if round_name else {
+        "ready_count": 0,
+        "attention_count": 0,
+        "blocked_count": 0,
+    }
     blockers: list[str] = []
     warnings: list[str] = []
     if not matches:
@@ -810,6 +1017,10 @@ def ready_summary(
         warnings.append(f"Поле ещё неполное: не хватает {missing_field} строк прогнозов.")
     if len(matches) and int(model_coverage["count"]) < len(matches):
         warnings.append(f"Модель зафиксирована не для всех матчей: {model_coverage['count']}/{len(matches)}.")
+    if intelligence["blocked_count"]:
+        blockers.append(f"Аналитика заблокирована у матчей: {intelligence['blocked_count']}. Открой /intel.")
+    elif intelligence["attention_count"]:
+        warnings.append(f"Нужен ручной аналитический чек у матчей: {intelligence['attention_count']}. Детали: /intel.")
 
     freshness = hq["freshness"]
     nearing_deadline = minutes_to_deadline is not None and minutes_to_deadline <= 72 * 60
@@ -840,6 +1051,7 @@ def ready_summary(
         "field_predictions": int(hq["predictions"]["rows"]),
         "expected_field_predictions": expected_field_rows,
         "model_forecasts": int(model_coverage["count"]),
+        "intelligence": intelligence,
         "freshness": freshness,
         "blockers": blockers,
         "warnings": warnings,
@@ -1435,7 +1647,7 @@ def player_status_summary(
 def match_dossier(conn: sqlite3.Connection, match_id: int) -> dict[str, object]:
     match = conn.execute(
         """
-        SELECT m.*, r.name AS round_name, r.sort_order
+        SELECT m.*, r.name AS round_name, r.sort_order, r.deadline_at AS round_deadline_at
         FROM matches m
         JOIN rounds r ON r.id = m.round_id
         WHERE m.id = ?

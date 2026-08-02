@@ -65,6 +65,8 @@ In Telegram:
 /id
 /hq
 /ready
+/intel
+/absence Arsenal | Saka | doubtful | 0.8 | Arsenal official | ankle knock
 /missing
 /calendar
 /next
@@ -97,7 +99,7 @@ In Telegram:
 
 `/schedule` subscribes the current chat to persistent deadline reminders. Delivery state is stored in SQLite, so a container restart does not lose the schedule or resend reminders already delivered.
 
-`/ready` is the operational preflight before a round. `/missing [тур]` adds the named follow-up list: people with a partial or missing block and the exact positions to chase. `/setresult <match> | <score> | <reason>` is restricted by the Telegram whitelist and writes every manual fallback into an audit log; use it only while the official result feed is delayed or being corrected.
+`/ready` is the operational preflight before a round. `/intel [тур]` adds a per-match variable coverage check and names the missing/stale inputs. `/absence Команда | Игрок | статус | impact | источник | заметка` records confirmed player news, recalculates factors and assessments, and accepts `fit`/`available` to clear an old entry. `/missing [тур]` adds the named follow-up list: people with a partial or missing block and the exact positions to chase. `/setresult <match> | <score> | <reason>` is restricted by the Telegram whitelist and writes every manual fallback into an audit log; use it only while the official result feed is delayed or being corrected.
 
 ## Updating data
 

@@ -30,6 +30,7 @@ from .analytics import (
     field_summary,
     finalize_completed_rounds,
     hq_summary,
+    intelligence_readiness,
     match_dossier,
     match_header,
     missing_forecasts_summary,
@@ -96,8 +97,9 @@ from .storage import (
     manual_result_history,
     set_manual_prediction_override,
     set_manual_match_result,
+    upsert_absence,
 )
-from .variable_sync import VariableSyncResult, sync_match_variables
+from .variable_sync import VariableSyncResult, sync_match_assessments, sync_match_contexts_and_factors, sync_match_variables
 from .vk_parser import parse_file as parse_vk_file
 
 
@@ -508,6 +510,12 @@ def render_ready(item: dict[str, object]) -> str:
                 ["missing_yours", clean(item["missing_your_predictions"])],
                 ["field", f"{item['field_predictions']}/{item['expected_field_predictions']}"],
                 ["model", f"{item['model_forecasts']}/{item['match_count']}"],
+                [
+                    "intel",
+                    f"ready={item['intelligence']['ready_count']}; "
+                    f"attention={item['intelligence']['attention_count']}; "
+                    f"blocked={item['intelligence']['blocked_count']}",
+                ],
             ],
         ),
     ]
@@ -516,6 +524,36 @@ def render_ready(item: dict[str, object]) -> str:
     if item["warnings"]:
         sections.append("Проверь:\n" + "\n".join(f"- {row}" for row in item["warnings"]))
     sections.append("Свежесть данных:\n" + render_freshness(item["freshness"]))
+    return "\n\n".join(sections)
+
+
+def render_intelligence(item: dict[str, object]) -> str:
+    if not item["items"]:
+        return "Не нашёл матчей для аналитической проверки. Сначала загрузи календарь."
+    status_labels = {"ready": "ready", "attention": "check", "blocked": "blocked"}
+    rows = []
+    follow_up: list[str] = []
+    for row in item["items"]:
+        match = row["match"]
+        needs = [signal for signal in row["follow_up"] if signal["key"] != "absences"]
+        rows.append(
+            [
+                match["position"],
+                f"{match['home']} - {match['away']}",
+                status_labels[str(row["status"])],
+                f"{row['ready_signals']}/{row['total_signals']}",
+                ", ".join(signal["title"] for signal in needs[:2]) or "-",
+            ]
+        )
+        for signal in row["follow_up"][:3]:
+            follow_up.append(f"#{match['position']} {match['home']} - {match['away']}: {signal['title']} - {signal['detail']}")
+    sections = [
+        f"Intel: тур {item['round_name']}. ready={item['ready_count']}, check={item['attention_count']}, blocked={item['blocked_count']}",
+        render_rows(["#", "match", "status", "signals", "priority"], rows),
+    ]
+    if follow_up:
+        sections.append("Что добрать:\n" + "\n".join(f"- {line}" for line in follow_up[:12]))
+    sections.append("После подтверждённой новости: /absence Команда | Игрок | injured/doubtful/suspended | 0.8 | источник | заметка")
     return "\n\n".join(sections)
 
 
@@ -729,7 +767,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Прогноз: первая строка - имя участника, ниже счета в порядке матчей. Текущий тур подставлю сам.",
         "Полный список команд: /help.",
     ]
-    lines.append("Быстрые команды: /forecast, /participants, /edge, /ready.")
+    lines.append("Быстрые команды: /forecast, /participants, /intel, /ready.")
     if not settings.allowed_chat_ids:
         lines.append("")
         if update.effective_chat is not None:
@@ -777,6 +815,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/forecast Имя | тур + счета с новой строки - загрузить один прогноз",
                 "/hq - штаб активного тура",
                 "/ready - предтуровый контроль перед отправкой прогнозов",
+                "/intel [тур] - качество и свежесть аналитики по каждому матчу",
+                "/absence Команда | Игрок | статус | impact | источник | заметка - внести подтверждённую потерю",
                 "/missing [тур] - кто не прислал или недоприслал прогноз",
                 "/table - таблица конкурса",
                 "/field <матч> - поле прогнозов",
@@ -877,6 +917,95 @@ async def ready_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = settings_from_context(context)
     conn = conn_from_context(context)
     await send_text(update, render_ready(ready_summary(conn, user_participant=settings.user_participant, lock_minutes=settings.lock_minutes)))
+
+
+@require_access
+async def intel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    conn = conn_from_context(context)
+    await send_text(
+        update,
+        render_intelligence(
+            intelligence_readiness(conn, query_text(context) or None, lock_minutes=settings.lock_minutes)
+        ),
+    )
+
+
+def parse_absence_entry(raw: str) -> dict[str, str] | None:
+    parts = [part.strip() for part in raw.split("|")]
+    if len(parts) < 3 or not all(parts[:3]):
+        return None
+    impact = parts[3] if len(parts) > 3 and parts[3] else ""
+    if impact:
+        try:
+            value = float(impact)
+        except ValueError:
+            return None
+        if not 0 <= value <= 1:
+            return None
+    return {
+        "team": parts[0],
+        "player": parts[1],
+        "status": parts[2],
+        "impact_rating": impact,
+        "source": parts[4] if len(parts) > 4 and parts[4] else "manual Telegram",
+        "notes": " | ".join(parts[5:]) if len(parts) > 5 else "",
+    }
+
+
+def record_absence_worker(settings: BotSettings, entry: dict[str, str]) -> tuple[int, int]:
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        activate_profile(
+            conn,
+            competition_code=settings.competition,
+            season_name=settings.season,
+            season_display_name=settings.season_display,
+            lock_minutes=settings.lock_minutes,
+        )
+        now = datetime.now().astimezone()
+        entry["updated_at"] = now.isoformat()
+        absence_id = upsert_absence(conn, entry)
+        sync_match_contexts_and_factors(
+            conn,
+            now=now,
+            days_ahead=365,
+            weather_days=0,
+            timezone_name=settings.timezone,
+        )
+        assessments = sync_match_assessments(
+            conn,
+            now.isoformat(),
+            now=now,
+            days_ahead=365,
+            timezone_name=settings.timezone,
+        )
+        conn.commit()
+        return absence_id, assessments
+    finally:
+        conn.close()
+
+
+@require_access
+async def absence_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    entry = parse_absence_entry(query_text(context))
+    if entry is None:
+        await send_text(
+            update,
+            "Формат: /absence Arsenal | Saka | doubtful | 0.8 | club news | knock. "
+            "Impact от 0 до 1; статус fit/available снимет старую запись.",
+        )
+        return
+    settings = settings_from_context(context)
+    await send_text(update, "Записываю новость и пересчитываю факторы ближайших матчей.")
+    absence_id, assessments = await asyncio.to_thread(record_absence_worker, settings, entry)
+    action = "Снял активную запись" if absence_id == 0 else "Сохранил потерю"
+    await send_text(
+        update,
+        f"{action}: {entry['team']} - {entry['player']} ({entry['status']}). "
+        f"Модельных оценок пересчитано: {assessments}. Проверь /intel и /dossier {entry['team']}.",
+    )
 
 
 @require_access
@@ -1986,6 +2115,8 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("forecast", forecast_cmd))
     application.add_handler(CommandHandler("hq", hq_cmd))
     application.add_handler(CommandHandler("ready", ready_cmd))
+    application.add_handler(CommandHandler("intel", intel_cmd))
+    application.add_handler(CommandHandler("absence", absence_cmd))
     application.add_handler(CommandHandler("missing", missing_cmd))
     application.add_handler(CommandHandler("table", table_cmd))
     application.add_handler(CommandHandler("field", field_cmd))

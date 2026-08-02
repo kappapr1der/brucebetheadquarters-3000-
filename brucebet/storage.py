@@ -1012,6 +1012,22 @@ def upsert_team_form(conn: sqlite3.Connection, row: dict[str, str]) -> int:
 
 def upsert_absence(conn: sqlite3.Connection, row: dict[str, str]) -> int:
     team_id = ensure_team(conn, row["team"])
+    player = row["player"].strip()
+    status = row["status"].strip().lower()
+    if not player or not status:
+        raise ValueError("absence.player and absence.status are required")
+    if status in {"available", "fit", "cleared", "returned"}:
+        conn.execute(
+            "DELETE FROM absences WHERE team_id = ? AND lower(player) = lower(?)",
+            (team_id, player),
+        )
+        return 0
+    # This is a current availability register, not a history table. A new status
+    # supersedes the old one so an "injured" row cannot linger after an update.
+    conn.execute(
+        "DELETE FROM absences WHERE team_id = ? AND lower(player) = lower(?) AND lower(status) <> ?",
+        (team_id, player, status),
+    )
     conn.execute(
         """
         INSERT INTO absences(
@@ -1030,9 +1046,9 @@ def upsert_absence(conn: sqlite3.Connection, row: dict[str, str]) -> int:
         """,
         (
             team_id,
-            row["player"].strip(),
+            player,
             optional_text(row.get("role")),
-            row["status"].strip(),
+            status,
             optional_text(row.get("severity")),
             optional_float(row.get("impact_rating")),
             optional_text(row.get("expected_return")),
@@ -1043,7 +1059,7 @@ def upsert_absence(conn: sqlite3.Connection, row: dict[str, str]) -> int:
     )
     db_row = conn.execute(
         "SELECT id FROM absences WHERE team_id = ? AND player = ? AND status = ?",
-        (team_id, row["player"].strip(), row["status"].strip()),
+        (team_id, player, status),
     ).fetchone()
     return int(db_row["id"])
 

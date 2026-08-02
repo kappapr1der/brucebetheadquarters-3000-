@@ -28,6 +28,8 @@
 - `/start`: короткий операторский старт: бот готов принять список участников или следующий блок прогнозов.
 - `/ready`: предтуровый preflight: дедлайн, покрытие прогнозами, готовность модели и свежесть источников.
 - `/missing [тур]`: адресный список участников с неполным блоком и номерами недостающих матчей.
+- `/intel [тур]`: готовность аналитики по каждому матчу и точный список того, что ещё нужно проверить.
+- `/absence`: быстрая запись подтверждённой травмы/дисквалификации; сразу пересчитывает факторы и оценку модели.
 - `/risk`: риск-карта тура.
 - `/edge`: карта расхождений поля, рынка и модели; ранжирует матчи для точечных отличий, а не выдаёт «истину».
 - `/strategy`: режим игры относительно лидера.
@@ -139,6 +141,8 @@ THESPORTSDB_KEY=123
 - `/id`
 - `/hq`
 - `/ready`
+- `/intel [тур]`
+- `/absence Arsenal | Saka | doubtful | 0.8 | Arsenal official | ankle knock`
 - `/missing [тур]`
 - `/load`
 - `/participants` + список с новой строки
@@ -206,6 +210,8 @@ Calendar commands:
 - `brucebet import-forecast <участник> <тур> <файл>` - import one participant's raw forecast block.
 
 After the deadline, a normal import can add a previously absent line but cannot replace an already stored score. Use the whitelisted Telegram command `/overrideforecast Участник | Матч | 2:1 | причина` only for an intentional correction; every correction is written to the audit log and exported in snapshots.
+
+Before a score decision, use `/intel [тур]` to see where the model lacks fresh input. Record a confirmed injury or suspension with `/absence Команда | Игрок | статус | impact | источник | заметка`; `impact` uses a scale from `0` to `1`, and `fit`/`available` removes a previous record.
 - `brucebet set-result <match> <score> --reason <text>` - manually record a fallback final score with an audit trail.
 - `brucebet result-history <match>` - inspect the manual result override journal.
 - `brucebet review <тур>` - post-round scoreboard, score swings, and model performance.
