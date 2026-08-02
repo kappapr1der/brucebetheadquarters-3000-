@@ -9,22 +9,31 @@ import sys
 
 from .analytics import (
     calendar_matches,
+    capture_model_forecasts,
     compare_participants,
     compute_standings,
+    edge_map,
     field_summary,
+    finalize_completed_rounds,
     hq_summary,
+    intelligence_readiness,
     match_header,
+    missing_forecasts_summary,
+    model_calibration_summary,
     match_dossier,
     next_calendar_match,
     player_status_summary,
     prediction_is_eligible,
     prediction_views_for_match,
+    ready_summary,
     recommend_match,
     risk_map,
     round_deadlines,
+    round_review,
     strategy_summary,
     team_profile,
 )
+from .forecast_import import ForecastImportReport, import_forecast_block
 from .scoring import is_standard_score, normalize_score, parse_datetime, parse_score
 from .odds_api import (
     DEFAULT_ODDS_BOOKMAKER,
@@ -35,7 +44,14 @@ from .odds_api import (
     TheOddsApiClient,
     sync_odds_to_db,
 )
-from .pl_fixtures import DEFAULT_PL_COMPSEASON_ID, DEFAULT_PL_SEASON_LABEL, PremierLeagueApiError, sync_pl_fixtures_to_db
+from .pl_fixtures import (
+    DEFAULT_PL_COMPSEASON_ID,
+    DEFAULT_PL_SEASON_LABEL,
+    PremierLeagueApiError,
+    sync_pl_fixtures_to_db,
+    sync_pl_results_to_db,
+)
+from .rehearsal import run_rehearsal
 from .sources import SourceConfig, check_all_sources
 from .snapshot import export_snapshot
 from .storage import (
@@ -55,9 +71,12 @@ from .storage import (
     import_team_match_factors,
     import_teams,
     init_db,
+    manual_result_history,
     reset_db,
+    set_manual_match_result,
+    upsert_absence,
 )
-from .variable_sync import VariableSyncResult, sync_match_variables
+from .variable_sync import VariableSyncResult, sync_match_assessments, sync_match_contexts_and_factors, sync_match_variables
 from .vk_parser import parse_file as parse_vk_file
 
 
@@ -192,6 +211,13 @@ def print_calendar_items(items: list[object]) -> None:
             for item in items
         ],
     )
+
+
+def freshness_rows(items: dict[str, dict[str, object]]) -> list[list[object]]:
+    return [
+        [key, clean(value["updated_at"]), clean(value["age_minutes"])]
+        for key, value in items.items()
+    ]
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -449,12 +475,262 @@ def cmd_hq(args: argparse.Namespace) -> int:
         ["#", "match", "top", "share", "base"],
         [[row["position"], row["label"], row["top_outcome"], row["top_share"], row["suggested_score"]] for row in focus],
     )
+    print()
+    print("Data freshness:")
+    print_rows(["source", "updated_at", "age_minutes"], freshness_rows(item["freshness"]))
+    return 0
+
+
+def cmd_ready(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    item = ready_summary(conn, user_participant=args.user, lock_minutes=args.lock_minutes)
+    print_key_values(
+        [
+            ("status", item["status"]),
+            ("round", item["round_name"]),
+            ("deadline", item["deadline"].isoformat() if item["deadline"] else None),
+            ("minutes_to_deadline", item["minutes_to_deadline"]),
+            ("matches", item["match_count"]),
+            ("your_predictions", item["your_predictions"]),
+            ("missing_your_predictions", item["missing_your_predictions"]),
+            ("field_predictions", f"{item['field_predictions']}/{item['expected_field_predictions']}"),
+            ("model_forecasts", f"{item['model_forecasts']}/{item['match_count']}"),
+        ]
+    )
+    if item["blockers"]:
+        print("\nBlockers:")
+        for row in item["blockers"]:
+            print(f"- {row}")
+    if item["warnings"]:
+        print("\nWarnings:")
+        for row in item["warnings"]:
+            print(f"- {row}")
+    print("\nData freshness:")
+    print_rows(["source", "updated_at", "age_minutes"], freshness_rows(item["freshness"]))
+    return 0
+
+
+def cmd_intel(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    item = intelligence_readiness(conn, args.round, lock_minutes=args.lock_minutes)
+    if not item["items"]:
+        print("No matches found for the selected round.")
+        return 0
+    print_key_values(
+        [
+            ("round", item["round_name"]),
+            ("ready", item["ready_count"]),
+            ("attention", item["attention_count"]),
+            ("blocked", item["blocked_count"]),
+        ]
+    )
+    print()
+    print_rows(
+        ["#", "match", "status", "signals", "priority"],
+        [
+            [
+                row["match"]["position"],
+                f"{row['match']['home']} - {row['match']['away']}",
+                row["status"],
+                f"{row['ready_signals']}/{row['total_signals']}",
+                ", ".join(signal["title"] for signal in row["follow_up"][:3]) or "-",
+            ]
+            for row in item["items"]
+        ],
+    )
+    return 0
+
+
+def cmd_absence(args: argparse.Namespace) -> int:
+    if args.impact is not None and not 0 <= args.impact <= 1:
+        print("impact must be between 0 and 1", file=sys.stderr)
+        return 2
+    conn = open_db(args)
+    now = datetime.now().astimezone()
+    absence_id = upsert_absence(
+        conn,
+        {
+            "team": args.team,
+            "player": args.player,
+            "status": args.status,
+            "impact_rating": "" if args.impact is None else str(args.impact),
+            "source": args.source,
+            "notes": args.note or "",
+            "updated_at": now.isoformat(),
+        },
+    )
+    sync_match_contexts_and_factors(
+        conn,
+        now=now,
+        days_ahead=args.days,
+        weather_days=0,
+        timezone_name=args.timezone,
+    )
+    assessments = sync_match_assessments(
+        conn,
+        now.isoformat(),
+        now=now,
+        days_ahead=args.days,
+        timezone_name=args.timezone,
+    )
+    conn.commit()
+    print_key_values(
+        [
+            ("action", "cleared" if absence_id == 0 else "saved"),
+            ("team", args.team),
+            ("player", args.player),
+            ("status", args.status),
+            ("assessments_recalculated", assessments),
+        ]
+    )
+    return 0
+
+
+def cmd_missing(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    item = missing_forecasts_summary(conn, args.round, lock_minutes=args.lock_minutes)
+    if not item["round_name"]:
+        print("No active round found.")
+        return 0
+    print_key_values(
+        [
+            ("round", item["round_name"]),
+            ("deadline", item["deadline"].isoformat() if item["deadline"] else None),
+            ("matches", item["match_count"]),
+            ("complete", f"{item['complete_count']}/{item['participant_count']}"),
+        ]
+    )
+    if not item["incomplete"]:
+        print("All participants have a complete forecast block.")
+        return 0
+    print()
+    print_rows(
+        ["participant", "saved", "missing positions"],
+        [
+            [
+                row["participant"],
+                f"{row['submitted_count']}/{item['match_count']}",
+                ",".join(str(position) for position in row["missing_positions"]),
+            ]
+            for row in item["incomplete"]
+        ],
+    )
+    return 0
+
+
+def cmd_set_result(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    match = find_match(conn, args.query)
+    previous, current = set_manual_match_result(conn, int(match["id"]), args.score, reason=args.reason)
+    reviews = finalize_completed_rounds(conn, lock_minutes=args.lock_minutes)
+    print_key_values(
+        [
+            ("match", match_header(match)),
+            ("previous_result", previous),
+            ("manual_result", current),
+            ("reason", args.reason),
+            ("completed_round_reviews", len(reviews)),
+        ]
+    )
+    return 0
+
+
+def cmd_result_history(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    match = find_match(conn, args.query)
+    print(match_header(match))
+    print_rows(
+        ["previous", "new", "changed_at", "chat_id", "reason"],
+        [
+            [clean(row["previous_result"]), row["new_result"], row["changed_at"], clean(row["actor_chat_id"]), clean(row["reason"])]
+            for row in manual_result_history(conn, int(match["id"]))
+        ],
+    )
     return 0
 
 
 def cmd_risk(args: argparse.Namespace) -> int:
     conn = open_db(args)
     print_risk_map(risk_map(conn, args.round))
+    return 0
+
+
+def print_edge_map(item: dict[str, object]) -> None:
+    print(f"Round: {clean(item['round_name'])}")
+    rows = item["opportunities"]
+    if rows:
+        print("\nDisagreement opportunities:")
+        print_rows(
+            ["#", "match", "model", "market", "field", "edge", "signals"],
+            [
+                [
+                    row["position"],
+                    row["label"],
+                    f"{row['model_score']} {row['model_outcome']}".strip(),
+                    f"{row['market_outcome']} {clean(row['market_share'])}",
+                    f"{row['field_outcome']} {clean(row['field_share'])}",
+                    row["edge_score"],
+                    ",".join(row["signals"]),
+                ]
+                for row in rows
+            ],
+        )
+    missing = item["needs_data"]
+    if missing:
+        print("\nNeeds data before it can be ranked:")
+        print_rows(
+            ["#", "match", "missing"],
+            [[row["position"], row["label"], ",".join(row["missing"])] for row in missing],
+        )
+
+
+def cmd_edge(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    print_edge_map(edge_map(conn, args.round))
+    return 0
+
+
+def print_forecast_import_report(participant: str, round_name: str, report: ForecastImportReport) -> None:
+    print(
+        f"Forecast import: participant={participant}, round={round_name}, "
+        f"parsed={report.accepted_count}/{report.expected_count}, stored={report.stored_count}/{report.expected_count}"
+    )
+    if report.normalized:
+        print("Normalized:")
+        print_rows(
+            ["position", "raw", "stored"],
+            [[item.position, item.raw_score, item.score] for item in report.normalized],
+        )
+    if report.missing_positions:
+        print("Missing positions: " + ", ".join(str(item) for item in report.missing_positions))
+    if report.duplicate_positions:
+        print("Duplicate positions skipped: " + ", ".join(str(item) for item in report.duplicate_positions))
+    if report.invalid_lines:
+        print("Invalid lines:")
+        for item in report.invalid_lines:
+            print(f"- {item}")
+    if report.extra_lines:
+        print("Extra lines:")
+        for item in report.extra_lines:
+            print(f"- {item}")
+    if report.protected_positions:
+        print("Deadline-protected positions: " + ", ".join(str(item) for item in report.protected_positions))
+
+
+def cmd_import_forecast(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    text = Path(args.source).read_text(encoding="utf-8-sig")
+    submitted_at = parse_datetime(args.submitted_at) if args.submitted_at else datetime.now().astimezone()
+    report = import_forecast_block(
+        conn,
+        participant=args.participant,
+        round_name=args.round,
+        text=text,
+        submitted_at=submitted_at,
+        source="cli-forecast",
+        lock_minutes=args.lock_minutes,
+    )
+    print_forecast_import_report(args.participant, args.round, report)
     return 0
 
 
@@ -875,7 +1151,127 @@ def cmd_sync_variables(args: argparse.Namespace) -> int:
         include_assessments=not args.skip_assessments,
     )
     print_key_values(variable_sync_rows(result))
+    captured = capture_model_forecasts(conn)
+    print(f"model_forecasts_captured={captured}")
     return 0 if not result.errors else 1
+
+
+def print_calibration(item: dict[str, object]) -> None:
+    print_key_values(
+        [
+            ("model", item["model_key"]),
+            ("forecasts", item["forecasts"]),
+            ("scored", item["scored"]),
+            ("pending", item["pending"]),
+            ("exact", item["exact"]),
+            ("diff", item["diff"]),
+            ("outcome", item["outcome"]),
+            ("miss", item["miss"]),
+            ("points", item["points"]),
+            ("points_per_match", item["points_per_match"]),
+        ]
+    )
+    print()
+    print("Confidence buckets:")
+    print_rows(
+        ["bucket", "forecasts", "exact", "diff", "outcome", "miss", "points"],
+        [
+            [bucket, value["forecasts"], value["exact"], value["diff"], value["outcome"], value["miss"], value["points"]]
+            for bucket, value in item["buckets"].items()
+        ],
+    )
+
+
+def print_round_review(item: dict[str, object]) -> None:
+    print_key_values(
+        [
+            ("round", item["round_name"]),
+            ("finished", f"{item['finished_count']}/{item['match_count']}"),
+            ("complete", item["complete"]),
+        ]
+    )
+    print()
+    print("Round standings:")
+    print_rows(
+        ["participant", "points", "exact", "diff", "outcome", "miss", "late"],
+        [
+            [row["participant"], row["points"], row["exact"], row["diff"], row["outcome"], row["miss"], row["late"]]
+            for row in item["participants"]
+        ],
+    )
+    if item["swings"]:
+        print()
+        print("Main swings:")
+        print_rows(
+            ["#", "match", "result", "spread", "max", "min"],
+            [
+                [row["position"], row["match"], row["result"], row["spread"], row["max_points"], row["min_points"]]
+                for row in item["swings"]
+            ],
+        )
+    print()
+    print("Model calibration:")
+    print_calibration(item["calibration"])
+
+
+def cmd_sync_results(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    try:
+        result = sync_pl_results_to_db(
+            conn,
+            compseason_id=args.compseason_id,
+            season_label=args.season_label,
+        )
+    except PremierLeagueApiError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    reviews = finalize_completed_rounds(conn, lock_minutes=args.lock_minutes)
+    print_key_values(
+        [
+            ("source", result.source),
+            ("fetched", result.fetched),
+            ("finished_seen", result.finished_seen),
+            ("matched", result.matched),
+            ("updated", result.updated),
+            ("unmatched", len(result.unmatched)),
+            ("completed_round_reviews", len(reviews)),
+        ]
+    )
+    if result.unmatched:
+        print("Unmatched completed fixtures:")
+        for item in result.unmatched[:10]:
+            print(f"- {item}")
+    return 0
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    print_round_review(round_review(conn, args.round, lock_minutes=args.lock_minutes))
+    return 0
+
+
+def cmd_calibration(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    print_calibration(model_calibration_summary(conn, round_name=args.round or None))
+    return 0
+
+
+def cmd_rehearse(args: argparse.Namespace) -> int:
+    item = run_rehearsal(lock_minutes=args.lock_minutes)
+    print("Rehearsal completed without touching the live database.")
+    print_key_values([("model_forecasts_captured", item["captured"]), ("reviews_saved", item["reviews_saved"])])
+    print()
+    print("Checks:")
+    print_rows(
+        ["status", "check", "detail"],
+        [["OK" if row["passed"] else "FAIL", row["name"], row["detail"]] for row in item["checks"]],
+    )
+    print()
+    print("Final standings:")
+    print_rows([["#", "participant", "points"][index] for index in range(3)], [[row["rank"], row["name"], row["points"]] for row in item["standings"]])
+    print()
+    print_round_review(item["review"])
+    return 0
 
 
 def cmd_snapshot(args: argparse.Namespace) -> int:
@@ -1126,9 +1522,35 @@ def build_parser() -> argparse.ArgumentParser:
     hq = sub.add_parser("hq", help="Show headquarters summary for the active round.")
     hq.set_defaults(func=cmd_hq)
 
+    ready = sub.add_parser("ready", help="Run a preflight check for the active round.")
+    ready.set_defaults(func=cmd_ready)
+
+    intel = sub.add_parser("intel", help="Show per-match analytical readiness and missing signals.")
+    intel.add_argument("round", nargs="?")
+    intel.set_defaults(func=cmd_intel)
+
+    absence = sub.add_parser("absence", help="Save a confirmed absence and recalculate relevant variables.")
+    absence.add_argument("team")
+    absence.add_argument("player")
+    absence.add_argument("status", help="injured, doubtful, suspended, fit, or available")
+    absence.add_argument("--impact", type=float, help="importance from 0 to 1")
+    absence.add_argument("--source", default="manual CLI")
+    absence.add_argument("--note")
+    absence.add_argument("--days", type=int, default=int(env_default("BRUCEBET_VARIABLE_DAYS_AHEAD", "365")))
+    absence.add_argument("--timezone", default=env_default("BRUCEBET_TIMEZONE", "Europe/Moscow"))
+    absence.set_defaults(func=cmd_absence)
+
+    missing = sub.add_parser("missing", help="List participants with missing forecasts for a round.")
+    missing.add_argument("round", nargs="?")
+    missing.set_defaults(func=cmd_missing)
+
     risk = sub.add_parser("risk", help="Show the risk map for a round.")
     risk.add_argument("round", nargs="?")
     risk.set_defaults(func=cmd_risk)
+
+    edge = sub.add_parser("edge", help="Rank matches where model, market, and field disagree.")
+    edge.add_argument("round", nargs="?")
+    edge.set_defaults(func=cmd_edge)
 
     strategy = sub.add_parser("strategy", help="Show season strategy against the table.")
     strategy.set_defaults(func=cmd_strategy)
@@ -1196,6 +1618,32 @@ def build_parser() -> argparse.ArgumentParser:
     sync_variables.add_argument("--skip-assessments", action="store_true")
     sync_variables.set_defaults(func=cmd_sync_variables)
 
+    sync_results = sub.add_parser("sync-results", help="Fetch completed PL results and finalize complete round reviews.")
+    sync_results.add_argument("--compseason-id", type=int, default=int(env_default("PREMIER_LEAGUE_COMPSEASON_ID", str(DEFAULT_PL_COMPSEASON_ID))))
+    sync_results.add_argument("--season-label", default=env_default("PREMIER_LEAGUE_SEASON_LABEL", DEFAULT_PL_SEASON_LABEL))
+    sync_results.set_defaults(func=cmd_sync_results)
+
+    set_result = sub.add_parser("set-result", help="Manually set a fallback final result and record an audit entry.")
+    set_result.add_argument("query")
+    set_result.add_argument("score")
+    set_result.add_argument("--reason", default="manual fallback")
+    set_result.set_defaults(func=cmd_set_result)
+
+    result_history = sub.add_parser("result-history", help="Show manual result override history for one match.")
+    result_history.add_argument("query")
+    result_history.set_defaults(func=cmd_result_history)
+
+    review = sub.add_parser("review", help="Show a post-round review with score swings and model results.")
+    review.add_argument("round")
+    review.set_defaults(func=cmd_review)
+
+    calibration = sub.add_parser("calibration", help="Show BruceBet model calibration from frozen pre-kickoff forecasts.")
+    calibration.add_argument("round", nargs="?")
+    calibration.set_defaults(func=cmd_calibration)
+
+    rehearse = sub.add_parser("rehearse", help="Run an isolated end-to-end test round without touching live data.")
+    rehearse.set_defaults(func=cmd_rehearse)
+
     snapshot = sub.add_parser("snapshot", help="Export a safe CSV/JSON snapshot of the active season.")
     snapshot.add_argument(
         "--out-dir",
@@ -1216,6 +1664,13 @@ def build_parser() -> argparse.ArgumentParser:
     parse_vk.add_argument("source")
     parse_vk.add_argument("--out-dir", required=True)
     parse_vk.set_defaults(func=cmd_parse_vk)
+
+    import_forecast = sub.add_parser("import-forecast", help="Import one participant's pasted forecast block.")
+    import_forecast.add_argument("participant")
+    import_forecast.add_argument("round")
+    import_forecast.add_argument("source", help="UTF-8 text file with scores in match order or labelled lines.")
+    import_forecast.add_argument("--submitted-at", help="ISO timestamp; defaults to now in the local timezone.")
+    import_forecast.set_defaults(func=cmd_import_forecast)
     return parser
 
 

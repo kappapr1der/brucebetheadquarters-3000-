@@ -453,8 +453,8 @@ def _latest_team_status_rows(conn: sqlite3.Connection, team_name: str) -> list[s
 
 
 def _availability_impact(conn: sqlite3.Connection, team_name: str) -> float:
-    impact = 0.0
-    for row in _latest_team_status_rows(conn, team_name)[:8]:
+    players: dict[str, tuple[float, str | None]] = {}
+    for row in _latest_team_status_rows(conn, team_name):
         status = str(row["status"] or "").lower()
         availability = _as_float(row["availability_pct"])
         if status == "unavailable":
@@ -469,7 +469,32 @@ def _availability_impact(conn: sqlite3.Connection, team_name: str) -> float:
             player_impact = 0.5
         else:
             player_impact = 0.0
-        role = str(row["role"] or "").upper()
+        player = str(row["player"] or "").casefold()
+        players[player] = (player_impact, row["role"])
+
+    manual_rows = conn.execute(
+        """
+        SELECT a.player, a.role, a.status, a.impact_rating
+        FROM absences a
+        JOIN teams t ON t.id = a.team_id
+        WHERE lower(t.name) = lower(?)
+        """,
+        (team_name,),
+    )
+    fallback_by_status = {"out": 1.0, "injured": 0.9, "suspended": 0.85, "doubtful": 0.5, "questionable": 0.5}
+    for row in manual_rows:
+        status = str(row["status"] or "").lower()
+        manual_impact = _as_float(row["impact_rating"])
+        if manual_impact is None:
+            manual_impact = fallback_by_status.get(status, 0.35)
+        player = str(row["player"] or "").casefold()
+        existing = players.get(player)
+        if existing is None or manual_impact > existing[0]:
+            players[player] = (manual_impact, row["role"] or (existing[1] if existing else None))
+
+    impact = 0.0
+    for player_impact, raw_role in sorted(players.values(), key=lambda item: item[0], reverse=True)[:8]:
+        role = str(raw_role or "").upper()
         role_weight = 1.15 if role in {"FWD", "MID"} else 1.0
         impact += player_impact * role_weight * 0.09
     return round(min(1.0, impact), 3)
@@ -632,6 +657,42 @@ def _blend_probabilities(model: tuple[float, float, float], odds: tuple[float, f
     return tuple(value / total for value in blended)  # type: ignore[return-value]
 
 
+def _factor_adjusted_probabilities(
+    probabilities: tuple[float, float, float],
+    home_factor: sqlite3.Row | None,
+    away_factor: sqlite3.Row | None,
+) -> tuple[float, float, float]:
+    """Apply small, bounded availability/rest corrections to the Elo/market base."""
+    def factor(row: sqlite3.Row | None, key: str) -> float:
+        return _as_float(row[key] if row else None) or 0.0
+
+    home_absences = factor(home_factor, "absences_impact")
+    away_absences = factor(away_factor, "absences_impact")
+    home_fatigue = factor(home_factor, "fatigue")
+    away_fatigue = factor(away_factor, "fatigue")
+    home_lineup = factor(home_factor, "expected_lineup_confidence")
+    away_lineup = factor(away_factor, "expected_lineup_confidence")
+    home_adjustment = _clamp(
+        0.16 * (away_absences - home_absences)
+        + 0.08 * (away_fatigue - home_fatigue)
+        + 0.06 * (home_lineup - away_lineup),
+        -0.12,
+        0.12,
+    )
+    home, draw, away = probabilities
+    adjusted = (max(0.05, home + home_adjustment), draw, max(0.05, away - home_adjustment))
+    total = sum(adjusted)
+    return tuple(value / total for value in adjusted)  # type: ignore[return-value]
+
+
+def _match_factor_rows(conn: sqlite3.Connection, match_id: int) -> dict[str, sqlite3.Row]:
+    rows = conn.execute(
+        "SELECT * FROM team_match_factors WHERE match_id = ?",
+        (match_id,),
+    )
+    return {str(row["side"]): row for row in rows}
+
+
 def _score_from_probabilities(home: float, draw: float, away: float, home_elo: float, away_elo: float) -> str:
     top = max(home, draw, away)
     elo_gap = (home_elo + 65.0) - away_elo
@@ -664,7 +725,12 @@ def sync_match_assessments(
         home_elo = _as_float(home["elo_rating"] if home else None) or 1500.0
         away_elo = _as_float(away["elo_rating"] if away else None) or 1500.0
         model = _model_probabilities(home_elo, away_elo)
-        probabilities = _blend_probabilities(model, _odds_probabilities(_latest_odds(conn, int(match["id"]))))
+        factors = _match_factor_rows(conn, int(match["id"]))
+        probabilities = _factor_adjusted_probabilities(
+            _blend_probabilities(model, _odds_probabilities(_latest_odds(conn, int(match["id"])))),
+            factors.get("home"),
+            factors.get("away"),
+        )
         home_prob, draw_prob, away_prob = probabilities
         top = max(probabilities)
         risk = "low" if top >= 0.55 else "medium" if top >= 0.44 else "high"
@@ -681,9 +747,13 @@ def sync_match_assessments(
                 "draw_edge": str(round(draw_prob, 3)),
                 "away_edge": str(round(away_prob, 3)),
                 "volatility": str(volatility),
-                "consensus_note": "auto: Elo baseline blended with latest stored odds when present",
+                "consensus_note": "auto: Elo baseline, latest stored odds, availability, and rest factors",
                 "contrarian_note": "contest layer still needs field predictions before final pick",
-                "notes": f"home_elo={round(home_elo, 1)}; away_elo={round(away_elo, 1)}",
+                "notes": (
+                    f"home_elo={round(home_elo, 1)}; away_elo={round(away_elo, 1)}; "
+                    f"home_absences={_as_float(factors.get('home')['absences_impact']) if factors.get('home') else 0.0}; "
+                    f"away_absences={_as_float(factors.get('away')['absences_impact']) if factors.get('away') else 0.0}"
+                ),
                 "updated_at": updated_at,
             },
         )

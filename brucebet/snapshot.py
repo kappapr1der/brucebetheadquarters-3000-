@@ -336,6 +336,92 @@ def active_season_snapshot_tables(season_id: int) -> Iterable[SnapshotTable]:
         """,
         (season_id,),
     )
+    yield SnapshotTable(
+        "model_forecasts.csv",
+        """
+        SELECT
+            r.name AS round,
+            m.position,
+            m.home,
+            m.away,
+            f.model_key,
+            f.suggested_score,
+            f.confidence,
+            f.risk_level,
+            f.captured_at,
+            f.assessment_updated_at
+        FROM model_forecasts f
+        JOIN matches m ON m.id = f.match_id
+        JOIN rounds r ON r.id = m.round_id
+        WHERE r.season_id = ?
+        ORDER BY r.sort_order, m.position, f.model_key
+        """,
+        (season_id,),
+    )
+    yield SnapshotTable(
+        "round_reviews.csv",
+        """
+        SELECT
+            r.name AS round,
+            r.sort_order,
+            rr.completed_at,
+            rr.match_count,
+            rr.finished_count,
+            rr.payload_json
+        FROM round_reviews rr
+        JOIN rounds r ON r.id = rr.round_id
+        WHERE r.season_id = ?
+        ORDER BY r.sort_order
+        """,
+        (season_id,),
+    )
+    yield SnapshotTable(
+        "manual_result_overrides.csv",
+        """
+        SELECT
+            r.name AS round,
+            m.position,
+            m.home,
+            m.away,
+            mo.previous_result,
+            mo.new_result,
+            mo.changed_at,
+            mo.reason
+        FROM manual_result_overrides mo
+        JOIN matches m ON m.id = mo.match_id
+        JOIN rounds r ON r.id = m.round_id
+        WHERE r.season_id = ?
+        ORDER BY r.sort_order, m.position, mo.changed_at
+        """,
+        (season_id,),
+    )
+    yield SnapshotTable(
+        "manual_prediction_overrides.csv",
+        """
+        SELECT
+            p.name AS participant,
+            r.name AS round,
+            m.position,
+            m.home,
+            m.away,
+            mpo.previous_score,
+            mpo.previous_submitted_at,
+            mpo.previous_source,
+            mpo.new_score,
+            mpo.new_submitted_at,
+            mpo.changed_at,
+            mpo.actor_chat_id,
+            mpo.reason
+        FROM manual_prediction_overrides mpo
+        JOIN predictions pr ON pr.id = mpo.prediction_id
+        JOIN participants p ON p.id = pr.participant_id
+        JOIN matches m ON m.id = pr.match_id
+        JOIN rounds r ON r.id = m.round_id
+        WHERE r.season_id = ?
+        ORDER BY r.sort_order, m.position, p.name, mpo.id
+        """,
+        (season_id,),
+    )
 
 
 def export_snapshot(conn: sqlite3.Connection, out_dir: str | Path, label: str | None = None) -> SnapshotResult:

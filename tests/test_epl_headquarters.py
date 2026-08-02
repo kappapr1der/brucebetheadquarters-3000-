@@ -3,7 +3,7 @@ import unittest
 
 from datetime import datetime
 
-from brucebet.analytics import calendar_matches, hq_summary, next_calendar_match, player_status_summary, risk_map, strategy_summary
+from brucebet.analytics import calendar_matches, edge_map, hq_summary, next_calendar_match, player_status_summary, risk_map, strategy_summary
 from brucebet.storage import (
     connect,
     init_db,
@@ -64,6 +64,16 @@ class EplHeadquartersTest(unittest.TestCase):
         self.assertEqual([row["label"] for row in item["safe"]], ["Liverpool - Burnley"])
         self.assertIn("Brighton - Newcastle", [row["label"] for row in item["risk"]])
         self.assertIn("Tottenham - Manchester United", [row["label"] for row in item["risk"]])
+
+    def test_edge_map_ranks_disagreements_above_consensus_matches(self) -> None:
+        conn = load_epl_sample()
+        item = edge_map(conn)
+
+        self.assertEqual(item["round_name"], "1")
+        self.assertEqual(item["opportunities"][0]["label"], "Tottenham - Manchester United")
+        self.assertIn("model-market", item["opportunities"][0]["signals"])
+        self.assertGreater(item["opportunities"][0]["edge_score"], item["opportunities"][-1]["edge_score"])
+        self.assertEqual(item["needs_data"], [])
 
     def test_strategy_knows_bruce_when_sample_uses_full_name(self) -> None:
         conn = load_epl_sample()

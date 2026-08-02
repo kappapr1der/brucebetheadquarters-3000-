@@ -88,6 +88,18 @@ Current automated layer:
 - Derived rest/fatigue/absence factors -> `team_match_factors`
 - Draft Elo/odds assessment -> `match_assessments`
 
+## Match intelligence control
+
+Run `/intel [тур]` or `brucebet intel [тур]` before choosing a score. It checks each fixture for kickoff, Elo, player snapshots, recent form, context, lineup/rest factors, model assessment, odds, weather, and a manual injury/news review.
+
+The bot will not invent an injury feed. When a confirmed item appears in club news or a trusted source, record it in a structured form:
+
+```text
+/absence Arsenal | Saka | doubtful | 0.8 | Arsenal official | ankle knock
+```
+
+`impact` is between `0` and `1`. Statuses `fit` or `available` remove the current record. Saving an absence recalculates lineup/rest factors and match assessments, so the information changes the recommendation rather than merely appearing in a note.
+
 The background sync intentionally does not call The Odds API. Odds snapshots should be pulled manually near deadline because each successful odds sync spends credits.
 
 ## Links

@@ -24,6 +24,7 @@ class ScoringTest(unittest.TestCase):
     def test_common_nonstandard_formats_are_accepted(self) -> None:
         self.assertEqual(parse_score("2 : 0"), Score(2, 0))
         self.assertEqual(parse_score("2-0"), Score(2, 0))
+        self.assertEqual(parse_score("2—0"), Score(2, 0))
         self.assertEqual(parse_score("2;0"), Score(2, 0))
         self.assertEqual(normalize_score("2-0"), "2:0")
         self.assertFalse(is_standard_score("2-0"))

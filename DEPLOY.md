@@ -41,6 +41,8 @@ Recommended env:
 - `BRUCEBET_AUTO_SYNC=1`
 - `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS=12`
 - `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES=5`
+- `BRUCEBET_REMINDER_INTERVAL_MINUTES=5`
+- `BRUCEBET_REMINDER_GRACE_MINUTES=35`
 - `BRUCEBET_VARIABLE_DAYS_AHEAD=365`
 - `BRUCEBET_WEATHER_DAYS_AHEAD=16`
 - `BRUCEBET_SNAPSHOT_LABEL=server-auto`
@@ -62,12 +64,17 @@ In Telegram:
 /start
 /id
 /hq
+/ready
+/intel
+/absence Arsenal | Saka | doubtful | 0.8 | Arsenal official | ankle knock
+/missing
 /calendar
 /next
 /variables
 /quota
 /sources
 /sync_fixtures
+/sync_results
 /sync_variables
 /sync_odds
 /dossier Arsenal
@@ -77,16 +84,41 @@ In Telegram:
 /audit
 /field Arsenal
 /recommend Arsenal
+/edge
 /risk
 /strategy
 /schedule
+/review 1
+/calibration
+/rehearse
+/setresult Arsenal - Chelsea | 2:1 | official feed delay
+/resulthistory Arsenal
+/overrideforecast Igor | Arsenal - Chelsea | 2:1 | confirmed typo
+/forecasthistory Igor | Arsenal - Chelsea
 ```
 
-`/schedule` puts reminder jobs in the running process for the current chat. If the container restarts, run `/schedule` again.
+`/schedule` subscribes the current chat to persistent deadline reminders. Delivery state is stored in SQLite, so a container restart does not lose the schedule or resend reminders already delivered.
+
+`/ready` is the operational preflight before a round. `/intel [тур]` adds a per-match variable coverage check and names the missing/stale inputs. `/absence Команда | Игрок | статус | impact | источник | заметка` records confirmed player news, recalculates factors and assessments, and accepts `fit`/`available` to clear an old entry. `/missing [тур]` adds the named follow-up list: people with a partial or missing block and the exact positions to chase. `/setresult <match> | <score> | <reason>` is restricted by the Telegram whitelist and writes every manual fallback into an audit log; use it only while the official result feed is delayed or being corrected.
 
 ## Updating data
 
 Send the VK pasted text as a message or `.txt` file. The bot will parse it, update `data/vk_matches.csv`, `data/vk_predictions.csv`, and import into SQLite.
+
+For one participant, use a direct multiline command:
+
+```text
+/forecast Igor | 1
+2:1
+Liverpool - Burnley 2 - 0
+1;1
+```
+
+The bot normalizes accepted punctuation and reports missing, duplicate, ambiguous, or extra rows without silently guessing.
+
+Once a deadline has passed, a normal direct forecast paste cannot replace an existing stored score. For a deliberate correction, use `/overrideforecast Участник | Матч | 2:1 | причина`; it preserves the original submission time and writes an audit record. `/forecasthistory Участник | Матч` shows that trail.
+
+After `/start`, it also accepts operator-friendly plain text. Send `Участники:` and one person per line; use `300р` or `без взноса` to set prize eligibility. For forecasts, send the participant name on the first line and scores below. The bot chooses the active upcoming round and replies with the accepted participant and an import report.
 
 The `data/` directory is mounted as a Docker volume, so database and parsed CSV files survive container rebuilds.
 
