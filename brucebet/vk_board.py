@@ -2,49 +2,65 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timezone
-import json
+from html import unescape
+from html.parser import HTMLParser
 import os
+from pathlib import Path
 import re
+import subprocess
 import sys
 from typing import Callable
-import urllib.parse
-import urllib.request
 
 
-VK_API_BASE = "https://api.vk.com/method"
-DEFAULT_VK_API_VERSION = "5.199"
 DEFAULT_FORECASTERS_GROUP_ID = 217130885
+DEFAULT_CHROMIUM_BIN = "chromium"
+DEFAULT_BROWSER_WAIT_MS = 8000
 TOPIC_URL_RE = re.compile(
     r"^https?://(?:m\.)?(?:vk\.com|vk\.ru)/topic-(?P<group>\d+)_(?P<topic>\d+)(?:[/?#].*)?$",
     re.IGNORECASE,
 )
+SCORE_LINE_RE = re.compile(r".+\s+\d+\s*[:;\-]\s*\d+\s*$")
 
 
-class VkApiError(RuntimeError):
+class VkBrowserError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
-class VkBoardComment:
-    comment_id: int
-    from_id: int
-    author_name: str
-    date: datetime | None
-    text: str
+class _VisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._skip_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() in {"script", "style", "noscript"}:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"script", "style", "noscript"} and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        value = " ".join(data.split())
+        if value:
+            self.parts.append(value)
 
 
 @dataclass(frozen=True)
-class VkBoardProbeResult:
+class VkPublicTopicResult:
     group_id: int
     topic_id: int
-    total_count: int
-    fetched: int
-    comments: list[VkBoardComment]
+    url: str
+    html_chars: int
+    visible_chars: int
+    score_line_count: int
+    text: str
 
     @property
-    def author_count(self) -> int:
-        return len({item.from_id for item in self.comments})
+    def lines(self) -> list[str]:
+        return [line for line in self.text.splitlines() if line.strip()]
 
 
 def parse_topic_url(url: str) -> tuple[int, int]:
@@ -54,130 +70,102 @@ def parse_topic_url(url: str) -> tuple[int, int]:
     return int(match.group("group")), int(match.group("topic"))
 
 
-def _profile_name(item: dict[str, object]) -> str:
-    first = str(item.get("first_name") or "").strip()
-    last = str(item.get("last_name") or "").strip()
-    name = " ".join(part for part in (first, last) if part)
-    return name or str(item.get("name") or "").strip()
+def build_topic_url(group_id: int, topic_id: int) -> str:
+    return f"https://vk.ru/topic-{int(group_id)}_{int(topic_id)}"
 
 
-def _author_map(payload: dict[str, object]) -> dict[int, str]:
-    authors: dict[int, str] = {}
-    for item in payload.get("profiles") or []:
-        if isinstance(item, dict) and item.get("id") is not None:
-            authors[int(item["id"])] = _profile_name(item) or f"VK user {item['id']}"
-    for item in payload.get("groups") or []:
-        if isinstance(item, dict) and item.get("id") is not None:
-            group_id = int(item["id"])
-            authors[-group_id] = str(item.get("name") or f"VK group {group_id}").strip()
-    return authors
+def extract_visible_text(html: str) -> str:
+    parser = _VisibleTextParser()
+    parser.feed(html)
+    return unescape("\n".join(parser.parts))
 
 
-def _comment_from_api(item: dict[str, object], authors: dict[int, str]) -> VkBoardComment:
-    from_id = int(item.get("from_id") or 0)
-    raw_date = item.get("date")
-    date = datetime.fromtimestamp(float(raw_date), timezone.utc) if raw_date is not None else None
-    return VkBoardComment(
-        comment_id=int(item.get("id") or 0),
-        from_id=from_id,
-        author_name=authors.get(from_id, f"VK {from_id}"),
-        date=date,
-        text=str(item.get("text") or "").strip(),
+def chromium_command(
+    url: str,
+    *,
+    chromium_bin: str = DEFAULT_CHROMIUM_BIN,
+    virtual_time_ms: int = DEFAULT_BROWSER_WAIT_MS,
+) -> list[str]:
+    return [
+        chromium_bin,
+        "--headless",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--no-first-run",
+        "--lang=ru-RU",
+        f"--virtual-time-budget={max(1000, int(virtual_time_ms))}",
+        "--dump-dom",
+        url,
+    ]
+
+
+def fetch_topic_html(
+    url: str,
+    *,
+    chromium_bin: str = DEFAULT_CHROMIUM_BIN,
+    virtual_time_ms: int = DEFAULT_BROWSER_WAIT_MS,
+    timeout: int = 45,
+    runner: Callable[..., object] = subprocess.run,
+) -> str:
+    command = chromium_command(url, chromium_bin=chromium_bin, virtual_time_ms=virtual_time_ms)
+    try:
+        completed = runner(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=max(5, int(timeout)),
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise VkBrowserError(f"Chromium executable not found: {chromium_bin}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise VkBrowserError(f"VK Chromium probe timed out after {timeout}s") from exc
+    except Exception as exc:  # noqa: BLE001 - CLI should report a compact browser failure.
+        raise VkBrowserError(f"VK Chromium probe failed: {exc}") from exc
+
+    returncode = int(getattr(completed, "returncode", 1))
+    stdout = str(getattr(completed, "stdout", "") or "")
+    stderr = str(getattr(completed, "stderr", "") or "")
+    if returncode != 0:
+        detail = " | ".join(line.strip() for line in stderr.splitlines()[-4:] if line.strip())
+        raise VkBrowserError(f"Chromium exited with code {returncode}: {detail or 'no stderr'}")
+    if not stdout.strip():
+        raise VkBrowserError("Chromium returned an empty VK page")
+    return stdout
+
+
+def probe_public_topic(
+    group_id: int,
+    topic_id: int,
+    *,
+    chromium_bin: str = DEFAULT_CHROMIUM_BIN,
+    virtual_time_ms: int = DEFAULT_BROWSER_WAIT_MS,
+    timeout: int = 45,
+    runner: Callable[..., object] = subprocess.run,
+) -> VkPublicTopicResult:
+    url = build_topic_url(group_id, topic_id)
+    html = fetch_topic_html(
+        url,
+        chromium_bin=chromium_bin,
+        virtual_time_ms=virtual_time_ms,
+        timeout=timeout,
+        runner=runner,
     )
-
-
-class VkBoardClient:
-    def __init__(
-        self,
-        access_token: str,
-        api_version: str = DEFAULT_VK_API_VERSION,
-        base_url: str = VK_API_BASE,
-        timeout: int = 20,
-        opener: Callable[..., object] | None = None,
-    ) -> None:
-        token = access_token.strip()
-        if not token:
-            raise ValueError("VK access token is empty")
-        self.access_token = token
-        self.api_version = api_version.strip() or DEFAULT_VK_API_VERSION
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
-        self.opener = opener or urllib.request.urlopen
-
-    def _get(self, method: str, params: dict[str, object]) -> dict[str, object]:
-        query = {
-            **params,
-            "access_token": self.access_token,
-            "v": self.api_version,
-        }
-        url = f"{self.base_url}/{method}?{urllib.parse.urlencode(query)}"
-        request = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "BruceBetHQ/0.1 VK read-only probe",
-            },
-        )
-        try:
-            with self.opener(request, timeout=self.timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except Exception as exc:  # noqa: BLE001 - compact CLI diagnostics are intentional.
-            raise VkApiError(f"VK API request failed: {exc}") from exc
-        if not isinstance(payload, dict):
-            raise VkApiError("VK API returned an unexpected payload")
-        error = payload.get("error")
-        if isinstance(error, dict):
-            code = error.get("error_code")
-            message = error.get("error_msg") or "unknown VK API error"
-            raise VkApiError(f"VK API error {code}: {message}")
-        response_payload = payload.get("response")
-        if not isinstance(response_payload, dict):
-            raise VkApiError("VK API response object is missing")
-        return response_payload
-
-    def get_comments_page(
-        self,
-        group_id: int,
-        topic_id: int,
-        *,
-        offset: int = 0,
-        count: int = 100,
-        sort: str = "asc",
-    ) -> dict[str, object]:
-        return self._get(
-            "board.getComments",
-            {
-                "group_id": int(group_id),
-                "topic_id": int(topic_id),
-                "offset": max(0, int(offset)),
-                "count": max(1, min(int(count), 100)),
-                "sort": sort,
-                "extended": 1,
-            },
-        )
-
-    def probe_topic(self, group_id: int, topic_id: int, limit: int = 100) -> VkBoardProbeResult:
-        wanted = max(1, int(limit))
-        comments: list[VkBoardComment] = []
-        offset = 0
-        total_count = 0
-        while len(comments) < wanted:
-            page_size = min(100, wanted - len(comments))
-            payload = self.get_comments_page(group_id, topic_id, offset=offset, count=page_size)
-            total_count = int(payload.get("count") or 0)
-            authors = _author_map(payload)
-            items = [item for item in (payload.get("items") or []) if isinstance(item, dict)]
-            comments.extend(_comment_from_api(item, authors) for item in items)
-            if not items or len(comments) >= total_count:
-                break
-            offset += len(items)
-        return VkBoardProbeResult(
-            group_id=int(group_id),
-            topic_id=int(topic_id),
-            total_count=total_count,
-            fetched=len(comments),
-            comments=comments,
-        )
+    text = extract_visible_text(html)
+    score_lines = sum(1 for line in text.splitlines() if SCORE_LINE_RE.fullmatch(line.strip()))
+    return VkPublicTopicResult(
+        group_id=int(group_id),
+        topic_id=int(topic_id),
+        url=url,
+        html_chars=len(html),
+        visible_chars=len(text),
+        score_line_count=score_lines,
+        text=text,
+    )
 
 
 def _env_int(name: str, fallback: int | None = None) -> int | None:
@@ -187,22 +175,22 @@ def _env_int(name: str, fallback: int | None = None) -> int | None:
     return int(raw)
 
 
-def _preview(value: str, limit: int = 140) -> str:
-    compact = " ".join(value.split())
-    return compact if len(compact) <= limit else compact[: limit - 1] + "…"
-
-
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Read-only VK discussion topic probe for BruceBet.")
+    parser = argparse.ArgumentParser(description="Read a public Forecasters Club VK topic through headless Chromium.")
     parser.add_argument("--topic-url", help="VK topic URL; overrides --group-id and --topic-id.")
     parser.add_argument("--group-id", type=int, default=_env_int("VK_GROUP_ID", DEFAULT_FORECASTERS_GROUP_ID))
     parser.add_argument("--topic-id", type=int, default=_env_int("VK_PREDICTIONS_TOPIC_ID"))
-    parser.add_argument("--access-token", default=os.getenv("VK_ACCESS_TOKEN", "").strip())
-    parser.add_argument("--api-version", default=os.getenv("VK_API_VERSION", DEFAULT_VK_API_VERSION).strip())
-    parser.add_argument("--timeout", type=int, default=20)
-    parser.add_argument("--limit", type=int, default=100, help="Maximum comments to fetch during the probe.")
-    parser.add_argument("--show", type=int, default=10, help="How many fetched comments to print.")
-    parser.add_argument("--json", action="store_true", help="Print fetched comments as JSON.")
+    parser.add_argument("--chromium", default=os.getenv("VK_CHROMIUM_BIN", DEFAULT_CHROMIUM_BIN).strip())
+    parser.add_argument(
+        "--wait-ms",
+        type=int,
+        default=_env_int("VK_BROWSER_WAIT_MS", DEFAULT_BROWSER_WAIT_MS),
+        help="Virtual time budget for VK JavaScript rendering.",
+    )
+    parser.add_argument("--timeout", type=int, default=45)
+    parser.add_argument("--show-lines", type=int, default=120)
+    parser.add_argument("--html-out", type=Path)
+    parser.add_argument("--text-out", type=Path)
     return parser
 
 
@@ -222,63 +210,50 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    if not args.access_token:
-        print(
-            "VK_ACCESS_TOKEN is not set. The read-only probe is ready, but VK authorization is still required.",
-            file=sys.stderr,
-        )
-        return 2
 
     try:
-        result = VkBoardClient(
-            args.access_token,
-            api_version=args.api_version,
+        url = build_topic_url(group_id, topic_id)
+        html = fetch_topic_html(
+            url,
+            chromium_bin=args.chromium,
+            virtual_time_ms=args.wait_ms,
             timeout=args.timeout,
-        ).probe_topic(group_id, topic_id, limit=args.limit)
-    except (ValueError, VkApiError) as exc:
+        )
+        text = extract_visible_text(html)
+        result = VkPublicTopicResult(
+            group_id=int(group_id),
+            topic_id=int(topic_id),
+            url=url,
+            html_chars=len(html),
+            visible_chars=len(text),
+            score_line_count=sum(1 for line in text.splitlines() if SCORE_LINE_RE.fullmatch(line.strip())),
+            text=text,
+        )
+    except (ValueError, VkBrowserError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
-    if args.json:
-        print(
-            json.dumps(
-                {
-                    "group_id": result.group_id,
-                    "topic_id": result.topic_id,
-                    "total_count": result.total_count,
-                    "fetched": result.fetched,
-                    "authors": result.author_count,
-                    "comments": [
-                        {
-                            "id": item.comment_id,
-                            "from_id": item.from_id,
-                            "author": item.author_name,
-                            "date": item.date.isoformat() if item.date else None,
-                            "text": item.text,
-                        }
-                        for item in result.comments
-                    ],
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
-        return 0
+    if args.html_out:
+        args.html_out.parent.mkdir(parents=True, exist_ok=True)
+        args.html_out.write_text(html, encoding="utf-8")
+    if args.text_out:
+        args.text_out.parent.mkdir(parents=True, exist_ok=True)
+        args.text_out.write_text(result.text + "\n", encoding="utf-8")
 
     print(f"VK group: {result.group_id}")
     print(f"VK topic: {result.topic_id}")
-    print(f"API version: {args.api_version}")
-    print(f"Comments in topic: {result.total_count}")
-    print(f"Fetched: {result.fetched}")
-    print(f"Unique authors in fetched slice: {result.author_count}")
-    if result.comments and args.show > 0:
+    print(f"URL: {result.url}")
+    print(f"HTML chars: {result.html_chars}")
+    print(f"Visible chars: {result.visible_chars}")
+    print(f"Prediction-like score lines: {result.score_line_count}")
+    print(f"Forecasters Club visible: {'yes' if 'Forecasters Club' in result.text else 'no'}")
+
+    lines = result.lines
+    if args.show_lines > 0 and lines:
         print()
-        print("Sample comments:")
-        for item in result.comments[: args.show]:
-            stamp = item.date.isoformat() if item.date else "unknown-time"
-            print(
-                f"- #{item.comment_id} | {item.author_name} ({item.from_id}) | {stamp} | {_preview(item.text)}"
-            )
+        print("Visible topic text:")
+        for line in lines[: args.show_lines]:
+            print(line)
     return 0
 
 
