@@ -10,6 +10,8 @@ The probe uses VK API method `board.getComments` with `extended=1` so it can rec
 
 Default VK API version: `5.199`.
 
+According to the official VK API 5.199 schema, both `board.getComments` and `board.getTopics` accept `user` and `service` access-token types. For BruceBet the preferred first attempt is therefore an application's **service access token**, not a community-admin token and not a personal-user OAuth token.
+
 ## Environment
 
 ```env
@@ -21,6 +23,14 @@ VK_SYNC_INTERVAL_MINUTES=5
 ```
 
 Do not commit a real access token.
+
+## Preferred token path
+
+1. Create a VK application in the VK ID developer/business console.
+2. Open the application settings.
+3. If a **service access key/token** is available, use that as `VK_ACCESS_TOKEN` for the read-only probe.
+4. Do not request administrator access to Forecasters Club: the target discussion is public and BruceBet only needs read access.
+5. If VK rejects the service token for the real topic, capture the exact API error first; only then fall back to a user OAuth token.
 
 ## Probe a topic by URL
 
@@ -65,7 +75,7 @@ python -m brucebet.vk_board --topic-url <VK_TOPIC_URL> --json
 
 ## Next step
 
-After VK authorization is available and the probe successfully reads a public discussion topic:
+After a service/user token successfully reads a public discussion topic:
 
 1. Extract the per-comment prediction parser from the legacy pasted-text `vk_parser.py` flow.
 2. Add persistent VK identity mapping (`vk_user_id -> participant_id`).
