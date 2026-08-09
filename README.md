@@ -31,6 +31,7 @@
 - `/quota`, `/sync_odds`, `/odds`: проверка квоты The Odds API, синк кэфов, просмотр снимков.
 - `/sources`: health-check всех подключенных источников данных.
 - `/sync_fixtures`: официальный календарь Premier League из public API сайта PL.
+- `vk_board`: публичное read-only чтение VK-темы через Chromium; `vk_dry_run` структурирует регистрацию или прогнозы без SQLite.
 - Сервисные сообщения: “принято”, “теперь кидай прогнозы участников”, “проверь аудит”.
 - Напоминания за 24 часа, 6 часов, 3 часа, 1 час и 20 минут до дедлайна.
 - Docker-деплой Telegram-бота.
@@ -207,6 +208,17 @@ Telegram has `/sync_variables` and `/dossier <match>`. The bot also runs a quiet
 The background sync does not call The Odds API, so it does not spend odds credits. Use `/sync_odds` manually closer to deadline.
 
 ## Runtime Data
+
+## VK Dry Run
+
+Будущие темы АПЛ пока не заданы: передавай URL явно. Команда читает только публичную страницу через Chromium, не открывает SQLite и ничего не публикует во VK:
+
+```powershell
+python -m brucebet.cli vk-dry-run --kind registration --topic-url <VK_REGISTRATION_TOPIC_URL>
+python -m brucebet.cli vk-dry-run --kind predictions --topic-url <VK_PREDICTIONS_TOPIC_URL>
+```
+
+Для прогнозов выводятся шаблон, дедлайн, автор комментария, фактический участник, нормализованные счета и статус `FULL`/`PARTIAL`. Для регистрации отдельно сохраняется заявленный выбор взноса и статус проверки оплаты: перевод считается только заявленным, пока организатор его не подтвердил. Тестовая тема РПЛ допускается лишь для проверки формата: dry-run пометит её как `non_epl`, а будущий импорт останется заблокированным.
 
 Реальные прогнозы, участники, SQLite и выгрузки должны жить только в серверном `data/`.
 

@@ -59,6 +59,8 @@ from .storage import (
 )
 from .variable_sync import VariableSyncResult, sync_match_variables
 from .vk_parser import parse_file as parse_vk_file
+from .vk_board import VkBrowserError
+from .vk_dry_run import read_public_topic_dry_run, render_dry_run_report
 
 
 DEFAULT_DB = "brucebet.sqlite"
@@ -1049,6 +1051,22 @@ def cmd_parse_vk(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_vk_dry_run(args: argparse.Namespace) -> int:
+    try:
+        report = read_public_topic_dry_run(
+            args.topic_url,
+            args.kind,
+            chromium_bin=args.chromium,
+            wait_ms=args.wait_ms,
+            timeout=args.timeout,
+        )
+    except (ValueError, VkBrowserError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(render_dry_run_report(report, limit=args.limit))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="brucebet", description="BruceBet 3000 contest toolkit")
     parser.add_argument("--db", default=DEFAULT_DB, help=f"SQLite database path, default: {DEFAULT_DB}")
@@ -1216,6 +1234,15 @@ def build_parser() -> argparse.ArgumentParser:
     parse_vk.add_argument("source")
     parse_vk.add_argument("--out-dir", required=True)
     parse_vk.set_defaults(func=cmd_parse_vk)
+
+    vk_dry_run = sub.add_parser("vk-dry-run", help="Read and structurally parse one public VK topic without SQLite writes.")
+    vk_dry_run.add_argument("--topic-url", required=True, help="Public VK discussion URL.")
+    vk_dry_run.add_argument("--kind", choices=("registration", "predictions"), required=True)
+    vk_dry_run.add_argument("--chromium", default=os.getenv("VK_CHROMIUM_BIN", "chromium").strip() or "chromium")
+    vk_dry_run.add_argument("--wait-ms", type=int, default=int(env_default("VK_BROWSER_WAIT_MS", "8000")))
+    vk_dry_run.add_argument("--timeout", type=int, default=45)
+    vk_dry_run.add_argument("--limit", type=int, default=60)
+    vk_dry_run.set_defaults(func=cmd_vk_dry_run)
     return parser
 
 

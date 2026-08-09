@@ -18,7 +18,7 @@ The earlier VK API service-token route was rejected by VK with error `1051` (`Me
 
 ## Current stage
 
-This branch adds a **read-only Chromium probe**. It renders a public VK topic, extracts visible text and reports how many prediction-like score lines were found.
+This branch adds a **read-only Chromium probe** and a structured dry-run parser. It renders a public VK topic, extracts visible text and reports what was recognized. The parser never opens SQLite and never changes VK.
 
 It does not write anything to the BruceBet database and does not modify VK.
 
@@ -28,13 +28,14 @@ Chromium is installed in the BruceBet Docker image so the same browser path can 
 
 ```env
 VK_GROUP_ID=217130885
+VK_REGISTRATION_TOPIC_ID=
 VK_PREDICTIONS_TOPIC_ID=
 VK_SYNC_INTERVAL_MINUTES=5
 VK_CHROMIUM_BIN=chromium
 VK_BROWSER_WAIT_MS=8000
 ```
 
-`VK_PREDICTIONS_TOPIC_ID` stays empty until the EPL 2026/27 topic exists.
+Both topic IDs stay empty until the two EPL 2026/27 discussions exist. They are deliberately separate: one registration topic and one prediction topic.
 
 No VK token is required for the public-topic reader.
 
@@ -69,6 +70,28 @@ python -m brucebet.vk_board \
   --text-out data/vk_topic_debug.txt
 ```
 
+## Structured dry-run parser
+
+Use a future EPL topic URL explicitly. The command is read-only and does not need a configured topic ID:
+
+```bash
+python -m brucebet.vk_dry_run \
+  --kind predictions \
+  --topic-url <EPL_PREDICTIONS_TOPIC_URL>
+
+python -m brucebet.vk_dry_run \
+  --kind registration \
+  --topic-url <EPL_REGISTRATION_TOPIC_URL>
+```
+
+For a prediction topic the report recognizes the round template, deadline, VK comment author, declared participant, labelled fixture scores, normalized score form, and whether every fixture was submitted. Duplicate or incomplete blocks remain warnings: they are never guessed or imported.
+
+For a registration topic it reports each declaration separately: VK author, declared participant, fee intent (`paid_declared`, `free`, or `unknown`), and an intentionally separate payment state. A claimed payment is always `unverified` until an organizer confirms it in a later workflow. It also detects visible registration-closed and final-roster markers without treating them as database state.
+
+Every report contains a content fingerprint and provisional per-comment source key. The future persistent monitor will use these to compare snapshots. Before any SQLite import it must upgrade to durable VK DOM comment IDs when the rendered topic exposes them; a line-based key alone is not sufficient for a final idempotent importer.
+
+The dry-run shows `league gate: epl`, `non_epl`, or `unknown`. Non-EPL topics, including the temporary RPL probe topic, may be parsed for format testing but are explicitly not future-ingestion-ready.
+
 ## Safety rules
 
 - Public read-only browser rendering only at this stage.
@@ -88,8 +111,7 @@ The important success signals are rendered visible text containing `Forecasters 
 After the EPL topic appears:
 
 1. Point `VK_PREDICTIONS_TOPIC_ID` at that EPL topic.
-2. Parse participant prediction blocks from the rendered topic text/DOM against the active EPL round fixtures.
-3. Add persistent source identifiers so repeated syncs are idempotent and edits can be detected.
-4. Add a dry-run EPL import report.
+2. Keep the registration and prediction topic monitors separate. The registration monitor records declarations, closure markers and a final-roster candidate; paid declarations remain unverified until explicitly confirmed.
+3. Poll the prediction topic frequently before the round deadline, save immutable parsed snapshots, and capture one final field snapshot immediately before `/recommend` evaluates a match.
+4. Extract durable VK comment IDs from the rendered DOM, then add idempotent persistence and edit detection.
 5. Only after validation, enable scheduled sync into the active EPL season.
-6. Add the separate contribution/payment-topic reader with an explicit status flow instead of treating newly discovered users as automatically paid.
