@@ -311,7 +311,10 @@ New names without a payment marker are added outside the prize bank until they a
 ```powershell
 python -m brucebet.cli vk-dry-run --kind registration --topic-url <VK_REGISTRATION_TOPIC_URL>
 python -m brucebet.cli vk-dry-run --kind predictions --topic-url <VK_PREDICTIONS_TOPIC_URL>
+python -m brucebet.cli vk-discover
 ```
+
+Set `VK_TOPIC_DISCOVERY_ENABLED=1` to poll the public Forecasters Club discussion list. The first pass with at least one discovered topic is a quiet baseline; later newly discovered EPL registration or prediction topics produce one Telegram alert. `/vk_topics` runs the same public, read-only check manually. RPL is ignored by the alert queue and no VK discovery result imports contest data.
 
 Для прогнозов выводятся шаблон, дедлайн, автор комментария, фактический участник, нормализованные счета и статус `FULL`/`PARTIAL`. Для регистрации отдельно сохраняется заявленный выбор взноса и статус проверки оплаты: перевод считается только заявленным, пока организатор его не подтвердил. Тестовая тема РПЛ допускается лишь для проверки формата: dry-run пометит её как `non_epl`, а будущий импорт останется заблокированным.
 

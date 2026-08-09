@@ -31,6 +31,9 @@ VK_GROUP_ID=217130885
 VK_REGISTRATION_TOPIC_ID=
 VK_PREDICTIONS_TOPIC_ID=
 VK_SYNC_INTERVAL_MINUTES=5
+VK_TOPIC_DISCOVERY_ENABLED=1
+VK_TOPIC_DISCOVERY_INTERVAL_MINUTES=30
+VK_TOPIC_DISCOVERY_FIRST_DELAY_SECONDS=20
 VK_CHROMIUM_BIN=chromium
 VK_BROWSER_WAIT_MS=8000
 ```
@@ -38,6 +41,20 @@ VK_BROWSER_WAIT_MS=8000
 Both topic IDs stay empty until the two EPL 2026/27 discussions exist. They are deliberately separate: one registration topic and one prediction topic.
 
 No VK token is required for the public-topic reader.
+
+## Automatic topic discovery
+
+Before the two EPL discussions exist, BruceBet can watch the public Forecasters Club discussion list without a VK token:
+
+```bash
+python -m brucebet.cli vk-discover
+```
+
+The browser tries the public discussion-list page first and then the public group page as a fallback. It recognizes only titles that explicitly identify EPL plus either registration/participants/fee language or prediction language. RPL and other-league topics remain visible in a manual scan but never enter the notification queue.
+
+With `VK_TOPIC_DISCOVERY_ENABLED=1`, the Telegram bot runs the same scan every `VK_TOPIC_DISCOVERY_INTERVAL_MINUTES` and sends one alert to the Telegram whitelist for each newly seen qualifying EPL topic. The first pass that exposes at least one topic link is a quiet baseline: it records already-existing topics and sends no alert. A blank render never establishes that baseline. Use `/vk_topics` for an immediate read-only scan at any time.
+
+Discovery records only its own alert state in SQLite. It does not configure `VK_REGISTRATION_TOPIC_ID` or `VK_PREDICTIONS_TOPIC_ID`, import participants, import forecasts, or make any VK write.
 
 ## Probe a topic by URL
 

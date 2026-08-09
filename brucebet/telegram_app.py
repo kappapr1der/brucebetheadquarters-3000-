@@ -95,11 +95,15 @@ from .storage import (
     init_db,
     manual_prediction_history,
     manual_result_history,
+    mark_vk_topic_alert_failed,
+    mark_vk_topic_alert_sent,
+    record_vk_topic_discovery,
     set_manual_prediction_override,
     set_manual_match_result,
     upsert_absence,
 )
 from .variable_sync import VariableSyncResult, sync_match_assessments, sync_match_contexts_and_factors, sync_match_variables
+from .vk_board import VkBrowserError, probe_public_group_topics
 from .vk_parser import parse_file as parse_vk_file
 
 
@@ -137,6 +141,12 @@ class BotSettings:
     auto_sync_first_delay_minutes: int
     reminder_interval_minutes: int
     reminder_grace_minutes: int
+    vk_group_id: int
+    vk_topic_discovery_enabled: bool
+    vk_topic_discovery_interval_minutes: int
+    vk_topic_discovery_first_delay_seconds: int
+    vk_chromium_bin: str
+    vk_browser_wait_ms: int
 
 
 def parse_chat_ids(raw: str | None) -> frozenset[int]:
@@ -184,6 +194,12 @@ def load_settings() -> BotSettings:
         auto_sync_first_delay_minutes=int(os.getenv("BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES", "5")),
         reminder_interval_minutes=int(os.getenv("BRUCEBET_REMINDER_INTERVAL_MINUTES", "5")),
         reminder_grace_minutes=int(os.getenv("BRUCEBET_REMINDER_GRACE_MINUTES", "35")),
+        vk_group_id=int(os.getenv("VK_GROUP_ID", "217130885")),
+        vk_topic_discovery_enabled=parse_bool(os.getenv("VK_TOPIC_DISCOVERY_ENABLED")),
+        vk_topic_discovery_interval_minutes=int(os.getenv("VK_TOPIC_DISCOVERY_INTERVAL_MINUTES", "30")),
+        vk_topic_discovery_first_delay_seconds=int(os.getenv("VK_TOPIC_DISCOVERY_FIRST_DELAY_SECONDS", "20")),
+        vk_chromium_bin=os.getenv("VK_CHROMIUM_BIN", "chromium").strip() or "chromium",
+        vk_browser_wait_ms=int(os.getenv("VK_BROWSER_WAIT_MS", "8000")),
     )
 
 
@@ -440,6 +456,14 @@ def render_source_checks(checks: list[object]) -> str:
         ["source", "ok", "configured", "detail"],
         [[item.name, "yes" if item.ok else "no", "yes" if item.configured else "no", item.detail] for item in checks],
     )
+
+
+def render_vk_topics(result: object) -> str:
+    topics = getattr(result, "topics", ())
+    if not topics:
+        return "VK: в этой проверке публичные ссылки на обсуждения не найдены."
+    rows = [[item.topic_kind, item.league_hint, item.title, item.url] for item in topics]
+    return "VK: публичные обсуждения:\n" + render_rows(["type", "league", "title", "url"], rows)
 
 
 def render_stored_odds(dossier: dict[str, object], limit: int = 10) -> str:
@@ -1295,6 +1319,22 @@ async def sources_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await send_text(update, "\n".join(lines))
 
 
+@require_access
+async def vk_topics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    await send_text(update, "Проверяю публичные обсуждения Forecasters Club...")
+    try:
+        result = await asyncio.to_thread(discover_vk_topics_worker, settings)
+    except VkBrowserError as exc:
+        await send_text(update, f"Публичная проверка VK не удалась: {exc}")
+        return
+    except Exception:  # noqa: BLE001 - leave the bot usable when Chromium is unavailable.
+        LOGGER.exception("Manual VK topic scan failed")
+        await send_text(update, "Публичная проверка VK не удалась. Проверь логи бота и Chromium.")
+        return
+    await send_text(update, render_vk_topics(result))
+
+
 def sync_fixtures_worker(settings: BotSettings):
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = connect(settings.db_path)
@@ -1991,6 +2031,75 @@ def auto_sync_worker(settings: BotSettings) -> tuple[object, VariableSyncResult,
     return fixture_result, variable_result, captured, result_sync, reviews
 
 
+def discover_vk_topics_worker(settings: BotSettings):
+    return probe_public_group_topics(
+        settings.vk_group_id,
+        chromium_bin=settings.vk_chromium_bin,
+        virtual_time_ms=settings.vk_browser_wait_ms,
+    )
+
+
+def record_vk_topic_discovery_worker(settings: BotSettings, result: object):
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        return record_vk_topic_discovery(
+            conn,
+            result.group_id,
+            result.topics,
+            checked_at=datetime.now().astimezone().isoformat(),
+        )
+    finally:
+        conn.close()
+
+
+def complete_vk_topic_alert_worker(settings: BotSettings, alert: object, error: str | None = None) -> None:
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        if error:
+            mark_vk_topic_alert_failed(conn, alert, error)
+        else:
+            mark_vk_topic_alert_sent(conn, alert, sent_at=datetime.now().astimezone().isoformat())
+    finally:
+        conn.close()
+
+
+async def vk_topic_discovery_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    try:
+        result = await asyncio.to_thread(discover_vk_topics_worker, settings)
+        baseline, alerts = await asyncio.to_thread(record_vk_topic_discovery_worker, settings, result)
+    except Exception:  # noqa: BLE001 - a public page change must not stop the bot.
+        LOGGER.exception("VK topic discovery failed")
+        return
+
+    if baseline:
+        LOGGER.info("VK topic discovery baseline recorded group=%s topics=%s", result.group_id, len(result.topics))
+        return
+    for alert in alerts:
+        text = "\n".join(
+            [
+                "BruceBet: появилась новая EPL-тема Forecasters Club.",
+                f"Тип: {alert.topic_kind}",
+                f"Название: {alert.title}",
+                alert.url,
+                "Автоимпорт из VK не запускался.",
+            ]
+        )
+        failures: list[str] = []
+        for chat_id in settings.allowed_chat_ids:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=text)
+            except Exception as exc:  # noqa: BLE001 - keep the topic pending for retry.
+                LOGGER.warning("VK topic alert failed chat=%s topic=%s: %s", chat_id, alert.topic_id, exc)
+                failures.append(f"chat {chat_id}: {exc}")
+        if failures:
+            await asyncio.to_thread(complete_vk_topic_alert_worker, settings, alert, " | ".join(failures))
+        else:
+            await asyncio.to_thread(complete_vk_topic_alert_worker, settings, alert)
+
+
 async def auto_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = settings_from_context(context)
     try:
@@ -2104,6 +2213,26 @@ def configure_auto_sync(application: Application, settings: BotSettings) -> None
     LOGGER.info("Auto sync scheduled every %s hours after %s minute first delay", interval_hours, first_delay_minutes)
 
 
+def configure_vk_topic_discovery(application: Application, settings: BotSettings) -> None:
+    if not settings.vk_topic_discovery_enabled:
+        return
+    if not settings.allowed_chat_ids:
+        LOGGER.warning("VK topic discovery is enabled, but TELEGRAM_ALLOWED_CHAT_IDS is empty")
+        return
+    if application.job_queue is None:
+        LOGGER.warning("VK topic discovery requested, but JobQueue is not available")
+        return
+    interval = max(5, settings.vk_topic_discovery_interval_minutes)
+    first_delay = max(5, settings.vk_topic_discovery_first_delay_seconds)
+    application.job_queue.run_repeating(
+        vk_topic_discovery_job,
+        interval=timedelta(minutes=interval),
+        first=timedelta(seconds=first_delay),
+        name="brucebet-vk-topic-discovery",
+    )
+    LOGGER.info("VK topic discovery scheduled every %s minutes", interval)
+
+
 def build_application(settings: BotSettings) -> Application:
     application = ApplicationBuilder().token(settings.token).build()
     application.bot_data["settings"] = settings
@@ -2124,6 +2253,7 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("odds", odds_cmd))
     application.add_handler(CommandHandler("quota", quota_cmd))
     application.add_handler(CommandHandler("sources", sources_cmd))
+    application.add_handler(CommandHandler("vk_topics", vk_topics_cmd))
     application.add_handler(CommandHandler("sync_fixtures", sync_fixtures_cmd))
     application.add_handler(CommandHandler("sync_results", sync_results_cmd))
     application.add_handler(CommandHandler("sync_odds", sync_odds_cmd))
@@ -2155,6 +2285,7 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     configure_auto_sync(application, settings)
     configure_deadline_reminders(application, settings)
+    configure_vk_topic_discovery(application, settings)
     return application
 
 

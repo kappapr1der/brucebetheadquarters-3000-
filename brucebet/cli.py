@@ -78,7 +78,7 @@ from .storage import (
 )
 from .variable_sync import VariableSyncResult, sync_match_assessments, sync_match_contexts_and_factors, sync_match_variables
 from .vk_parser import parse_file as parse_vk_file
-from .vk_board import VkBrowserError
+from .vk_board import VkBrowserError, probe_public_group_topics
 from .vk_dry_run import read_public_topic_dry_run, render_dry_run_report
 
 
@@ -1463,6 +1463,25 @@ def cmd_vk_dry_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_vk_discover(args: argparse.Namespace) -> int:
+    try:
+        result = probe_public_group_topics(
+            args.group_id,
+            chromium_bin=args.chromium,
+            virtual_time_ms=args.wait_ms,
+            timeout=args.timeout,
+        )
+    except VkBrowserError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"VK group: {result.group_id}")
+    print(f"Source URL: {result.source_url}")
+    print(f"Topics found: {len(result.topics)}")
+    for topic in result.topics:
+        print(f"- [{topic.league_hint}/{topic.topic_kind}] {topic.title}: {topic.url}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="brucebet", description="BruceBet 3000 contest toolkit")
     parser.add_argument("--db", default=DEFAULT_DB, help=f"SQLite database path, default: {DEFAULT_DB}")
@@ -1691,6 +1710,13 @@ def build_parser() -> argparse.ArgumentParser:
     vk_dry_run.add_argument("--timeout", type=int, default=45)
     vk_dry_run.add_argument("--limit", type=int, default=60)
     vk_dry_run.set_defaults(func=cmd_vk_dry_run)
+
+    vk_discover = sub.add_parser("vk-discover", help="List public Forecasters Club discussion topics without SQLite writes.")
+    vk_discover.add_argument("--group-id", type=int, default=int(env_default("VK_GROUP_ID", "217130885")))
+    vk_discover.add_argument("--chromium", default=os.getenv("VK_CHROMIUM_BIN", "chromium").strip() or "chromium")
+    vk_discover.add_argument("--wait-ms", type=int, default=int(env_default("VK_BROWSER_WAIT_MS", "8000")))
+    vk_discover.add_argument("--timeout", type=int, default=45)
+    vk_discover.set_defaults(func=cmd_vk_discover)
 
     import_forecast = sub.add_parser("import-forecast", help="Import one participant's pasted forecast block.")
     import_forecast.add_argument("participant")

@@ -5,9 +5,12 @@ import unittest
 
 from brucebet.vk_board import (
     build_topic_url,
+    classify_topic,
     chromium_command,
+    extract_topic_links,
     extract_visible_text,
     parse_topic_url,
+    probe_public_group_topics,
     probe_public_topic,
 )
 
@@ -70,6 +73,35 @@ class VkBoardTests(unittest.TestCase):
         self.assertEqual(result.topic_id, 12345678)
         self.assertEqual(result.score_line_count, 2)
         self.assertIn("Bruce Wayne", result.text)
+
+    def test_group_discovery_extracts_and_classifies_public_topic_links(self) -> None:
+        html = """
+        <html><body>
+          <a href="/topic-217130885_777">Прогнозы на АПЛ 2026/27</a>
+          <a href="https://vk.ru/topic-217130885_778">Регистрация участников АПЛ</a>
+          <a href="/topic-217130885_779">Прогнозы РПЛ</a>
+          <a href="/topic-999_111">Чужая тема</a>
+        </body></html>
+        """
+        topics = extract_topic_links(html, 217130885)
+
+        self.assertEqual([topic.topic_id for topic in topics], [779, 778, 777])
+        self.assertEqual((topics[1].league_hint, topics[1].topic_kind), ("epl", "registration"))
+        self.assertTrue(topics[2].is_epl_candidate)
+        self.assertFalse(topics[0].is_epl_candidate)
+        self.assertEqual(classify_topic("Что-то ещё"), ("other", "unknown"))
+
+    def test_group_discovery_uses_public_topics_page_before_group_home(self) -> None:
+        html = '<a href="/topic-217130885_777">Прогнозы на АПЛ</a>'
+        seen_urls: list[str] = []
+
+        def runner(command, **kwargs):
+            seen_urls.append(command[-1])
+            return SimpleNamespace(returncode=0, stdout=html, stderr="")
+
+        result = probe_public_group_topics(217130885, runner=runner)
+        self.assertEqual(len(result.topics), 1)
+        self.assertEqual(seen_urls, ["https://vk.ru/club217130885?act=topics"])
 
 
 if __name__ == "__main__":

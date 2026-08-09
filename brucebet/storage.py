@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 import sqlite3
+from typing import Iterable, TYPE_CHECKING
 
 from .scoring import parse_datetime, parse_score
+
+if TYPE_CHECKING:
+    from .vk_board import VkDiscoveredTopic
 
 
 DEFAULT_COMPETITION_CODE = "epl"
@@ -304,7 +309,37 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries (
     error TEXT,
     UNIQUE(chat_id, round_id, reminder_key)
 );
+
+CREATE TABLE IF NOT EXISTS vk_topic_discovery_state (
+    group_id INTEGER PRIMARY KEY,
+    initialized_at TEXT NOT NULL,
+    last_checked_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vk_topic_alerts (
+    group_id INTEGER NOT NULL,
+    topic_id INTEGER NOT NULL,
+    topic_kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    notification_status TEXT NOT NULL DEFAULT 'pending',
+    notified_at TEXT,
+    notification_error TEXT,
+    PRIMARY KEY(group_id, topic_id)
+);
 """
+
+
+@dataclass(frozen=True)
+class VkTopicAlert:
+    group_id: int
+    topic_id: int
+    topic_kind: str
+    title: str
+    url: str
+    first_seen_at: str
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -329,6 +364,8 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS match_assessments;
         DROP TABLE IF EXISTS reminder_deliveries;
         DROP TABLE IF EXISTS reminder_subscriptions;
+        DROP TABLE IF EXISTS vk_topic_alerts;
+        DROP TABLE IF EXISTS vk_topic_discovery_state;
         DROP TABLE IF EXISTS model_forecasts;
         DROP TABLE IF EXISTS round_reviews;
         DROP TABLE IF EXISTS result_sync_runs;
@@ -431,6 +468,120 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     has_legacy_round_name_unique = ("name",) in unique_indexes
     if "season_id" not in rounds_columns or has_legacy_round_name_unique:
         rebuild_rounds_for_seasons(conn, ensure_legacy_season(conn))
+
+
+def record_vk_topic_discovery(
+    conn: sqlite3.Connection,
+    group_id: int,
+    candidates: Iterable["VkDiscoveredTopic"],
+    *,
+    checked_at: str,
+) -> tuple[bool, list[VkTopicAlert]]:
+    """Persist discovery state and return candidate topics that still need a Telegram alert.
+
+    The first successful pass is a baseline. It deliberately produces no alert,
+    so old discussions cannot be mistaken for newly opened EPL topics.
+    """
+
+    observed = list(candidates)
+    # A blank render can mean that VK changed its page shell. Do not establish
+    # a baseline until the browser has actually exposed at least one topic link.
+    if not observed:
+        return False, []
+    normalized = [item for item in observed if item.is_epl_candidate]
+    state = conn.execute(
+        "SELECT group_id FROM vk_topic_discovery_state WHERE group_id = ?",
+        (int(group_id),),
+    ).fetchone()
+    baseline = state is None
+
+    for item in normalized:
+        status = "baseline" if baseline else "pending"
+        conn.execute(
+            """
+            INSERT INTO vk_topic_alerts(
+                group_id, topic_id, topic_kind, title, url,
+                first_seen_at, last_seen_at, notification_status
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(group_id, topic_id) DO UPDATE SET
+                topic_kind = excluded.topic_kind,
+                title = excluded.title,
+                url = excluded.url,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (
+                int(item.group_id),
+                int(item.topic_id),
+                item.topic_kind,
+                item.title,
+                item.url,
+                checked_at,
+                checked_at,
+                status,
+            ),
+        )
+
+    if baseline:
+        conn.execute(
+            """
+            INSERT INTO vk_topic_discovery_state(group_id, initialized_at, last_checked_at)
+            VALUES(?, ?, ?)
+            """,
+            (int(group_id), checked_at, checked_at),
+        )
+        conn.commit()
+        return True, []
+
+    conn.execute(
+        "UPDATE vk_topic_discovery_state SET last_checked_at = ? WHERE group_id = ?",
+        (checked_at, int(group_id)),
+    )
+    rows = conn.execute(
+        """
+        SELECT group_id, topic_id, topic_kind, title, url, first_seen_at
+        FROM vk_topic_alerts
+        WHERE group_id = ? AND notification_status = 'pending'
+        ORDER BY first_seen_at, topic_id
+        """,
+        (int(group_id),),
+    ).fetchall()
+    conn.commit()
+    return False, [
+        VkTopicAlert(
+            group_id=int(row["group_id"]),
+            topic_id=int(row["topic_id"]),
+            topic_kind=row["topic_kind"],
+            title=row["title"],
+            url=row["url"],
+            first_seen_at=row["first_seen_at"],
+        )
+        for row in rows
+    ]
+
+
+def mark_vk_topic_alert_sent(conn: sqlite3.Connection, alert: VkTopicAlert, *, sent_at: str) -> None:
+    conn.execute(
+        """
+        UPDATE vk_topic_alerts
+        SET notification_status = 'sent', notified_at = ?, notification_error = NULL
+        WHERE group_id = ? AND topic_id = ?
+        """,
+        (sent_at, alert.group_id, alert.topic_id),
+    )
+    conn.commit()
+
+
+def mark_vk_topic_alert_failed(conn: sqlite3.Connection, alert: VkTopicAlert, error: str) -> None:
+    conn.execute(
+        """
+        UPDATE vk_topic_alerts
+        SET notification_status = 'pending', notification_error = ?
+        WHERE group_id = ? AND topic_id = ?
+        """,
+        (error[:500], alert.group_id, alert.topic_id),
+    )
+    conn.commit()
 
 
 def ensure_competition(conn: sqlite3.Connection, code: str, name: str | None = None) -> int:
