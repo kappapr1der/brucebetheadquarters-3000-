@@ -1,8 +1,8 @@
 from datetime import datetime
 import unittest
 
-from brucebet.analytics import match_dossier, player_status_summary
-from brucebet.storage import connect, ensure_team, reset_db, upsert_match
+from brucebet.analytics import intelligence_readiness, match_dossier, player_status_summary
+from brucebet.storage import connect, ensure_team, reset_db, upsert_absence, upsert_match
 from brucebet.variable_sync import (
     canonical_team_name,
     import_fpl_bootstrap,
@@ -75,6 +75,52 @@ class VariableSyncTest(unittest.TestCase):
         self.assertEqual(dossier["context"]["venue"], "Emirates Stadium")
         self.assertIsNotNone(dossier["assessment"]["suggested_score"])
         self.assertGreater(dossier["assessment"]["home_edge"], dossier["assessment"]["away_edge"])
+
+    def test_confirmed_manual_absence_changes_factors_and_clears_cleanly(self) -> None:
+        conn = sample_conn()
+        ensure_team(conn, "Arsenal", elo_rating=1700, updated_at="2026-08-01T10:00:00+03:00")
+        ensure_team(conn, "Chelsea", elo_rating=1700, updated_at="2026-08-01T10:00:00+03:00")
+        now = datetime.fromisoformat("2026-08-01T12:00:00+03:00")
+        sync_match_contexts_and_factors(conn, now=now, weather_days=0)
+        sync_match_assessments(conn, now.isoformat(), now=now)
+        baseline = float(match_dossier(conn, 1)["assessment"]["home_edge"])
+
+        upsert_absence(
+            conn,
+            {
+                "team": "Chelsea",
+                "player": "Palmer",
+                "role": "MID",
+                "status": "injured",
+                "impact_rating": "1.0",
+                "source": "club news",
+                "updated_at": now.isoformat(),
+            },
+        )
+        sync_match_contexts_and_factors(conn, now=now, weather_days=0)
+        sync_match_assessments(conn, now.isoformat(), now=now)
+        dossier = match_dossier(conn, 1)
+        away_factor = next(row for row in dossier["factors"] if row["side"] == "away")
+
+        self.assertGreater(float(away_factor["absences_impact"]), 0)
+        self.assertGreater(float(dossier["assessment"]["home_edge"]), baseline)
+
+        upsert_absence(
+            conn,
+            {"team": "Chelsea", "player": "Palmer", "status": "fit", "updated_at": now.isoformat()},
+        )
+        remaining = conn.execute("SELECT COUNT(*) AS count FROM absences WHERE player = 'Palmer'").fetchone()
+        self.assertEqual(remaining["count"], 0)
+
+    def test_intelligence_readiness_names_missing_variable_layers(self) -> None:
+        conn = sample_conn()
+
+        item = intelligence_readiness(conn, "1", now=datetime.fromisoformat("2026-08-01T12:00:00+03:00"))
+        signals = {row["key"]: row for row in item["items"][0]["signals"]}
+
+        self.assertEqual(signals["kickoff"]["state"], "ok")
+        self.assertEqual(signals["players"]["state"], "missing")
+        self.assertIn("form", [row["key"] for row in item["items"][0]["follow_up"]])
 
     def test_team_aliases_cover_common_external_names(self) -> None:
         self.assertEqual(canonical_team_name("Brighton & Hove Albion"), "Brighton and Hove Albion")

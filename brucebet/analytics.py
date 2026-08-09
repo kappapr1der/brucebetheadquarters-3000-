@@ -3,9 +3,10 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+import json
 import sqlite3
 
-from .scoring import Score, is_prediction_eligible, parse_datetime, parse_score, score_prediction
+from .scoring import Score, is_prediction_eligible, normalize_score, parse_datetime, parse_score, score_prediction
 from .storage import active_season, active_season_id
 
 
@@ -523,6 +524,381 @@ def risk_map(conn: sqlite3.Connection, round_name: str | None = None) -> dict[st
     return {"round_name": matches[0]["round_name"], **categories}
 
 
+def _outcome_for_score(raw: str | None) -> str | None:
+    score = parse_score(raw)
+    if score is None:
+        return None
+    return "P1" if score.outcome > 0 else "P2" if score.outcome < 0 else "X"
+
+
+def _top_probability(values: dict[str, float]) -> tuple[str | None, float | None]:
+    if not values:
+        return None, None
+    label, probability = max(values.items(), key=lambda item: item[1])
+    return label, round(probability, 2)
+
+
+def _normalised_market_probabilities(row: sqlite3.Row | None) -> dict[str, float]:
+    if row is None:
+        return {}
+    raw = {"P1": row["home_win"], "X": row["draw"], "P2": row["away_win"]}
+    implied: dict[str, float] = {}
+    for label, odds in raw.items():
+        try:
+            value = float(odds)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            implied[label] = 1 / value
+    total = sum(implied.values())
+    if total == 0 or len(implied) != 3:
+        return {}
+    return {label: value / total for label, value in implied.items()}
+
+
+def edge_map(conn: sqlite3.Connection, round_name: str | None = None) -> dict[str, object]:
+    """Rank contest matches where field, market, and model disagree.
+
+    This is a contest-strategy map, not a claim that one of the three sources is
+    objectively right. Missing signals are reported separately instead of being
+    treated as a contrarian opportunity.
+    """
+    matches = match_rows_for_round(conn, round_name)
+    if not matches:
+        return {"round_name": round_name, "opportunities": [], "needs_data": []}
+
+    opportunities: list[dict[str, object]] = []
+    needs_data: list[dict[str, object]] = []
+    for match in matches:
+        match_id = int(match["id"])
+        field = field_summary(conn, match_id)["outcomes"]
+        field_total = sum(field.values())
+        field_outcome, field_share = (None, None)
+        if field_total:
+            top = field.most_common(1)[0]
+            field_outcome, field_share = top[0], round(top[1] / field_total, 2)
+
+        assessment = conn.execute("SELECT * FROM match_assessments WHERE match_id = ?", (match_id,)).fetchone()
+        model_score = assessment["suggested_score"] if assessment else None
+        model_outcome = _outcome_for_score(model_score)
+        model_probabilities: dict[str, float] = {}
+        if assessment:
+            for label, key in (("P1", "home_edge"), ("X", "draw_edge"), ("P2", "away_edge")):
+                try:
+                    value = float(assessment[key])
+                except (TypeError, ValueError):
+                    continue
+                if value >= 0:
+                    model_probabilities[label] = value
+        model_top, model_share = _top_probability(model_probabilities)
+        model_outcome = model_outcome or model_top
+
+        odds = conn.execute(
+            "SELECT * FROM match_odds WHERE match_id = ? ORDER BY captured_at DESC, id DESC LIMIT 1",
+            (match_id,),
+        ).fetchone()
+        market_probabilities = _normalised_market_probabilities(odds)
+        market_outcome, market_share = _top_probability(market_probabilities)
+
+        missing: list[str] = []
+        if field_outcome is None:
+            missing.append("field")
+        if model_outcome is None:
+            missing.append("model")
+        if market_outcome is None:
+            missing.append("market")
+
+        row: dict[str, object] = {
+            "match_id": match_id,
+            "position": int(match["position"]),
+            "label": f"{match['home']} - {match['away']}",
+            "model_score": model_score or "",
+            "model_outcome": model_outcome or "",
+            "model_share": model_share,
+            "market_outcome": market_outcome or "",
+            "market_share": market_share,
+            "field_outcome": field_outcome or "",
+            "field_share": field_share,
+            "field_predictions": field_total,
+            "volatility": assessment["volatility"] if assessment else None,
+            "missing": missing,
+            "signals": [],
+            "edge_score": None,
+            "note": assessment["contrarian_note"] if assessment else "",
+        }
+        if missing:
+            needs_data.append(row)
+            continue
+
+        signals: list[str] = []
+        if model_outcome != field_outcome:
+            signals.append("model-field")
+        if model_outcome != market_outcome:
+            signals.append("model-market")
+        if field_outcome != market_outcome:
+            signals.append("field-market")
+        try:
+            volatility = max(0.0, min(1.0, float(assessment["volatility"]))) if assessment else 0.0
+        except (TypeError, ValueError):
+            volatility = 0.0
+        model_market_gap = abs(model_probabilities.get(model_outcome, 0.0) - market_probabilities.get(model_outcome, 0.0))
+        edge_score = (
+            0.35 * (len(signals) / 3)
+            + 0.30 * (1 - float(field_share))
+            + 0.20 * volatility
+            + 0.15 * model_market_gap
+        )
+        row["signals"] = signals
+        row["edge_score"] = round(edge_score, 2)
+        opportunities.append(row)
+
+    opportunities.sort(key=lambda item: (-float(item["edge_score"]), int(item["position"])))
+    needs_data.sort(key=lambda item: int(item["position"]))
+    return {"round_name": matches[0]["round_name"], "opportunities": opportunities, "needs_data": needs_data}
+
+
+def _freshness_item(raw: str | None, now: datetime) -> dict[str, object]:
+    updated_at = parse_datetime(raw)
+    comparable = _aware_for_compare(updated_at, now)
+    age_minutes = None
+    if comparable is not None:
+        age_minutes = max(0, int((now - comparable).total_seconds() // 60))
+    return {"updated_at": raw, "age_minutes": age_minutes}
+
+
+def data_freshness(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, dict[str, object]]:
+    """Return the latest timestamp for every signal used in match decisions."""
+    now = now or datetime.now().astimezone()
+    season_id = active_season_id(conn)
+    queries = {
+        "fpl": "SELECT MAX(updated_at) AS updated_at FROM player_status_snapshots WHERE source = 'FPL'",
+        "elo": "SELECT MAX(updated_at) AS updated_at FROM teams WHERE elo_rating IS NOT NULL",
+        "odds": """
+            SELECT MAX(mo.captured_at) AS updated_at
+            FROM match_odds mo
+            JOIN matches m ON m.id = mo.match_id
+            JOIN rounds r ON r.id = m.round_id
+            WHERE r.season_id = ?
+        """,
+        "model": """
+            SELECT MAX(ma.updated_at) AS updated_at
+            FROM match_assessments ma
+            JOIN matches m ON m.id = ma.match_id
+            JOIN rounds r ON r.id = m.round_id
+            WHERE r.season_id = ?
+        """,
+        "results": "SELECT MAX(finished_at) AS updated_at FROM result_sync_runs",
+    }
+    values: dict[str, str | None] = {}
+    for key, query in queries.items():
+        params: tuple[object, ...] = (season_id,) if key in {"odds", "model"} else ()
+        row = conn.execute(query, params).fetchone()
+        values[key] = row["updated_at"] if row else None
+    return {key: _freshness_item(value, now) for key, value in values.items()}
+
+
+def _readiness_signal(
+    key: str,
+    title: str,
+    present: bool,
+    detail: str,
+    updated_at: str | None = None,
+    max_age_hours: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    if not present:
+        return {"key": key, "title": title, "state": "missing", "detail": detail, "updated_at": updated_at}
+    if max_age_hours is not None and now is not None:
+        comparable = _aware_for_compare(parse_datetime(updated_at), now)
+        if comparable is None:
+            return {"key": key, "title": title, "state": "missing", "detail": detail, "updated_at": updated_at}
+        age_hours = max(0, int((now - comparable).total_seconds() // 3600))
+        if age_hours > max_age_hours:
+            return {
+                "key": key,
+                "title": title,
+                "state": "stale",
+                "detail": f"{detail}; age={age_hours}h",
+                "updated_at": updated_at,
+            }
+    return {"key": key, "title": title, "state": "ok", "detail": detail, "updated_at": updated_at}
+
+
+def match_intelligence_readiness(
+    conn: sqlite3.Connection,
+    match_id: int,
+    now: datetime | None = None,
+    lock_minutes: int = 90,
+) -> dict[str, object]:
+    """Explain whether a match has enough fresh information for a responsible pick."""
+    now = now or datetime.now().astimezone()
+    dossier = match_dossier(conn, match_id)
+    match = dossier["match"]
+    kickoff = parse_datetime(match["kickoff_at"])
+    deadline = _match_deadline(kickoff, parse_datetime(match["round_deadline_at"]), lock_minutes)
+    comparable_kickoff = _aware_for_compare(kickoff, now)
+    within_weather_window = comparable_kickoff is not None and timedelta(0) <= comparable_kickoff - now <= timedelta(days=16)
+    within_odds_window = deadline is not None and _aware_for_compare(deadline, now) is not None and _aware_for_compare(deadline, now) - now <= timedelta(hours=72)
+
+    teams = [dossier["home"], dossier["away"]]
+    team_ids = [int(team["id"]) for team in teams]
+    status_rows = list(
+        conn.execute(
+            """
+            SELECT team_id, COUNT(DISTINCT player) AS player_count, MAX(updated_at) AS updated_at
+            FROM player_status_snapshots
+            WHERE team_id IN (?, ?)
+            GROUP BY team_id
+            """,
+            team_ids,
+        )
+    )
+    status_by_team = {int(row["team_id"]): row for row in status_rows}
+    player_counts = [int(status_by_team.get(team_id, {"player_count": 0})["player_count"]) for team_id in team_ids]
+    player_updates = [status_by_team.get(team_id, {"updated_at": None})["updated_at"] for team_id in team_ids]
+    player_updated_at = min((value for value in player_updates if value), default=None)
+
+    form_rows = list(
+        conn.execute(
+            """
+            SELECT team_id, COUNT(*) AS form_count, MAX(match_date) AS latest_match_at
+            FROM team_form
+            WHERE team_id IN (?, ?)
+            GROUP BY team_id
+            """,
+            team_ids,
+        )
+    )
+    form_by_team = {int(row["team_id"]): row for row in form_rows}
+    form_counts = [int(form_by_team.get(team_id, {"form_count": 0})["form_count"]) for team_id in team_ids]
+    form_updated_at = min(
+        (row["latest_match_at"] for row in form_rows if row["latest_match_at"]),
+        default=None,
+    )
+    absence_row = conn.execute(
+        "SELECT COUNT(*) AS count, MAX(updated_at) AS updated_at FROM absences WHERE team_id IN (?, ?)",
+        team_ids,
+    ).fetchone()
+    context = dossier["context"]
+    factors = dossier["factors"]
+    assessment = dossier["assessment"]
+    latest_odds = dossier["odds"][0] if dossier["odds"] else None
+
+    signals = [
+        _readiness_signal("kickoff", "Kickoff", kickoff is not None, "kickoff is set" if kickoff else "no kickoff", now=now),
+        _readiness_signal(
+            "strength",
+            "Elo strength",
+            all(team["elo_rating"] is not None for team in teams),
+            "both team Elo ratings loaded",
+            min((team["updated_at"] for team in teams if team["updated_at"]), default=None),
+            max_age_hours=14 * 24,
+            now=now,
+        ),
+        _readiness_signal(
+            "players",
+            "Player availability",
+            min(player_counts, default=0) >= 11,
+            f"snapshots home/away={player_counts[0]}/{player_counts[1]}",
+            player_updated_at,
+            max_age_hours=48,
+            now=now,
+        ),
+        _readiness_signal(
+            "form",
+            "Recent form/xG",
+            min(form_counts, default=0) >= 3,
+            f"recent form rows home/away={form_counts[0]}/{form_counts[1]}",
+            form_updated_at,
+            max_age_hours=30 * 24,
+            now=now,
+        ),
+        _readiness_signal(
+            "context",
+            "Match context",
+            context is not None,
+            "venue/rest context loaded" if context else "context is absent",
+            now=now,
+        ),
+        _readiness_signal(
+            "factors",
+            "Lineup/rest factors",
+            len(factors) == 2,
+            f"team factor rows={len(factors)}/2",
+            now=now,
+        ),
+        _readiness_signal(
+            "model",
+            "Model assessment",
+            assessment is not None and assessment["suggested_score"] is not None,
+            "assessment is generated" if assessment else "assessment is absent",
+            assessment["updated_at"] if assessment else None,
+            max_age_hours=48,
+            now=now,
+        ),
+        _readiness_signal(
+            "odds",
+            "Odds market",
+            latest_odds is not None,
+            "latest odds snapshot loaded" if latest_odds else "sync odds near deadline",
+            latest_odds["captured_at"] if latest_odds else None,
+            max_age_hours=36 if within_odds_window else None,
+            now=now,
+        ),
+        _readiness_signal(
+            "weather",
+            "Weather",
+            not within_weather_window or (context is not None and bool(context["weather"])),
+            "outside forecast window" if not within_weather_window else "weather is loaded",
+            now=now,
+        ),
+    ]
+    absence_count = int(absence_row["count"] or 0) if absence_row else 0
+    absence_detail = f"manual absences logged={absence_count}" if absence_count else "manual injury/news review still needed"
+    signals.append(
+        {
+            "key": "absences",
+            "title": "Manual injury review",
+            "state": "ok" if absence_count else "review",
+            "detail": absence_detail,
+            "updated_at": absence_row["updated_at"] if absence_row else None,
+        }
+    )
+    core_keys = {"kickoff", "strength", "players", "context", "factors", "model"}
+    core_issues = [item for item in signals if item["key"] in core_keys and item["state"] != "ok"]
+    follow_up = [item for item in signals if item["state"] in {"missing", "stale", "review"}]
+    data_gaps = [item for item in follow_up if item["state"] != "review"]
+    status = "blocked" if any(item["key"] == "kickoff" for item in core_issues) else "attention" if data_gaps else "ready"
+    return {
+        "match": match,
+        "deadline": deadline,
+        "status": status,
+        "signals": signals,
+        "ready_signals": sum(item["state"] == "ok" for item in signals),
+        "total_signals": len(signals),
+        "follow_up": follow_up,
+    }
+
+
+def intelligence_readiness(
+    conn: sqlite3.Connection,
+    round_name: str | None = None,
+    now: datetime | None = None,
+    lock_minutes: int = 90,
+) -> dict[str, object]:
+    matches = match_rows_for_round(conn, round_name)
+    items = [match_intelligence_readiness(conn, int(match["id"]), now=now, lock_minutes=lock_minutes) for match in matches]
+    order = {"blocked": 0, "attention": 1, "ready": 2}
+    items.sort(key=lambda item: (order[str(item["status"])], int(item["match"]["position"])))
+    return {
+        "round_name": matches[0]["round_name"] if matches else round_name,
+        "items": items,
+        "ready_count": sum(item["status"] == "ready" for item in items),
+        "attention_count": sum(item["status"] == "attention" for item in items),
+        "blocked_count": sum(item["status"] == "blocked" for item in items),
+    }
+
+
 def hq_summary(
     conn: sqlite3.Connection,
     user_participant: str = "Bruce Wayne",
@@ -577,6 +953,173 @@ def hq_summary(
         "bank_rub": paid_count * int(season["entry_fee_rub"]),
         "predictions": prediction_counts,
         "risk": risk,
+        "freshness": data_freshness(conn),
+    }
+
+
+def ready_summary(
+    conn: sqlite3.Connection,
+    user_participant: str = "Bruce Wayne",
+    lock_minutes: int = 90,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Preflight the active round before committing a prediction to the contest."""
+    now = now or datetime.now().astimezone()
+    hq = hq_summary(conn, user_participant=user_participant, lock_minutes=lock_minutes)
+    round_name = hq["round_name"]
+    matches = match_rows_for_round(conn, round_name)
+    deadline = hq["deadline"]
+    effective_deadline = deadline.effective_deadline_at if deadline else None
+    comparable_deadline = _aware_for_compare(effective_deadline, now)
+    minutes_to_deadline = (
+        int((comparable_deadline - now).total_seconds() // 60)
+        if comparable_deadline is not None
+        else None
+    )
+    unknown_kickoff = [int(row["position"]) for row in matches if parse_datetime(row["kickoff_at"]) is None]
+    participants = _participants(conn)
+    user_present = any(str(row["name"]).lower() == user_participant.lower() for row in participants)
+    missing_mine = max(0, len(matches) - int(hq["predictions"]["mine"]))
+    expected_field_rows = len(matches) * len(participants)
+    missing_field = max(0, expected_field_rows - int(hq["predictions"]["rows"]))
+    model_coverage = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM model_forecasts f
+        JOIN matches m ON m.id = f.match_id
+        JOIN rounds r ON r.id = m.round_id
+        WHERE r.season_id = ? AND r.name = ?
+        """,
+        (active_season_id(conn), round_name),
+    ).fetchone()
+    intelligence = intelligence_readiness(conn, round_name, now=now, lock_minutes=lock_minutes) if round_name else {
+        "ready_count": 0,
+        "attention_count": 0,
+        "blocked_count": 0,
+    }
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if not matches:
+        blockers.append("Нет матчей активного тура.")
+    if effective_deadline is None:
+        blockers.append("Не вычислен дедлайн тура.")
+    if unknown_kickoff:
+        blockers.append(f"Нет kickoff у матчей: {', '.join(map(str, unknown_kickoff))}.")
+    if minutes_to_deadline is not None and minutes_to_deadline < 0:
+        blockers.append("Дедлайн уже прошёл.")
+    if participants and not user_present:
+        blockers.append(f"Участник {user_participant} не загружен в активный сезон.")
+    elif user_present and missing_mine:
+        warnings.append(f"Не хватает твоих прогнозов: {missing_mine}.")
+    if not participants:
+        warnings.append("Участники пока не загружены.")
+    elif missing_field:
+        warnings.append(f"Поле ещё неполное: не хватает {missing_field} строк прогнозов.")
+    if len(matches) and int(model_coverage["count"]) < len(matches):
+        warnings.append(f"Модель зафиксирована не для всех матчей: {model_coverage['count']}/{len(matches)}.")
+    if intelligence["blocked_count"]:
+        blockers.append(f"Аналитика заблокирована у матчей: {intelligence['blocked_count']}. Открой /intel.")
+    elif intelligence["attention_count"]:
+        warnings.append(f"Нужен ручной аналитический чек у матчей: {intelligence['attention_count']}. Детали: /intel.")
+
+    freshness = hq["freshness"]
+    nearing_deadline = minutes_to_deadline is not None and minutes_to_deadline <= 72 * 60
+    for key, title, threshold in [("fpl", "FPL", 36 * 60), ("model", "модель", 48 * 60)]:
+        item = freshness[key]
+        if item["updated_at"] is None:
+            warnings.append(f"Нет данных источника: {title}.")
+        elif item["age_minutes"] is not None and item["age_minutes"] > threshold:
+            warnings.append(f"Данные {title} устарели: {item['age_minutes']} мин.")
+    if nearing_deadline:
+        odds = freshness["odds"]
+        if odds["updated_at"] is None:
+            warnings.append("Перед близким дедлайном нет сохранённых кэфов.")
+        elif odds["age_minutes"] is not None and odds["age_minutes"] > 36 * 60:
+            warnings.append(f"Кэфы устарели: {odds['age_minutes']} мин.")
+
+    status = "blocked" if blockers else "attention" if warnings else "ready"
+    return {
+        "status": status,
+        "round_name": round_name,
+        "deadline": effective_deadline,
+        "minutes_to_deadline": minutes_to_deadline,
+        "match_count": len(matches),
+        "unknown_kickoff": unknown_kickoff,
+        "participants": len(participants),
+        "your_predictions": int(hq["predictions"]["mine"]),
+        "missing_your_predictions": missing_mine if user_present else None,
+        "field_predictions": int(hq["predictions"]["rows"]),
+        "expected_field_predictions": expected_field_rows,
+        "model_forecasts": int(model_coverage["count"]),
+        "intelligence": intelligence,
+        "freshness": freshness,
+        "blockers": blockers,
+        "warnings": warnings,
+    }
+
+
+def missing_forecasts_summary(
+    conn: sqlite3.Connection,
+    round_name: str | None = None,
+    lock_minutes: int = 90,
+) -> dict[str, object]:
+    """Return an operator-friendly per-person coverage view for one round."""
+    selected_round = round_name.strip() if round_name else target_round_name(conn, lock_minutes=lock_minutes)
+    if not selected_round:
+        return {
+            "round_name": None,
+            "deadline": None,
+            "match_count": 0,
+            "participant_count": 0,
+            "complete_count": 0,
+            "incomplete": [],
+        }
+
+    season_id = active_season_id(conn)
+    matches = match_rows_for_round(conn, selected_round)
+    if not matches:
+        raise ValueError(f"No matches found for round {selected_round!r}")
+    deadline_by_round = {item.round_name: item for item in round_deadlines(conn, lock_minutes=lock_minutes)}
+    participants = _participants(conn)
+    rows = list(
+        conn.execute(
+            """
+            SELECT
+                p.name AS participant,
+                COUNT(pr.id) AS submitted_count,
+                GROUP_CONCAT(CASE WHEN pr.id IS NULL THEN m.position END, ',') AS missing_positions
+            FROM season_participants sp
+            JOIN participants p ON p.id = sp.participant_id
+            CROSS JOIN matches m
+            JOIN rounds r ON r.id = m.round_id
+            LEFT JOIN predictions pr ON pr.participant_id = p.id AND pr.match_id = m.id
+            WHERE sp.season_id = ?
+              AND sp.active = 1
+              AND r.season_id = ?
+              AND r.name = ?
+            GROUP BY p.id
+            ORDER BY submitted_count ASC, p.name
+            """,
+            (season_id, season_id, selected_round),
+        )
+    )
+    incomplete = [
+        {
+            "participant": row["participant"],
+            "submitted_count": int(row["submitted_count"]),
+            "missing_positions": tuple(int(value) for value in (row["missing_positions"] or "").split(",") if value),
+        }
+        for row in rows
+        if int(row["submitted_count"]) < len(matches)
+    ]
+    deadline = deadline_by_round.get(selected_round)
+    return {
+        "round_name": selected_round,
+        "deadline": deadline.effective_deadline_at if deadline else None,
+        "match_count": len(matches),
+        "participant_count": len(participants),
+        "complete_count": len(participants) - len(incomplete),
+        "incomplete": incomplete,
     }
 
 
@@ -613,6 +1156,270 @@ def strategy_summary(
         "advice": advice,
         "risk": risk_map(conn),
     }
+
+
+def capture_model_forecasts(
+    conn: sqlite3.Connection,
+    now: datetime | None = None,
+    model_key: str = "brucebet",
+) -> int:
+    """Freeze the current model draft before kickoff for later honest calibration."""
+    now = now or datetime.now().astimezone()
+    season_id = active_season_id(conn)
+    rows = conn.execute(
+        """
+        SELECT
+            m.id AS match_id,
+            m.kickoff_at,
+            a.suggested_score,
+            a.confidence,
+            a.risk_level,
+            a.updated_at
+        FROM matches m
+        JOIN rounds r ON r.id = m.round_id
+        JOIN match_assessments a ON a.match_id = m.id
+        WHERE r.season_id = ?
+        ORDER BY r.sort_order, m.position
+        """,
+        (season_id,),
+    )
+    captured = 0
+    for row in rows:
+        score = normalize_score(row["suggested_score"])
+        kickoff = parse_datetime(row["kickoff_at"])
+        if score is None or (kickoff is not None and kickoff <= now):
+            continue
+        cursor = conn.execute(
+            """
+            INSERT INTO model_forecasts(
+                match_id, model_key, suggested_score, confidence, risk_level, captured_at, assessment_updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(match_id, model_key) DO NOTHING
+            """,
+            (
+                int(row["match_id"]),
+                model_key,
+                score,
+                row["confidence"],
+                row["risk_level"],
+                now.isoformat(),
+                row["updated_at"],
+            ),
+        )
+        captured += int(cursor.rowcount)
+    conn.commit()
+    return captured
+
+
+def model_calibration_summary(
+    conn: sqlite3.Connection,
+    round_name: str | None = None,
+    model_key: str = "brucebet",
+) -> dict[str, object]:
+    season_id = active_season_id(conn)
+    where_round = "AND r.name = ?" if round_name else ""
+    params: tuple[object, ...] = (season_id, model_key, round_name) if round_name else (season_id, model_key)
+    rows = conn.execute(
+        f"""
+        SELECT
+            r.name AS round_name,
+            r.sort_order,
+            m.id AS match_id,
+            m.home,
+            m.away,
+            m.result,
+            f.suggested_score,
+            f.confidence,
+            f.risk_level,
+            f.captured_at
+        FROM model_forecasts f
+        JOIN matches m ON m.id = f.match_id
+        JOIN rounds r ON r.id = m.round_id
+        WHERE r.season_id = ? AND f.model_key = ? {where_round}
+        ORDER BY r.sort_order, m.position
+        """,
+        params,
+    ).fetchall()
+    totals: Counter[str] = Counter()
+    buckets: dict[str, Counter[str]] = {"low": Counter(), "medium": Counter(), "high": Counter()}
+    matches: list[dict[str, object]] = []
+    for row in rows:
+        award = score_prediction(parse_score(row["suggested_score"]), parse_score(row["result"]))
+        bucket = "low"
+        confidence = float(row["confidence"] or 0)
+        if confidence >= 0.65:
+            bucket = "high"
+        elif confidence >= 0.45:
+            bucket = "medium"
+        totals[award.category] += 1
+        totals["points"] += award.points
+        buckets[bucket][award.category] += 1
+        buckets[bucket]["points"] += award.points
+        matches.append(
+            {
+                "round_name": row["round_name"],
+                "match": f"{row['home']} - {row['away']}",
+                "forecast": row["suggested_score"],
+                "result": row["result"] or "",
+                "category": award.category,
+                "points": award.points,
+                "confidence": row["confidence"],
+                "risk_level": row["risk_level"] or "",
+            }
+        )
+    scored = sum(totals[key] for key in ("exact", "diff", "outcome", "miss"))
+    return {
+        "model_key": model_key,
+        "forecasts": len(rows),
+        "scored": scored,
+        "pending": totals["pending"],
+        "exact": totals["exact"],
+        "diff": totals["diff"],
+        "outcome": totals["outcome"],
+        "miss": totals["miss"],
+        "points": totals["points"],
+        "points_per_match": round(totals["points"] / scored, 2) if scored else 0.0,
+        "buckets": {
+            key: {
+                "forecasts": sum(value[item] for item in ("exact", "diff", "outcome", "miss", "pending")),
+                "points": value["points"],
+                "exact": value["exact"],
+                "diff": value["diff"],
+                "outcome": value["outcome"],
+                "miss": value["miss"],
+            }
+            for key, value in buckets.items()
+        },
+        "matches": matches,
+    }
+
+
+def round_review(conn: sqlite3.Connection, round_name: str, lock_minutes: int = 90) -> dict[str, object]:
+    """Build a compact factual debrief for one round, including score swings."""
+    season_id = active_season_id(conn)
+    round_row = conn.execute(
+        "SELECT id, name, sort_order, deadline_at FROM rounds WHERE season_id = ? AND name = ?",
+        (season_id, round_name),
+    ).fetchone()
+    if round_row is None:
+        raise ValueError(f"Unknown round: {round_name}")
+    matches = list(
+        conn.execute(
+            "SELECT id, position, home, away, kickoff_at, result FROM matches WHERE round_id = ? ORDER BY position",
+            (int(round_row["id"]),),
+        )
+    )
+    participants = {
+        int(row["id"]): {
+            "participant": row["name"],
+            "points": 0,
+            "exact": 0,
+            "diff": 0,
+            "outcome": 0,
+            "miss": 0,
+            "late": 0,
+        }
+        for row in _participants(conn)
+    }
+    predictions = conn.execute(
+        """
+        SELECT pr.participant_id, pr.match_id, pr.score, pr.submitted_at
+        FROM predictions pr
+        JOIN matches m ON m.id = pr.match_id
+        WHERE m.round_id = ?
+        """,
+        (int(round_row["id"]),),
+    ).fetchall()
+    match_by_id = {int(match["id"]): match for match in matches}
+    points_by_match: dict[int, list[int]] = defaultdict(list)
+    deadline_at = parse_datetime(round_row["deadline_at"])
+    for row in predictions:
+        participant = participants.get(int(row["participant_id"]))
+        match = match_by_id.get(int(row["match_id"]))
+        if participant is None or match is None:
+            continue
+        eligible = prediction_is_eligible(
+            parse_datetime(row["submitted_at"]),
+            parse_datetime(match["kickoff_at"]),
+            deadline_at,
+            lock_minutes,
+        )
+        if not eligible:
+            participant["late"] += 1
+            continue
+        award = score_prediction(parse_score(row["score"]), parse_score(match["result"]))
+        participant["points"] += award.points
+        participant[award.category] = int(participant.get(award.category, 0)) + 1
+        if parse_score(match["result"]):
+            points_by_match[int(match["id"])].append(award.points)
+    participant_rows = sorted(
+        participants.values(),
+        key=lambda row: (-int(row["points"]), -int(row["exact"]), -int(row["diff"]), str(row["participant"]).lower()),
+    )
+    swings = []
+    for match in matches:
+        points = points_by_match.get(int(match["id"]), [])
+        if not points or parse_score(match["result"]) is None:
+            continue
+        swings.append(
+            {
+                "position": int(match["position"]),
+                "match": f"{match['home']} - {match['away']}",
+                "result": match["result"],
+                "spread": max(points) - min(points),
+                "max_points": max(points),
+                "min_points": min(points),
+            }
+        )
+    swings.sort(key=lambda row: (-int(row["spread"]), int(row["position"])))
+    finished = sum(1 for match in matches if parse_score(match["result"]) is not None)
+    return {
+        "round_name": round_row["name"],
+        "round_id": int(round_row["id"]),
+        "match_count": len(matches),
+        "finished_count": finished,
+        "complete": bool(matches) and finished == len(matches),
+        "participants": participant_rows,
+        "swings": swings[:5],
+        "calibration": model_calibration_summary(conn, round_name=round_name),
+    }
+
+
+def finalize_completed_rounds(conn: sqlite3.Connection, lock_minutes: int = 90) -> list[dict[str, object]]:
+    """Persist a review whenever every match in a round has a valid final score."""
+    season_id = active_season_id(conn)
+    rounds = conn.execute(
+        "SELECT id, name FROM rounds WHERE season_id = ? ORDER BY sort_order",
+        (season_id,),
+    ).fetchall()
+    saved: list[dict[str, object]] = []
+    completed_at = datetime.now().astimezone().isoformat()
+    for row in rounds:
+        review = round_review(conn, str(row["name"]), lock_minutes=lock_minutes)
+        if not review["complete"]:
+            continue
+        conn.execute(
+            """
+            INSERT INTO round_reviews(round_id, completed_at, match_count, finished_count, payload_json)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(round_id) DO UPDATE SET
+                completed_at = excluded.completed_at,
+                match_count = excluded.match_count,
+                finished_count = excluded.finished_count,
+                payload_json = excluded.payload_json
+            """,
+            (
+                int(row["id"]),
+                completed_at,
+                int(review["match_count"]),
+                int(review["finished_count"]),
+                json.dumps(review, ensure_ascii=True, sort_keys=True),
+            ),
+        )
+        saved.append(review)
+    conn.commit()
+    return saved
 
 
 def recommend_match(conn: sqlite3.Connection, match_id: int) -> dict[str, object]:
@@ -840,7 +1647,7 @@ def player_status_summary(
 def match_dossier(conn: sqlite3.Connection, match_id: int) -> dict[str, object]:
     match = conn.execute(
         """
-        SELECT m.*, r.name AS round_name, r.sort_order
+        SELECT m.*, r.name AS round_name, r.sort_order, r.deadline_at AS round_deadline_at
         FROM matches m
         JOIN rounds r ON r.id = m.round_id
         WHERE m.id = ?

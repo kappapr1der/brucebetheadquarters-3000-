@@ -21,19 +21,31 @@
 
 - SQLite-ядро для сезонов, участников, взносов, туров, матчей, прогнозов и результатов.
 - Сезонные взносы: один и тот же участник может играть в разных сезонах с разным статусом оплаты.
-- Гибкий парсер счёта: `2:1`, `2-1`, `2;1`, `2 : 1` принимаются и нормализуются.
+- Гибкий парсер счёта: `2:1`, `2-1`, `2—1`, `2;1`, `2 : 1` принимаются и нормализуются.
 - Двузначные счета вроде `10:0` считаются невалидными и уходят в аудит.
 - Таблица с тай-брейками: очки, точные, разницы, очки последних туров.
 - `/hq`: штаб активного тура.
+- `/start`: короткий операторский старт: бот готов принять список участников или следующий блок прогнозов.
+- `/ready`: предтуровый preflight: дедлайн, покрытие прогнозами, готовность модели и свежесть источников.
+- `/missing [тур]`: адресный список участников с неполным блоком и номерами недостающих матчей.
+- `/intel [тур]`: готовность аналитики по каждому матчу и точный список того, что ещё нужно проверить.
+- `/absence`: быстрая запись подтверждённой травмы/дисквалификации; сразу пересчитывает факторы и оценку модели.
 - `/risk`: риск-карта тура.
+- `/edge`: карта расхождений поля, рынка и модели; ранжирует матчи для точечных отличий, а не выдаёт «истину».
 - `/strategy`: режим игры относительно лидера.
 - `/field`, `/recommend`, `/match`, `/vs`, `/audit`, `/deadlines`.
 - `/quota`, `/sync_odds`, `/odds`: проверка квоты The Odds API, синк кэфов, просмотр снимков.
 - `/sources`: health-check всех подключенных источников данных.
 - `/sync_fixtures`: официальный календарь Premier League из public API сайта PL.
 - `vk_board`: публичное read-only чтение VK-темы через Chromium; `vk_dry_run` структурирует регистрацию или прогнозы без SQLite.
+- `/sync_results`: только финальные результаты из официального PL feed, затем автоматическое закрытие завершённого тура.
 - Сервисные сообщения: “принято”, “теперь кидай прогнозы участников”, “проверь аудит”.
-- Напоминания за 24 часа, 6 часов, 3 часа, 1 час и 20 минут до дедлайна.
+- Устойчивые напоминания за 24 часа, 6 часов, 3 часа, 1 час и 20 минут до дедлайна: доставки лежат в SQLite и переживают рестарт контейнера.
+- `/review <тур>`: пост-туровый разбор, туровая таблица и матчи-качели.
+- `/calibration [тур]`: честная калибровка замороженных до kickoff прогнозов модели.
+- `/rehearse`: изолированная репетиция полного тура без изменения живой базы.
+- `/setresult`: ручной резервный финальный счёт с неизменяемой историей исправлений.
+- `/overrideforecast`: осознанная ручная правка прогноза с аудитом и сохранением исходного времени отправки.
 - Docker-деплой Telegram-бота.
 
 ## Быстрый Старт
@@ -42,9 +54,15 @@
 python -m brucebet.cli --db brucebet.sqlite load-sample
 python -m brucebet.cli --db brucebet.sqlite sync-fixtures
 python -m brucebet.cli --db brucebet.sqlite sync-variables
+python -m brucebet.cli --db brucebet.sqlite sync-results
+python -m brucebet.cli --db brucebet.sqlite review 1
+python -m brucebet.cli --db brucebet.sqlite calibration
+python -m brucebet.cli rehearse
 python -m brucebet.cli --db brucebet.sqlite snapshot --out-dir data/snapshots/current
 python -m brucebet.cli --db brucebet.sqlite hq
+python -m brucebet.cli --db brucebet.sqlite ready
 python -m brucebet.cli --db brucebet.sqlite risk
+python -m brucebet.cli --db brucebet.sqlite edge
 python -m brucebet.cli --db brucebet.sqlite strategy
 python -m brucebet.cli --db brucebet.sqlite calendar
 python -m brucebet.cli --db brucebet.sqlite next
@@ -99,6 +117,8 @@ PREMIER_LEAGUE_SEASON_LABEL=2026/2027
 BRUCEBET_AUTO_SYNC=1
 BRUCEBET_AUTO_SYNC_INTERVAL_HOURS=12
 BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES=5
+BRUCEBET_REMINDER_INTERVAL_MINUTES=5
+BRUCEBET_REMINDER_GRACE_MINUTES=35
 BRUCEBET_VARIABLE_DAYS_AHEAD=365
 BRUCEBET_WEATHER_DAYS_AHEAD=16
 BRUCEBET_SNAPSHOT_LABEL=server-auto
@@ -121,14 +141,22 @@ THESPORTSDB_KEY=123
 - `/start`
 - `/id`
 - `/hq`
+- `/ready`
+- `/intel [тур]`
+- `/absence Arsenal | Saka | doubtful | 0.8 | Arsenal official | ankle knock`
+- `/missing [тур]`
 - `/load`
+- `/participants` + список с новой строки
+- `/forecast Имя участника | тур` + счета с новой строки
 - `/table`
 - `/field <матч>`
 - `/recommend <матч>`
+- `/edge [тур]`
 - `/odds <матч>`
 - `/quota`
 - `/sources`
 - `/sync_fixtures`
+- `/sync_results`
 - `/sync_variables`
 - `/sync_odds`
 - `/dossier <match>`
@@ -139,6 +167,13 @@ THESPORTSDB_KEY=123
 - `/deadlines`
 - `/schedule`
 - `/audit`
+- `/review <тур>`
+- `/calibration [тур]`
+- `/rehearse`
+- `/setresult Arsenal - Chelsea | 2:1 | официальный feed задержался`
+- `/resulthistory Arsenal`
+- `/overrideforecast Igor | Arsenal - Chelsea | 2:1 | подтверждённая опечатка`
+- `/forecasthistory Igor | Arsenal - Chelsea`
 
 ## CSV
 
@@ -169,6 +204,20 @@ Calendar commands:
 - `brucebet variables [team]` - latest player status/form snapshots.
 - `brucebet sync-fixtures` - fetch official Premier League fixtures into `matches`.
 - `brucebet sync-variables` - fetch FPL, ClubElo, context/weather, factors, and draft assessments.
+- `brucebet sync-results` - write only completed official results and save completed round reviews.
+- `brucebet ready` - preflight the active round: deadline, coverage, model, and data freshness.
+- `brucebet missing [тур]` - names and missing match positions for incomplete forecast blocks.
+- `brucebet edge [тур]` - rank matches where field consensus, market implied outcome, and model disagree.
+- `brucebet import-forecast <участник> <тур> <файл>` - import one participant's raw forecast block.
+
+After the deadline, a normal import can add a previously absent line but cannot replace an already stored score. Use the whitelisted Telegram command `/overrideforecast Участник | Матч | 2:1 | причина` only for an intentional correction; every correction is written to the audit log and exported in snapshots.
+
+Before a score decision, use `/intel [тур]` to see where the model lacks fresh input. Record a confirmed injury or suspension with `/absence Команда | Игрок | статус | impact | источник | заметка`; `impact` uses a scale from `0` to `1`, and `fit`/`available` removes a previous record.
+- `brucebet set-result <match> <score> --reason <text>` - manually record a fallback final score with an audit trail.
+- `brucebet result-history <match>` - inspect the manual result override journal.
+- `brucebet review <тур>` - post-round scoreboard, score swings, and model performance.
+- `brucebet calibration [тур]` - accuracy/points for pre-kickoff frozen model forecasts.
+- `brucebet rehearse` - isolated end-to-end rehearsal without live database writes.
 - `brucebet snapshot` - export stable sanitized CSV/JSON files for server-side git snapshots.
 - `brucebet dossier <team>` - show the match variable card.
 - `brucebet quota` - check The Odds API key and remaining credits without spending odds quota.
@@ -203,9 +252,55 @@ python -m brucebet.cli --db brucebet.sqlite import --reset `
 - Team match factors: lineup confidence, absences impact, fatigue, baseline motivation.
 - Draft `match_assessments` based on Elo and latest stored odds when available.
 
-Telegram has `/sync_variables` and `/dossier <match>`. The bot also runs a quiet background sync every `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS` when `BRUCEBET_AUTO_SYNC=1`, after `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES` on startup.
+Telegram has `/sync_variables`, `/sync_results`, and `/dossier <match>`. The bot also runs a quiet background sync every `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS` when `BRUCEBET_AUTO_SYNC=1`, after `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES` on startup. It freezes available model drafts before kickoff and checks finished official results without spending Odds API credits.
 
-The background sync does not call The Odds API, so it does not spend odds credits. Use `/sync_odds` manually closer to deadline.
+The background sync does not call The Odds API, so it does not spend odds credits. Use `/sync_odds` manually closer to deadline. `/schedule` subscribes the current chat to persistent reminders; the dispatcher checks due deliveries every `BRUCEBET_REMINDER_INTERVAL_MINUTES` and retries failed sends inside the configured grace window.
+
+## Preflight And Result Fallback
+
+Before publishing forecasts, use `/ready`. It checks kickoff/deadline coverage, your and the field's submissions, frozen model coverage, and the freshness of FPL, Elo, odds, model, and results data. `/hq` includes the same source-freshness panel.
+
+If the official results feed lags, use the restricted command:
+
+```text
+/setresult Arsenal - Chelsea | 2:1 | официальный feed задержался
+```
+
+The score is normalized, current standings/reviews are recalculated, and the previous score, time, chat, and reason are retained in the SQLite audit log. Inspect it with `/resulthistory Arsenal`.
+
+## Quick Forecast Import
+
+For a full VK export, use `/load` or send the `.txt` file as before. For one participant's raw block, send this directly to the bot:
+
+```text
+/forecast Игорь Григорьев | 1
+2:1
+Liverpool - Burnley 2 - 0
+1;1
+2—2
+```
+
+The named match is placed into its exact fixture position; unlabeled scores fill the remaining positions in template order. Valid scores are saved immediately. The reply separately reports normalized punctuation, missing positions, duplicates, ambiguous lines, and any scores beyond the end of the tour. The same flow also works without a command when the first line is `Прогноз: Игорь Григорьев | 1`.
+
+After `/start`, the shortest operator flow is even simpler. Send a roster first:
+
+```text
+Участники:
+Игорь Григорьев 300р
+Анна Бухтеева 300р
+Стас Ручкин без взноса
+```
+
+Then send a forecast with the participant name on the first line and scores below. The active upcoming round is chosen automatically:
+
+```text
+Игорь Григорьев
+2:1
+2 - 0
+1;1
+```
+
+New names without a payment marker are added outside the prize bank until they are resent with `300р`; this prevents accidental prize eligibility.
 
 ## Runtime Data
 
