@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -15,8 +16,10 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
-VK_AUTHORIZE_URL = "https://oauth.vk.com/authorize"
-VK_TOKEN_URL = "https://oauth.vk.com/access_token"
+# VK ID applications use OAuth 2.1 with PKCE.  The older oauth.vk.com flow
+# rejects these application IDs with "Security Error".
+VK_ID_AUTHORIZE_URL = "https://id.vk.com/authorize"
+VK_ID_TOKEN_URL = "https://id.vk.com/oauth2/auth"
 
 
 class VkOAuthConfigurationError(RuntimeError):
@@ -46,9 +49,9 @@ class VkOAuthSettings:
         client_id = os.getenv("VK_OAUTH_CLIENT_ID", "").strip()
         client_secret = os.getenv("VK_OAUTH_CLIENT_SECRET", "").strip()
         redirect_uri = os.getenv("VK_OAUTH_REDIRECT_URI", "").strip()
-        if not client_id or not client_secret or not redirect_uri:
+        if not client_id or not redirect_uri:
             raise VkOAuthConfigurationError(
-                "VK OAuth needs VK_OAUTH_CLIENT_ID, VK_OAUTH_CLIENT_SECRET and VK_OAUTH_REDIRECT_URI"
+                "VK OAuth needs VK_OAUTH_CLIENT_ID and VK_OAUTH_REDIRECT_URI"
             )
         parsed = urlparse(redirect_uri)
         if parsed.scheme != "https" or not parsed.netloc:
@@ -100,26 +103,32 @@ def _read_json(path: Path) -> dict[str, object]:
 def create_authorization_url(settings: VkOAuthSettings, *, now: datetime | None = None) -> str:
     current = now or datetime.now(timezone.utc)
     state = secrets.token_urlsafe(32)
+    code_verifier = secrets.token_urlsafe(64)
+    code_challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("utf-8")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
     _write_private_json(
         settings.state_path,
         {
             "state_sha256": hashlib.sha256(state.encode("utf-8")).hexdigest(),
             "expires_at": (current + timedelta(minutes=settings.state_ttl_minutes)).isoformat(),
             "worker_state": state,
+            "code_verifier": code_verifier,
         },
     )
     query = urlencode(
         {
             "client_id": settings.client_id,
             "redirect_uri": settings.redirect_uri,
-            "display": "page",
-            "scope": "groups",
             "response_type": "code",
             "state": state,
-            "v": settings.api_version,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "s256",
         }
     )
-    return f"{VK_AUTHORIZE_URL}?{query}"
+    return f"{VK_ID_AUTHORIZE_URL}?{query}"
 
 
 def _validate_state(settings: VkOAuthSettings, candidate: str, *, now: datetime | None = None) -> bool:
@@ -142,17 +151,26 @@ def exchange_authorization_code(
     settings: VkOAuthSettings,
     code: str,
     *,
+    state: str,
+    device_id: str,
+    code_verifier: str,
     opener: Callable[..., object] = urlopen,
 ) -> dict[str, object]:
-    body = urlencode(
+    query = urlencode(
         {
+            "grant_type": "authorization_code",
             "client_id": settings.client_id,
-            "client_secret": settings.client_secret,
             "redirect_uri": settings.redirect_uri,
-            "code": code,
+            "code_verifier": code_verifier,
+            "state": state,
+            "device_id": device_id,
         }
-    ).encode("utf-8")
-    request = Request(VK_TOKEN_URL, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    )
+    request = Request(
+        f"{VK_ID_TOKEN_URL}?{query}",
+        data=urlencode({"code": code}).encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
     try:
         with opener(request, timeout=20) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -164,15 +182,30 @@ def exchange_authorization_code(
     return payload
 
 
-def complete_authorization(settings: VkOAuthSettings, *, code: str, state: str) -> None:
+def complete_authorization(settings: VkOAuthSettings, *, code: str, state: str, device_id: str) -> None:
     if not _validate_state(settings, state):
         raise VkOAuthError("OAuth state is invalid or has expired; run /vk_connect again")
-    payload = exchange_authorization_code(settings, code)
+    stored = _read_json(settings.state_path)
+    code_verifier = str(stored.get("code_verifier", "")).strip()
+    if not code_verifier:
+        raise VkOAuthError("OAuth PKCE verifier is missing; run /vk_connect again")
+    if not device_id:
+        raise VkOAuthError("VK did not return a device ID; run /vk_connect again")
+    payload = exchange_authorization_code(
+        settings,
+        code,
+        state=state,
+        device_id=device_id,
+        code_verifier=code_verifier,
+    )
     _write_private_json(
         settings.credentials_path,
         {
             "access_token": str(payload["access_token"]),
             "user_id": payload.get("user_id"),
+            "refresh_token": payload.get("refresh_token"),
+            "expires_in": payload.get("expires_in"),
+            "device_id": device_id,
             "connected_at": datetime.now(timezone.utc).isoformat(),
         },
     )
@@ -227,10 +260,11 @@ def complete_worker_relay_authorization(
     if not isinstance(payload, dict):
         raise VkOAuthError("VK OAuth Worker relay returned invalid data")
     code = str(payload.get("code", "")).strip()
-    if not code:
-        raise VkOAuthError("VK OAuth Worker relay returned no authorization code")
+    device_id = str(payload.get("device_id", "")).strip()
+    if not code or not device_id:
+        raise VkOAuthError("VK OAuth Worker relay returned an incomplete authorization response")
 
-    complete_authorization(settings, code=code, state=state)
+    complete_authorization(settings, code=code, state=state, device_id=device_id)
     return True
 
 
@@ -252,13 +286,14 @@ def handler_factory(settings: VkOAuthSettings):
                 error = query.get("error", [""])[0]
                 code = query.get("code", [""])[0]
                 state = query.get("state", [""])[0]
+                device_id = query.get("device_id", [""])[0]
                 try:
                     if error:
                         description = query.get("error_description", [error])[0]
                         raise VkOAuthError(description)
                     if not code:
                         raise VkOAuthError("VK did not return an authorization code")
-                    complete_authorization(settings, code=code, state=state)
+                    complete_authorization(settings, code=code, state=state, device_id=device_id)
                     status, body = _page("BruceBet connected to VK", "Готово. Вернись в Telegram и используй /vk_status.")
                 except VkOAuthError as exc:
                     status, body = _page("VK connection was not completed", str(exc), status=400)

@@ -16,6 +16,7 @@ from brucebet.vk_oauth import (
     complete_authorization,
     complete_worker_relay_authorization,
     create_authorization_url,
+    exchange_authorization_code,
 )
 
 
@@ -120,9 +121,12 @@ class VkOAuthTests(unittest.TestCase):
                 api_version="5.199",
             )
             url = create_authorization_url(settings, now=datetime(2026, 8, 11, tzinfo=timezone.utc))
-            state = parse_qs(urlparse(url).query)["state"][0]
+            query = parse_qs(urlparse(url).query)
+            state = query["state"][0]
+            self.assertEqual(urlparse(url).netloc, "id.vk.com")
+            self.assertEqual(query["code_challenge_method"], ["s256"])
             with patch("brucebet.vk_oauth.exchange_authorization_code", return_value={"access_token": "stored-token", "user_id": 7}):
-                complete_authorization(settings, code="short-lived-code", state=state)
+                complete_authorization(settings, code="short-lived-code", state=state, device_id="device-123")
 
             self.assertEqual(load_server_access_token(settings.credentials_path), "stored-token")
             self.assertFalse(settings.state_path.exists())
@@ -139,6 +143,44 @@ class VkOAuthTests(unittest.TestCase):
         ):
             with self.assertRaises(VkOAuthConfigurationError):
                 VkOAuthSettings.from_env()
+
+    def test_vk_id_token_exchange_uses_pkce_and_device_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = VkOAuthSettings(
+                client_id="54715552",
+                client_secret="protected-key-is-not-sent-in-pkce",
+                redirect_uri="https://brucebet-vk-oauth.example.workers.dev/vk/oauth/callback",
+                credentials_path=root / "credentials.json",
+                state_path=root / "state.json",
+                state_ttl_minutes=15,
+                api_version="5.199",
+            )
+            captured = {}
+
+            def opener(request, **_kwargs):
+                captured["url"] = request.full_url
+                captured["body"] = request.data
+                return FakeBytesResponse(b'{"access_token":"stored-token","state":"state-123"}')
+
+            payload = exchange_authorization_code(
+                settings,
+                "short-lived-code",
+                state="state-123",
+                device_id="device-123",
+                code_verifier="verifier-123",
+                opener=opener,
+            )
+
+            query = parse_qs(urlparse(captured["url"]).query)
+            self.assertEqual(urlparse(captured["url"]).netloc, "id.vk.com")
+            self.assertEqual(urlparse(captured["url"]).path, "/oauth2/auth")
+            self.assertEqual(query["grant_type"], ["authorization_code"])
+            self.assertEqual(query["code_verifier"], ["verifier-123"])
+            self.assertEqual(query["device_id"], ["device-123"])
+            self.assertNotIn("client_secret", query)
+            self.assertEqual(captured["body"], b"code=short-lived-code")
+            self.assertEqual(payload["access_token"], "stored-token")
 
     def test_worker_relay_exchanges_pending_code_without_returning_a_token(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -160,7 +202,7 @@ class VkOAuthTests(unittest.TestCase):
             def opener(request, **_kwargs):
                 captured["url"] = request.full_url
                 captured["authorization"] = request.get_header("Authorization")
-                return FakeBytesResponse(b'{"code":"short-lived-code"}')
+                return FakeBytesResponse(b'{"code":"short-lived-code","device_id":"device-123"}')
 
             with patch("brucebet.vk_oauth.exchange_authorization_code", return_value={"access_token": "stored-token", "user_id": 7}):
                 self.assertTrue(complete_worker_relay_authorization(settings, opener=opener))

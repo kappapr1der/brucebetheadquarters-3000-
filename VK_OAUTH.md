@@ -2,8 +2,9 @@
 
 BruceBet reads only the configured EPL registration and prediction discussion
 IDs. It never posts to VK. The free Cloudflare Worker temporarily stores only a
-short-lived authorization code; the VPS alone exchanges that code and stores the
-VK access token in `data/vk_oauth_credentials.json` with mode `0600`.
+short-lived authorization code plus VK ID's `device_id`; the VPS alone exchanges
+them with PKCE and stores the VK access token in
+`data/vk_oauth_credentials.json` with mode `0600`.
 
 ## Cloudflare Worker Setup
 
@@ -36,9 +37,10 @@ VK_OAUTH_WORKER_RELAY_SECRET=<same random value as the Worker RELAY_SECRET>
 VK_OAUTH_WORKER_POLL_INTERVAL_SECONDS=15
 ```
 
-Keep `VK_OAUTH_CLIENT_ID` and `VK_OAUTH_CLIENT_SECRET` only on the VPS. In the
-VK application settings, set the exact same value of `VK_OAUTH_REDIRECT_URI` as
-the trusted Redirect URL.
+Set `VK_OAUTH_CLIENT_ID` on the VPS. VK ID's OAuth 2.1 PKCE exchange does not
+send the protected key; an existing `VK_OAUTH_CLIENT_SECRET` may remain in the
+server `.env` but is not required for this flow. In the VK application settings,
+set the exact same value of `VK_OAUTH_REDIRECT_URI` as the trusted Redirect URL.
 
 Restart only BruceBet:
 
