@@ -36,6 +36,9 @@ class VkOAuthSettings:
     state_path: Path
     state_ttl_minutes: int
     api_version: str
+    worker_url: str = ""
+    worker_relay_secret: str = ""
+    worker_timeout_seconds: int = 20
 
     @classmethod
     def from_env(cls) -> "VkOAuthSettings":
@@ -50,6 +53,19 @@ class VkOAuthSettings:
         parsed = urlparse(redirect_uri)
         if parsed.scheme != "https" or not parsed.netloc:
             raise VkOAuthConfigurationError("VK_OAUTH_REDIRECT_URI must be a public HTTPS URL")
+        worker_url = os.getenv("VK_OAUTH_WORKER_URL", "").strip().rstrip("/")
+        worker_relay_secret = os.getenv("VK_OAUTH_WORKER_RELAY_SECRET", "").strip()
+        if worker_url:
+            worker_parsed = urlparse(worker_url)
+            if worker_parsed.scheme != "https" or not worker_parsed.netloc or worker_parsed.query or worker_parsed.fragment:
+                raise VkOAuthConfigurationError("VK_OAUTH_WORKER_URL must be a public HTTPS Worker URL")
+            if not worker_relay_secret:
+                raise VkOAuthConfigurationError("VK_OAUTH_WORKER_RELAY_SECRET is required with VK_OAUTH_WORKER_URL")
+            expected_redirect = f"{worker_url}/vk/oauth/callback"
+            if redirect_uri.rstrip("/") != expected_redirect:
+                raise VkOAuthConfigurationError(
+                    "VK_OAUTH_REDIRECT_URI must be the Worker callback URL when VK_OAUTH_WORKER_URL is set"
+                )
         return cls(
             client_id=client_id,
             client_secret=client_secret,
@@ -58,6 +74,9 @@ class VkOAuthSettings:
             state_path=Path(os.getenv("VK_OAUTH_STATE_PATH", str(data_dir / "vk_oauth_state.json"))),
             state_ttl_minutes=max(5, int(os.getenv("VK_OAUTH_STATE_TTL_MINUTES", "15"))),
             api_version=os.getenv("VK_API_VERSION", "5.199").strip() or "5.199",
+            worker_url=worker_url,
+            worker_relay_secret=worker_relay_secret,
+            worker_timeout_seconds=max(5, int(os.getenv("VK_OAUTH_WORKER_TIMEOUT_SECONDS", "20"))),
         )
 
 
@@ -86,6 +105,7 @@ def create_authorization_url(settings: VkOAuthSettings, *, now: datetime | None 
         {
             "state_sha256": hashlib.sha256(state.encode("utf-8")).hexdigest(),
             "expires_at": (current + timedelta(minutes=settings.state_ttl_minutes)).isoformat(),
+            "worker_state": state,
         },
     )
     query = urlencode(
@@ -160,6 +180,58 @@ def complete_authorization(settings: VkOAuthSettings, *, code: str, state: str) 
         settings.state_path.unlink()
     except FileNotFoundError:
         pass
+
+
+def _pending_worker_state(settings: VkOAuthSettings) -> str:
+    stored = _read_json(settings.state_path)
+    candidate = str(stored.get("worker_state", "")).strip()
+    return candidate if _validate_state(settings, candidate) else ""
+
+
+def complete_worker_relay_authorization(
+    settings: VkOAuthSettings,
+    *,
+    opener: Callable[..., object] = urlopen,
+) -> bool:
+    """Exchange a short-lived code fetched from the optional Worker relay."""
+
+    if not settings.worker_url:
+        return False
+    state = _pending_worker_state(settings)
+    if not state:
+        return False
+
+    request = Request(
+        f"{settings.worker_url}/vk/oauth/pending?{urlencode({'state': state})}",
+        headers={
+            "Authorization": f"Bearer {settings.worker_relay_secret}",
+            "User-Agent": "BruceBet/3000",
+        },
+    )
+    try:
+        with opener(request, timeout=settings.worker_timeout_seconds) as response:
+            raw_payload = response.read()
+    except HTTPError as exc:
+        if exc.code == 404:
+            return False
+        raise VkOAuthError(f"VK OAuth Worker relay request failed with HTTP {exc.code}") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise VkOAuthError(f"VK OAuth Worker relay request failed: {exc}") from exc
+
+    if not raw_payload:
+        return False
+    try:
+        payload = json.loads(raw_payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise VkOAuthError("VK OAuth Worker relay returned invalid data") from exc
+    if not isinstance(payload, dict):
+        raise VkOAuthError("VK OAuth Worker relay returned invalid data")
+    code = str(payload.get("code", "")).strip()
+    if not code:
+        raise VkOAuthError("VK OAuth Worker relay returned no authorization code")
+
+    complete_authorization(settings, code=code, state=state)
+    return True
 
 
 def _page(title: str, body: str, status: int = 200) -> tuple[int, bytes]:

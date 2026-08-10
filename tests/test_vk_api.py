@@ -10,12 +10,32 @@ from urllib.parse import parse_qs, urlparse
 
 from brucebet.vk_api import VkApiClient, VkApiError, load_server_access_token
 from brucebet.vk_dry_run import VkComment, parse_api_topic_result
-from brucebet.vk_oauth import VkOAuthConfigurationError, VkOAuthSettings, complete_authorization, create_authorization_url
+from brucebet.vk_oauth import (
+    VkOAuthConfigurationError,
+    VkOAuthSettings,
+    complete_authorization,
+    complete_worker_relay_authorization,
+    create_authorization_url,
+)
 
 
 class FakeResponse:
     def __init__(self, payload: dict[str, object]) -> None:
         self._body = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
+
+
+class FakeBytesResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
 
     def __enter__(self):
         return self
@@ -118,6 +138,72 @@ class VkOAuthTests(unittest.TestCase):
             clear=True,
         ):
             with self.assertRaises(VkOAuthConfigurationError):
+                VkOAuthSettings.from_env()
+
+    def test_worker_relay_exchanges_pending_code_without_returning_a_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = VkOAuthSettings(
+                client_id="54715552",
+                client_secret="server-secret",
+                redirect_uri="https://brucebet-vk-oauth.example.workers.dev/vk/oauth/callback",
+                credentials_path=root / "credentials.json",
+                state_path=root / "state.json",
+                state_ttl_minutes=15,
+                api_version="5.199",
+                worker_url="https://brucebet-vk-oauth.example.workers.dev",
+                worker_relay_secret="relay-secret-that-is-long-enough",
+            )
+            create_authorization_url(settings)
+            captured = {}
+
+            def opener(request, **_kwargs):
+                captured["url"] = request.full_url
+                captured["authorization"] = request.get_header("Authorization")
+                return FakeBytesResponse(b'{"code":"short-lived-code"}')
+
+            with patch("brucebet.vk_oauth.exchange_authorization_code", return_value={"access_token": "stored-token", "user_id": 7}):
+                self.assertTrue(complete_worker_relay_authorization(settings, opener=opener))
+
+            self.assertEqual(captured["authorization"], "Bearer relay-secret-that-is-long-enough")
+            self.assertIn("/vk/oauth/pending?state=", captured["url"])
+            self.assertEqual(load_server_access_token(settings.credentials_path), "stored-token")
+            self.assertFalse(settings.state_path.exists())
+
+    def test_worker_relay_keeps_waiting_when_no_code_has_arrived(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = VkOAuthSettings(
+                client_id="54715552",
+                client_secret="server-secret",
+                redirect_uri="https://brucebet-vk-oauth.example.workers.dev/vk/oauth/callback",
+                credentials_path=root / "credentials.json",
+                state_path=root / "state.json",
+                state_ttl_minutes=15,
+                api_version="5.199",
+                worker_url="https://brucebet-vk-oauth.example.workers.dev",
+                worker_relay_secret="relay-secret-that-is-long-enough",
+            )
+            create_authorization_url(settings)
+
+            self.assertFalse(
+                complete_worker_relay_authorization(settings, opener=lambda *_args, **_kwargs: FakeBytesResponse(b""))
+            )
+            self.assertTrue(settings.state_path.exists())
+
+    def test_worker_configuration_requires_its_exact_callback_url(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "VK_OAUTH_CLIENT_ID": "54715552",
+                "VK_OAUTH_CLIENT_SECRET": "secret",
+                "VK_OAUTH_WORKER_URL": "https://brucebet-vk-oauth.example.workers.dev",
+                "VK_OAUTH_WORKER_RELAY_SECRET": "relay-secret-that-is-long-enough",
+                "VK_OAUTH_REDIRECT_URI": "https://wrong.example.test/vk/oauth/callback",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(VkOAuthConfigurationError, "must be the Worker callback URL"):
                 VkOAuthSettings.from_env()
 
 

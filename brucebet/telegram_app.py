@@ -109,7 +109,13 @@ from .variable_sync import VariableSyncResult, sync_match_assessments, sync_matc
 from .vk_board import VkAccessChallengeError, VkBrowserError, build_topic_url, probe_public_group_topics
 from .vk_api import VkApiError, VkApiNotConnectedError, read_api_topic_dry_run
 from .vk_dry_run import read_public_topic_dry_run
-from .vk_oauth import VkOAuthConfigurationError, VkOAuthSettings, create_authorization_url
+from .vk_oauth import (
+    VkOAuthConfigurationError,
+    VkOAuthError,
+    VkOAuthSettings,
+    complete_worker_relay_authorization,
+    create_authorization_url,
+)
 from .vk_parser import parse_file as parse_vk_file
 
 
@@ -154,6 +160,8 @@ class BotSettings:
     vk_api_credentials_path: Path
     vk_api_version: str
     vk_api_timeout_seconds: int
+    vk_oauth_worker_url: str
+    vk_oauth_worker_poll_interval_seconds: int
     vk_registration_sync_enabled: bool
     vk_registration_sync_interval_minutes: int
     vk_registration_sync_first_delay_seconds: int
@@ -220,6 +228,8 @@ def load_settings() -> BotSettings:
         ),
         vk_api_version=os.getenv("VK_API_VERSION", "5.199").strip() or "5.199",
         vk_api_timeout_seconds=int(os.getenv("VK_API_TIMEOUT_SECONDS", "20")),
+        vk_oauth_worker_url=os.getenv("VK_OAUTH_WORKER_URL", "").strip(),
+        vk_oauth_worker_poll_interval_seconds=int(os.getenv("VK_OAUTH_WORKER_POLL_INTERVAL_SECONDS", "15")),
         vk_registration_sync_enabled=parse_bool(
             os.getenv("VK_REGISTRATION_SYNC_ENABLED"),
             default=bool(os.getenv("VK_REGISTRATION_TOPIC_ID", "").strip()),
@@ -1375,9 +1385,39 @@ async def vk_connect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await send_text(
         update,
         "Открой эту одноразовую ссылку в течение 15 минут и подтверди доступ. "
-        "Ничего из адресной строки не копируй: VK сам вернет тебя на наш защищенный callback.\n\n"
+        "Ничего из адресной строки не копируй: Worker передаст только короткоживущий "
+        "код серверу, а бот сам сообщит, когда подключение будет готово.\n\n"
         + authorization_url,
     )
+
+
+def complete_vk_worker_oauth(settings: BotSettings) -> bool:
+    return complete_worker_relay_authorization(VkOAuthSettings.from_env())
+
+
+async def vk_oauth_worker_poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    try:
+        connected = await asyncio.to_thread(complete_vk_worker_oauth, settings)
+    except VkOAuthConfigurationError as exc:
+        LOGGER.warning("VK OAuth Worker relay is misconfigured: %s", exc)
+        return
+    except VkOAuthError as exc:
+        LOGGER.warning("VK OAuth Worker relay did not complete: %s", exc)
+        return
+    except Exception:  # noqa: BLE001 - a relay failure must not stop Telegram polling.
+        LOGGER.exception("VK OAuth Worker relay poll failed")
+        return
+    if not connected:
+        return
+    for chat_id in settings.allowed_chat_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="VK OAuth подключен. Теперь /vk_status проверит чтение двух EPL-тем через API.",
+            )
+        except Exception:  # noqa: BLE001 - connection succeeded even if this notification fails.
+            LOGGER.exception("Could not announce completed VK OAuth connection to chat=%s", chat_id)
 
 
 def vk_api_status_worker(settings: BotSettings) -> list[str]:
@@ -1415,6 +1455,12 @@ def vk_api_status_worker(settings: BotSettings) -> list[str]:
 @require_access
 async def vk_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = settings_from_context(context)
+    try:
+        if await asyncio.to_thread(complete_vk_worker_oauth, settings):
+            await send_text(update, "VK OAuth подключен. Проверяю две EPL-темы через VK API...")
+    except (VkOAuthConfigurationError, VkOAuthError) as exc:
+        await send_text(update, f"Не смог забрать результат VK OAuth из Worker: {exc}")
+        return
     await send_text(update, "Проверяю две EPL-темы через VK API...")
     lines = await asyncio.to_thread(vk_api_status_worker, settings)
     await send_text(update, "VK API status:\n" + "\n".join(lines))
@@ -2515,6 +2561,28 @@ def configure_vk_registration_sync(application: Application, settings: BotSettin
     LOGGER.info("VK registration sync scheduled every %s minutes", interval)
 
 
+def configure_vk_oauth_worker_poll(application: Application, settings: BotSettings) -> None:
+    if not settings.vk_oauth_worker_url:
+        return
+    if not os.getenv("VK_OAUTH_WORKER_RELAY_SECRET", "").strip():
+        LOGGER.warning("VK OAuth Worker URL is set, but VK_OAUTH_WORKER_RELAY_SECRET is empty")
+        return
+    if not settings.allowed_chat_ids:
+        LOGGER.warning("VK OAuth Worker relay is configured, but TELEGRAM_ALLOWED_CHAT_IDS is empty")
+        return
+    if application.job_queue is None:
+        LOGGER.warning("VK OAuth Worker relay requested, but JobQueue is not available")
+        return
+    interval = max(10, settings.vk_oauth_worker_poll_interval_seconds)
+    application.job_queue.run_repeating(
+        vk_oauth_worker_poll_job,
+        interval=timedelta(seconds=interval),
+        first=timedelta(seconds=10),
+        name="brucebet-vk-oauth-worker-relay",
+    )
+    LOGGER.info("VK OAuth Worker relay scheduled every %s seconds", interval)
+
+
 def build_application(settings: BotSettings) -> Application:
     application = ApplicationBuilder().token(settings.token).build()
     application.bot_data["settings"] = settings
@@ -2571,6 +2639,7 @@ def build_application(settings: BotSettings) -> Application:
     configure_deadline_reminders(application, settings)
     configure_vk_topic_discovery(application, settings)
     configure_vk_registration_sync(application, settings)
+    configure_vk_oauth_worker_poll(application, settings)
     return application
 
 
