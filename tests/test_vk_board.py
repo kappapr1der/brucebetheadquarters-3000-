@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import unittest
 
 from brucebet.vk_board import (
+    VkAccessChallengeError,
     build_topic_url,
     classify_topic,
     chromium_command,
@@ -103,6 +104,15 @@ class VkBoardTests(unittest.TestCase):
         result = probe_public_group_topics(217130885, runner=runner)
         self.assertEqual(len(result.topics), 1)
         self.assertEqual(seen_urls, ["https://vk.ru/club217130885?act=topics"])
+
+    def test_probe_rejects_vk_anti_bot_challenge(self) -> None:
+        html = "<html><head><title>Проверяем, что вы не робот</title></head></html>"
+
+        def runner(command, **kwargs):
+            return SimpleNamespace(returncode=0, stdout=html, stderr="")
+
+        with self.assertRaises(VkAccessChallengeError):
+            probe_public_topic(217130885, 12345678, runner=runner)
 
 
 if __name__ == "__main__":

@@ -28,10 +28,18 @@ EPL_TOPIC_RE = re.compile(r"\b(?:апл|английск\w*\s+премьер|pre
 NON_EPL_TOPIC_RE = re.compile(r"\b(?:рпл|российск\w*\s+премьер)\b", re.IGNORECASE)
 REGISTRATION_TOPIC_RE = re.compile(r"\b(?:регистрац\w*|заявк\w*|участник\w*|взнос\w*)\b", re.IGNORECASE)
 PREDICTIONS_TOPIC_RE = re.compile(r"\b(?:прогноз\w*|ставк\w*)\b", re.IGNORECASE)
+ACCESS_CHALLENGE_MARKERS = (
+    "Проверяем, что вы не робот",
+    "checking that you are not a robot",
+)
 
 
 class VkBrowserError(RuntimeError):
     pass
+
+
+class VkAccessChallengeError(VkBrowserError):
+    """VK returned an anti-bot challenge instead of the requested public page."""
 
 
 class _VisibleTextParser(HTMLParser):
@@ -253,6 +261,8 @@ def fetch_public_html(
         raise VkBrowserError(f"Chromium exited with code {returncode}: {detail or 'no stderr'}")
     if not stdout.strip():
         raise VkBrowserError("Chromium returned an empty VK page")
+    if any(marker.casefold() in stdout.casefold() for marker in ACCESS_CHALLENGE_MARKERS):
+        raise VkAccessChallengeError("VK returned an anti-bot challenge")
     return stdout
 
 

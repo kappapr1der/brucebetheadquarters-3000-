@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 from pathlib import Path
@@ -106,7 +106,7 @@ from .storage import (
     upsert_absence,
 )
 from .variable_sync import VariableSyncResult, sync_match_assessments, sync_match_contexts_and_factors, sync_match_variables
-from .vk_board import VkBrowserError, build_topic_url, probe_public_group_topics
+from .vk_board import VkAccessChallengeError, VkBrowserError, build_topic_url, probe_public_group_topics
 from .vk_dry_run import read_public_topic_dry_run
 from .vk_parser import parse_file as parse_vk_file
 
@@ -151,6 +151,7 @@ class BotSettings:
     vk_registration_sync_interval_minutes: int
     vk_registration_sync_first_delay_seconds: int
     vk_registration_browser_wait_ms: int
+    vk_challenge_alert_cooldown_minutes: int
     vk_topic_discovery_enabled: bool
     vk_topic_discovery_interval_minutes: int
     vk_topic_discovery_first_delay_seconds: int
@@ -216,6 +217,7 @@ def load_settings() -> BotSettings:
         vk_registration_browser_wait_ms=int(
             os.getenv("VK_REGISTRATION_BROWSER_WAIT_MS", os.getenv("VK_BROWSER_WAIT_MS", "8000"))
         ),
+        vk_challenge_alert_cooldown_minutes=int(os.getenv("VK_CHALLENGE_ALERT_COOLDOWN_MINUTES", "360")),
         vk_topic_discovery_enabled=parse_bool(os.getenv("VK_TOPIC_DISCOVERY_ENABLED")),
         vk_topic_discovery_interval_minutes=int(os.getenv("VK_TOPIC_DISCOVERY_INTERVAL_MINUTES", "30")),
         vk_topic_discovery_first_delay_seconds=int(os.getenv("VK_TOPIC_DISCOVERY_FIRST_DELAY_SECONDS", "20")),
@@ -1346,6 +1348,13 @@ async def vk_topics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await send_text(update, "Проверяю публичные обсуждения Forecasters Club...")
     try:
         result = await asyncio.to_thread(discover_vk_topics_worker, settings)
+    except VkAccessChallengeError:
+        await send_text(
+            update,
+            "VK временно показал антибот-проверку, а не список обсуждений. "
+            "Новые темы сейчас нельзя увидеть автоматически; пришли их прямую ссылку сюда.",
+        )
+        return
     except VkBrowserError as exc:
         await send_text(update, f"Публичная проверка VK не удалась: {exc}")
         return
@@ -2086,11 +2095,40 @@ def complete_vk_topic_alert_worker(settings: BotSettings, alert: object, error: 
         conn.close()
 
 
+async def notify_vk_access_challenge(context: ContextTypes.DEFAULT_TYPE, settings: BotSettings) -> None:
+    """Warn once per cooldown instead of silently treating a captcha as no topics."""
+
+    now = datetime.now(timezone.utc)
+    last_alert_at = context.application.bot_data.get("vk_access_challenge_last_alert_at")
+    cooldown = timedelta(minutes=max(5, settings.vk_challenge_alert_cooldown_minutes))
+    if isinstance(last_alert_at, datetime) and now - last_alert_at < cooldown:
+        return
+
+    text = (
+        "BruceBet: VK показал антибот-проверку вместо публичных обсуждений.\n"
+        "Автопоиск новых тем временно слеп; новые темы могут не попасть в уведомления.\n"
+        "Пришли прямую ссылку на тему в этот чат, и я подключу её отдельно."
+    )
+    delivered = False
+    for chat_id in settings.allowed_chat_ids:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+            delivered = True
+        except Exception as exc:  # noqa: BLE001 - one unreadable chat must not stop the bot.
+            LOGGER.warning("VK challenge alert failed chat=%s: %s", chat_id, exc)
+    if delivered:
+        context.application.bot_data["vk_access_challenge_last_alert_at"] = now
+
+
 async def vk_topic_discovery_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = settings_from_context(context)
     try:
         result = await asyncio.to_thread(discover_vk_topics_worker, settings)
         baseline, alerts = await asyncio.to_thread(record_vk_topic_discovery_worker, settings, result)
+    except VkAccessChallengeError:
+        LOGGER.warning("VK topic discovery hit an anti-bot challenge")
+        await notify_vk_access_challenge(context, settings)
+        return
     except Exception:  # noqa: BLE001 - a public page change must not stop the bot.
         LOGGER.exception("VK topic discovery failed")
         return
@@ -2190,6 +2228,10 @@ async def vk_registration_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         report = await asyncio.to_thread(read_vk_registration_worker, settings)
         alerts = await asyncio.to_thread(record_vk_registration_worker, settings, report)
+    except VkAccessChallengeError:
+        LOGGER.warning("VK registration sync hit an anti-bot challenge")
+        await notify_vk_access_challenge(context, settings)
+        return
     except Exception:  # noqa: BLE001 - VK changes must not stop the bot.
         LOGGER.exception("VK registration sync failed")
         return
