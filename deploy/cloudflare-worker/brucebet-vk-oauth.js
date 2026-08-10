@@ -47,7 +47,7 @@ export default {
       const code = url.searchParams.get("code") || "";
       const state = url.searchParams.get("state") || "";
       const deviceId = url.searchParams.get("device_id") || "";
-      if (!code || !deviceId || !STATE_PATTERN.test(state)) {
+      if (!code || !STATE_PATTERN.test(state)) {
         return htmlPage(
           "VK connection was not completed",
           "VK did not return a valid authorization response. Return to Telegram and run /vk_connect again.",
@@ -57,7 +57,7 @@ export default {
       try {
         await env.OAUTH_CODES.put(
           state,
-          JSON.stringify({ code, device_id: deviceId, receivedAt: new Date().toISOString() }),
+          JSON.stringify({ code, device_id: deviceId || null, receivedAt: new Date().toISOString() }),
           { expirationTtl: TTL_SECONDS },
         );
       } catch {
@@ -87,10 +87,10 @@ export default {
       const pending = await env.OAUTH_CODES.get(state, "json");
       const code = pending && typeof pending.code === "string" ? pending.code : "";
       const deviceId = pending && typeof pending.device_id === "string" ? pending.device_id : "";
-      if (!code || !deviceId) {
+      if (!code) {
         return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
       }
-      return Response.json({ code, device_id: deviceId }, { headers: { "cache-control": "no-store" } });
+      return Response.json({ code, device_id: deviceId || null }, { headers: { "cache-control": "no-store" } });
     }
 
     return new Response("Not found", { status: 404, headers: { "cache-control": "no-store" } });

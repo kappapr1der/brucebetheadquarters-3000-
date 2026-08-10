@@ -20,6 +20,8 @@ from urllib.request import Request, urlopen
 # rejects these application IDs with "Security Error".
 VK_ID_AUTHORIZE_URL = "https://id.vk.com/authorize"
 VK_ID_TOKEN_URL = "https://id.vk.com/oauth2/auth"
+VK_LEGACY_AUTHORIZE_URL = "https://oauth.vk.com/authorize"
+VK_LEGACY_TOKEN_URL = "https://oauth.vk.com/access_token"
 
 
 class VkOAuthConfigurationError(RuntimeError):
@@ -39,6 +41,8 @@ class VkOAuthSettings:
     state_path: Path
     state_ttl_minutes: int
     api_version: str
+    provider: str = "vk_id"
+    legacy_scope: str = "groups"
     worker_url: str = ""
     worker_relay_secret: str = ""
     worker_timeout_seconds: int = 20
@@ -49,10 +53,15 @@ class VkOAuthSettings:
         client_id = os.getenv("VK_OAUTH_CLIENT_ID", "").strip()
         client_secret = os.getenv("VK_OAUTH_CLIENT_SECRET", "").strip()
         redirect_uri = os.getenv("VK_OAUTH_REDIRECT_URI", "").strip()
+        provider = os.getenv("VK_OAUTH_PROVIDER", "vk_id").strip().lower() or "vk_id"
         if not client_id or not redirect_uri:
             raise VkOAuthConfigurationError(
                 "VK OAuth needs VK_OAUTH_CLIENT_ID and VK_OAUTH_REDIRECT_URI"
             )
+        if provider not in {"vk_id", "legacy"}:
+            raise VkOAuthConfigurationError("VK_OAUTH_PROVIDER must be vk_id or legacy")
+        if provider == "legacy" and not client_secret:
+            raise VkOAuthConfigurationError("VK_OAUTH_CLIENT_SECRET is required for legacy VK OAuth")
         parsed = urlparse(redirect_uri)
         if parsed.scheme != "https" or not parsed.netloc:
             raise VkOAuthConfigurationError("VK_OAUTH_REDIRECT_URI must be a public HTTPS URL")
@@ -77,6 +86,8 @@ class VkOAuthSettings:
             state_path=Path(os.getenv("VK_OAUTH_STATE_PATH", str(data_dir / "vk_oauth_state.json"))),
             state_ttl_minutes=max(5, int(os.getenv("VK_OAUTH_STATE_TTL_MINUTES", "15"))),
             api_version=os.getenv("VK_API_VERSION", "5.199").strip() or "5.199",
+            provider=provider,
+            legacy_scope=os.getenv("VK_OAUTH_LEGACY_SCOPE", "groups").strip() or "groups",
             worker_url=worker_url,
             worker_relay_secret=worker_relay_secret,
             worker_timeout_seconds=max(5, int(os.getenv("VK_OAUTH_WORKER_TIMEOUT_SECONDS", "20"))),
@@ -103,21 +114,34 @@ def _read_json(path: Path) -> dict[str, object]:
 def create_authorization_url(settings: VkOAuthSettings, *, now: datetime | None = None) -> str:
     current = now or datetime.now(timezone.utc)
     state = secrets.token_urlsafe(32)
+    state_payload: dict[str, object] = {
+        "state_sha256": hashlib.sha256(state.encode("utf-8")).hexdigest(),
+        "expires_at": (current + timedelta(minutes=settings.state_ttl_minutes)).isoformat(),
+        "worker_state": state,
+    }
+    if settings.provider == "legacy":
+        query = urlencode(
+            {
+                "client_id": settings.client_id,
+                "redirect_uri": settings.redirect_uri,
+                "display": "page",
+                "scope": settings.legacy_scope,
+                "response_type": "code",
+                "state": state,
+                "v": settings.api_version,
+            }
+        )
+        _write_private_json(settings.state_path, state_payload)
+        return f"{VK_LEGACY_AUTHORIZE_URL}?{query}"
+
     code_verifier = secrets.token_urlsafe(64)
     code_challenge = (
         base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("utf-8")).digest())
         .rstrip(b"=")
         .decode("ascii")
     )
-    _write_private_json(
-        settings.state_path,
-        {
-            "state_sha256": hashlib.sha256(state.encode("utf-8")).hexdigest(),
-            "expires_at": (current + timedelta(minutes=settings.state_ttl_minutes)).isoformat(),
-            "worker_state": state,
-            "code_verifier": code_verifier,
-        },
-    )
+    state_payload["code_verifier"] = code_verifier
+    _write_private_json(settings.state_path, state_payload)
     query = urlencode(
         {
             "client_id": settings.client_id,
@@ -152,10 +176,28 @@ def exchange_authorization_code(
     code: str,
     *,
     state: str,
-    device_id: str,
-    code_verifier: str,
+    device_id: str = "",
+    code_verifier: str = "",
     opener: Callable[..., object] = urlopen,
 ) -> dict[str, object]:
+    if settings.provider == "legacy":
+        body = urlencode(
+            {
+                "client_id": settings.client_id,
+                "client_secret": settings.client_secret,
+                "redirect_uri": settings.redirect_uri,
+                "code": code,
+            }
+        ).encode("utf-8")
+        request = Request(
+            VK_LEGACY_TOKEN_URL,
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        return _read_token_exchange_response(request, opener=opener)
+
+    if not code_verifier or not device_id:
+        raise VkOAuthError("VK ID token exchange needs a PKCE verifier and device ID")
     query = urlencode(
         {
             "grant_type": "authorization_code",
@@ -171,6 +213,14 @@ def exchange_authorization_code(
         data=urlencode({"code": code}).encode("utf-8"),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
+    return _read_token_exchange_response(request, opener=opener)
+
+
+def _read_token_exchange_response(
+    request: Request,
+    *,
+    opener: Callable[..., object],
+) -> dict[str, object]:
     try:
         with opener(request, timeout=20) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -187,9 +237,9 @@ def complete_authorization(settings: VkOAuthSettings, *, code: str, state: str, 
         raise VkOAuthError("OAuth state is invalid or has expired; run /vk_connect again")
     stored = _read_json(settings.state_path)
     code_verifier = str(stored.get("code_verifier", "")).strip()
-    if not code_verifier:
+    if settings.provider == "vk_id" and not code_verifier:
         raise VkOAuthError("OAuth PKCE verifier is missing; run /vk_connect again")
-    if not device_id:
+    if settings.provider == "vk_id" and not device_id:
         raise VkOAuthError("VK did not return a device ID; run /vk_connect again")
     payload = exchange_authorization_code(
         settings,
@@ -205,7 +255,7 @@ def complete_authorization(settings: VkOAuthSettings, *, code: str, state: str, 
             "user_id": payload.get("user_id"),
             "refresh_token": payload.get("refresh_token"),
             "expires_in": payload.get("expires_in"),
-            "device_id": device_id,
+            "device_id": device_id or None,
             "connected_at": datetime.now(timezone.utc).isoformat(),
         },
     )

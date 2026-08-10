@@ -6,6 +6,18 @@ short-lived authorization code plus VK ID's `device_id`; the VPS alone exchanges
 them with PKCE and stores the VK access token in
 `data/vk_oauth_credentials.json` with mode `0600`.
 
+## Choosing The VK Application
+
+The modern **Site** / VK ID application signs a person in, but its `vk2.a.*`
+token is not accepted by `board.getComments` and returns VK error `1051`.
+For the two discussion topics, create a **Standalone application** in the VK
+developer panel instead. BruceBet supports both flows:
+
+- `VK_OAUTH_PROVIDER=vk_id` is retained for VK ID sign-in and uses PKCE.
+- `VK_OAUTH_PROVIDER=legacy` uses the classic VK API authorization-code flow.
+  It requires the Standalone application's ID and secure key, and requests the
+  `groups` scope needed for the read-only board API.
+
 ## Cloudflare Worker Setup
 
 Use the existing Worker URL, for example
@@ -37,10 +49,17 @@ VK_OAUTH_WORKER_RELAY_SECRET=<same random value as the Worker RELAY_SECRET>
 VK_OAUTH_WORKER_POLL_INTERVAL_SECONDS=15
 ```
 
-Set `VK_OAUTH_CLIENT_ID` on the VPS. VK ID's OAuth 2.1 PKCE exchange does not
-send the protected key; an existing `VK_OAUTH_CLIENT_SECRET` may remain in the
-server `.env` but is not required for this flow. In the VK application settings,
-set the exact same value of `VK_OAUTH_REDIRECT_URI` as the trusted Redirect URL.
+For a Standalone application, also set:
+
+```dotenv
+VK_OAUTH_PROVIDER=legacy
+VK_OAUTH_CLIENT_ID=<Standalone application ID>
+VK_OAUTH_CLIENT_SECRET=<Standalone secure key>
+VK_OAUTH_LEGACY_SCOPE=groups
+```
+
+In the VK application settings, set the exact same value of
+`VK_OAUTH_REDIRECT_URI` as the trusted Redirect URL.
 
 Restart only BruceBet:
 

@@ -182,6 +182,42 @@ class VkOAuthTests(unittest.TestCase):
             self.assertEqual(captured["body"], b"code=short-lived-code")
             self.assertEqual(payload["access_token"], "stored-token")
 
+    def test_legacy_authorization_code_flow_uses_standalone_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = VkOAuthSettings(
+                client_id="standalone-id",
+                client_secret="standalone-secure-key",
+                redirect_uri="https://brucebet-vk-oauth.example.workers.dev/vk/oauth/callback",
+                credentials_path=root / "credentials.json",
+                state_path=root / "state.json",
+                state_ttl_minutes=15,
+                api_version="5.199",
+                provider="legacy",
+            )
+            url = create_authorization_url(settings)
+            query = parse_qs(urlparse(url).query)
+            self.assertEqual(urlparse(url).netloc, "oauth.vk.com")
+            self.assertEqual(query["scope"], ["groups"])
+            captured = {}
+
+            def opener(request, **_kwargs):
+                captured["url"] = request.full_url
+                captured["body"] = request.data
+                return FakeBytesResponse(b'{"access_token":"legacy-token","user_id":7}')
+
+            payload = exchange_authorization_code(
+                settings,
+                "short-lived-code",
+                state=query["state"][0],
+                opener=opener,
+            )
+
+            self.assertEqual(captured["url"], "https://oauth.vk.com/access_token")
+            body = parse_qs(captured["body"].decode("utf-8"))
+            self.assertEqual(body["client_secret"], ["standalone-secure-key"])
+            self.assertEqual(payload["access_token"], "legacy-token")
+
     def test_worker_relay_exchanges_pending_code_without_returning_a_token(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
