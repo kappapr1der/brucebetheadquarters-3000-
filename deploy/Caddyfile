@@ -1,4 +1,4 @@
-8412675-hk474154.twc1.net {
+{$VK_OAUTH_PUBLIC_HOST} {
     encode zstd gzip
 
     @vk_oauth path /vk/oauth/*

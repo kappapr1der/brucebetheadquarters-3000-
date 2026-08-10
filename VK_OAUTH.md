@@ -7,7 +7,7 @@ neither the code nor the access token is copied through Telegram or Git.
 ## One-Time Server Setup
 
 1. In VK application `54715552`, configure the redirect URI:
-   `https://8412675-hk474154.twc1.net/vk/oauth/callback`
+   `https://brucebet-hq-2026.duckdns.org/vk/oauth/callback`
 2. Put the application's secure key directly in `/opt/brucebet-3000/.env` as
    `VK_OAUTH_CLIENT_SECRET`. Keep `VK_OAUTH_CLIENT_ID=54715552` and the redirect
    URI from `.env.example`.
@@ -22,7 +22,7 @@ neither the code nor the access token is copied through Telegram or Git.
 
    Caddy serves `/opt/jl105-clan-site` as before and handles HTTPS plus only
    `/vk/oauth/*` for the private callback.
-4. Confirm that `https://8412675-hk474154.twc1.net/vk/oauth/healthz` returns
+4. Confirm that `https://brucebet-hq-2026.duckdns.org/vk/oauth/healthz` returns
    a small `ok` page.
 5. In the allowed Telegram chat, run `/vk_connect`, open the generated link,
    and confirm access in VK. The link expires after 15 minutes.
