@@ -323,6 +323,7 @@ def probe_public_group_topics(
 ) -> VkGroupTopicsResult:
     failures: list[str] = []
     first_success: tuple[str, str] | None = None
+    access_challenge_detected = False
     for url in build_group_topics_urls(group_id):
         try:
             html = fetch_public_html(
@@ -332,6 +333,10 @@ def probe_public_group_topics(
                 timeout=timeout,
                 runner=runner,
             )
+        except VkAccessChallengeError as exc:
+            access_challenge_detected = True
+            failures.append(str(exc))
+            continue
         except VkBrowserError as exc:
             failures.append(str(exc))
             continue
@@ -347,6 +352,8 @@ def probe_public_group_topics(
                 topics=topics,
             )
 
+    if access_challenge_detected:
+        raise VkAccessChallengeError("VK returned an anti-bot challenge while loading the public topic list")
     if first_success is None:
         detail = " | ".join(failures[-2:]) or "no successful public group page"
         raise VkBrowserError(f"VK group topic discovery failed: {detail}")

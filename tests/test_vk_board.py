@@ -114,6 +114,15 @@ class VkBoardTests(unittest.TestCase):
         with self.assertRaises(VkAccessChallengeError):
             probe_public_topic(217130885, 12345678, runner=runner)
 
+    def test_group_discovery_propagates_vk_anti_bot_challenge(self) -> None:
+        html = "<html><head><title>Проверяем, что вы не робот</title></head></html>"
+
+        def runner(command, **kwargs):
+            return SimpleNamespace(returncode=0, stdout=html, stderr="")
+
+        with self.assertRaises(VkAccessChallengeError):
+            probe_public_group_topics(217130885, runner=runner)
+
 
 if __name__ == "__main__":
     unittest.main()
