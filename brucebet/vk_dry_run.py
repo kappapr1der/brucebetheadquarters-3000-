@@ -340,12 +340,18 @@ def _title(lines: list[str]) -> str:
     return lines[0] if lines else ""
 
 
-def parse_public_topic_result(result: VkPublicTopicResult, topic_kind: TopicKind) -> VkTopicDryRunReport:
-    """Build a structured report from a public topic without opening SQLite."""
-
-    lines = _clean_lines(result.text)
+def _parse_topic(
+    *,
+    group_id: int,
+    topic_id: int,
+    url: str,
+    title: str,
+    source_text: str,
+    topic_kind: TopicKind,
+    comments: tuple[VkComment, ...],
+) -> VkTopicDryRunReport:
+    lines = _clean_lines(source_text)
     templates = tuple(parse_templates(lines))
-    comments = tuple(parse_comment_blocks(result.text, group_id=result.group_id, topic_id=result.topic_id))
     warnings: list[str] = []
     forecast_submissions: list[VkForecastSubmission] = []
     registration_entries: list[VkRegistrationEntry] = []
@@ -386,26 +392,69 @@ def parse_public_topic_result(result: VkPublicTopicResult, topic_kind: TopicKind
         if not registration_entries:
             warnings.append("no registration comments were recognized")
 
-    league_hint = _league_hint(result.text)
+    league_hint = _league_hint(source_text)
     if league_hint != "epl":
         warnings.append("non-EPL or unknown topic: dry-run is allowed, future ingestion must stay disabled")
 
     return VkTopicDryRunReport(
         topic_kind=topic_kind,
-        group_id=result.group_id,
-        topic_id=result.topic_id,
-        url=result.url,
+        group_id=group_id,
+        topic_id=topic_id,
+        url=url,
         captured_at=datetime.now(timezone.utc),
-        content_fingerprint=sha256(result.text.encode("utf-8")).hexdigest(),
-        title=_title(lines),
+        content_fingerprint=sha256(source_text.encode("utf-8")).hexdigest(),
+        title=title or _title(lines),
         league_hint=league_hint,
         comments=comments,
         templates=templates,
         forecast_submissions=tuple(forecast_submissions),
         registration_entries=tuple(registration_entries),
-        registration_state=_registration_state(result.text),
-        final_roster_detected=bool(FINAL_ROSTER_RE.search(result.text)),
+        registration_state=_registration_state(source_text),
+        final_roster_detected=bool(FINAL_ROSTER_RE.search(source_text)),
         warnings=tuple(warnings),
+    )
+
+
+def parse_public_topic_result(result: VkPublicTopicResult, topic_kind: TopicKind) -> VkTopicDryRunReport:
+    """Build a structured report from a public topic without opening SQLite."""
+
+    return _parse_topic(
+        group_id=result.group_id,
+        topic_id=result.topic_id,
+        url=result.url,
+        title=_title(_clean_lines(result.text)),
+        source_text=result.text,
+        topic_kind=topic_kind,
+        comments=tuple(parse_comment_blocks(result.text, group_id=result.group_id, topic_id=result.topic_id)),
+    )
+
+
+def parse_api_topic_result(
+    *,
+    group_id: int,
+    topic_id: int,
+    url: str,
+    title: str,
+    topic_kind: TopicKind,
+    comments: tuple[VkComment, ...],
+) -> VkTopicDryRunReport:
+    """Parse VK API comments with the same rules as public Chromium output.
+
+    The comment objects retain their immutable VK comment IDs as source keys,
+    while the shared parser still owns template, score, fee and league logic.
+    """
+
+    source_lines = [title]
+    for comment in comments:
+        source_lines.extend(comment.body_lines)
+    return _parse_topic(
+        group_id=group_id,
+        topic_id=topic_id,
+        url=url,
+        title=title,
+        source_text="\n".join(line for line in source_lines if line),
+        topic_kind=topic_kind,
+        comments=comments,
     )
 
 

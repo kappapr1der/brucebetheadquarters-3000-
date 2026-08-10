@@ -107,7 +107,9 @@ from .storage import (
 )
 from .variable_sync import VariableSyncResult, sync_match_assessments, sync_match_contexts_and_factors, sync_match_variables
 from .vk_board import VkAccessChallengeError, VkBrowserError, build_topic_url, probe_public_group_topics
+from .vk_api import VkApiError, VkApiNotConnectedError, read_api_topic_dry_run
 from .vk_dry_run import read_public_topic_dry_run
+from .vk_oauth import VkOAuthConfigurationError, VkOAuthSettings, create_authorization_url
 from .vk_parser import parse_file as parse_vk_file
 
 
@@ -147,6 +149,11 @@ class BotSettings:
     reminder_grace_minutes: int
     vk_group_id: int
     vk_registration_topic_id: int
+    vk_predictions_topic_id: int
+    vk_api_read_enabled: bool
+    vk_api_credentials_path: Path
+    vk_api_version: str
+    vk_api_timeout_seconds: int
     vk_registration_sync_enabled: bool
     vk_registration_sync_interval_minutes: int
     vk_registration_sync_first_delay_seconds: int
@@ -206,6 +213,13 @@ def load_settings() -> BotSettings:
         reminder_grace_minutes=int(os.getenv("BRUCEBET_REMINDER_GRACE_MINUTES", "35")),
         vk_group_id=int(os.getenv("VK_GROUP_ID", "217130885")),
         vk_registration_topic_id=int(os.getenv("VK_REGISTRATION_TOPIC_ID", "0")),
+        vk_predictions_topic_id=int(os.getenv("VK_PREDICTIONS_TOPIC_ID", "0")),
+        vk_api_read_enabled=parse_bool(os.getenv("VK_API_READ_ENABLED"), default=True),
+        vk_api_credentials_path=Path(
+            os.getenv("VK_OAUTH_CREDENTIALS_PATH", str(Path(os.getenv("BRUCEBET_DATA_DIR", "data")) / "vk_oauth_credentials.json"))
+        ),
+        vk_api_version=os.getenv("VK_API_VERSION", "5.199").strip() or "5.199",
+        vk_api_timeout_seconds=int(os.getenv("VK_API_TIMEOUT_SECONDS", "20")),
         vk_registration_sync_enabled=parse_bool(
             os.getenv("VK_REGISTRATION_SYNC_ENABLED"),
             default=bool(os.getenv("VK_REGISTRATION_TOPIC_ID", "").strip()),
@@ -871,6 +885,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/odds <матч> - последние сохранённые кэфы",
                 "/quota - остаток кредитов The Odds API",
                 "/sources - проверить все источники данных",
+                "/vk_connect - выдать одноразовую безопасную ссылку для подключения VK",
+                "/vk_status - проверить чтение двух EPL-тем через VK API",
+                "/vk_topics - резервная публичная проверка новых обсуждений",
                 "/sync_fixtures - подтянуть официальный календарь PL",
                 "/sync_odds - подтянуть кэфы The Odds API в базу",
                 "/risk [тур] - риск-карта тура",
@@ -1340,6 +1357,67 @@ async def sources_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         render_source_checks(checks),
     ]
     await send_text(update, "\n".join(lines))
+
+
+@require_access
+async def vk_connect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        oauth_settings = VkOAuthSettings.from_env()
+        authorization_url = await asyncio.to_thread(create_authorization_url, oauth_settings)
+    except VkOAuthConfigurationError as exc:
+        await send_text(update, f"VK OAuth пока не настроен на сервере: {exc}")
+        return
+    except Exception:  # noqa: BLE001 - do not expose OAuth internals in Telegram.
+        LOGGER.exception("VK OAuth link creation failed")
+        await send_text(update, "Не смог подготовить безопасную VK-ссылку. Проверь логи OAuth-сервиса.")
+        return
+
+    await send_text(
+        update,
+        "Открой эту одноразовую ссылку в течение 15 минут и подтверди доступ. "
+        "Ничего из адресной строки не копируй: VK сам вернет тебя на наш защищенный callback.\n\n"
+        + authorization_url,
+    )
+
+
+def vk_api_status_worker(settings: BotSettings) -> list[str]:
+    if not settings.vk_api_read_enabled:
+        return ["VK API reader отключен переменной VK_API_READ_ENABLED=0."]
+
+    topic_specs = [
+        ("Регистрация", settings.vk_registration_topic_id, "registration", "Premier League registration"),
+        ("Прогнозы", settings.vk_predictions_topic_id, "predictions", "Premier League predictions"),
+    ]
+    lines: list[str] = []
+    for label, topic_id, topic_kind, title in topic_specs:
+        if topic_id <= 0:
+            lines.append(f"{label}: topic ID не задан.")
+            continue
+        try:
+            report = read_api_topic_dry_run(
+                credentials_path=settings.vk_api_credentials_path,
+                group_id=settings.vk_group_id,
+                topic_id=topic_id,
+                topic_kind=topic_kind,
+                title=title,
+                api_version=settings.vk_api_version,
+                timeout=settings.vk_api_timeout_seconds,
+            )
+        except VkApiNotConnectedError:
+            return ["VK OAuth пока не подключен. Используй /vk_connect после настройки callback."]
+        except VkApiError as exc:
+            lines.append(f"{label}: API не дал прочитать тему ({exc}).")
+            continue
+        lines.append(f"{label}: API читает {len(report.comments)} комментариев.")
+    return lines
+
+
+@require_access
+async def vk_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    await send_text(update, "Проверяю две EPL-темы через VK API...")
+    lines = await asyncio.to_thread(vk_api_status_worker, settings)
+    await send_text(update, "VK API status:\n" + "\n".join(lines))
 
 
 @require_access
@@ -2159,13 +2237,44 @@ async def vk_topic_discovery_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             await asyncio.to_thread(complete_vk_topic_alert_worker, settings, alert)
 
 
-def read_vk_registration_worker(settings: BotSettings):
-    topic_url = build_topic_url(settings.vk_group_id, settings.vk_registration_topic_id)
-    report = read_public_topic_dry_run(
+def read_vk_topic_worker(
+    settings: BotSettings,
+    *,
+    topic_id: int,
+    topic_kind: str,
+    title: str,
+):
+    if settings.vk_api_read_enabled:
+        try:
+            return read_api_topic_dry_run(
+                credentials_path=settings.vk_api_credentials_path,
+                group_id=settings.vk_group_id,
+                topic_id=topic_id,
+                topic_kind=topic_kind,
+                title=title,
+                api_version=settings.vk_api_version,
+                timeout=settings.vk_api_timeout_seconds,
+            )
+        except VkApiNotConnectedError:
+            pass
+        except VkApiError as exc:
+            LOGGER.warning("VK API read failed topic=%s; trying public reader: %s", topic_id, exc)
+
+    topic_url = build_topic_url(settings.vk_group_id, topic_id)
+    return read_public_topic_dry_run(
         topic_url,
-        "registration",
+        topic_kind,
         chromium_bin=settings.vk_chromium_bin,
         wait_ms=settings.vk_registration_browser_wait_ms,
+    )
+
+
+def read_vk_registration_worker(settings: BotSettings):
+    report = read_vk_topic_worker(
+        settings,
+        topic_id=settings.vk_registration_topic_id,
+        topic_kind="registration",
+        title="Premier League registration",
     )
     if report.league_hint != "epl":
         raise ValueError(f"registration topic failed EPL gate: {report.league_hint}")
@@ -2426,6 +2535,8 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("odds", odds_cmd))
     application.add_handler(CommandHandler("quota", quota_cmd))
     application.add_handler(CommandHandler("sources", sources_cmd))
+    application.add_handler(CommandHandler("vk_connect", vk_connect_cmd))
+    application.add_handler(CommandHandler("vk_status", vk_status_cmd))
     application.add_handler(CommandHandler("vk_topics", vk_topics_cmd))
     application.add_handler(CommandHandler("sync_fixtures", sync_fixtures_cmd))
     application.add_handler(CommandHandler("sync_results", sync_results_cmd))

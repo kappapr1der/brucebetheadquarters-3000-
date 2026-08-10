@@ -1,0 +1,9 @@
+8412675-hk474154.twc1.net {
+    encode zstd gzip
+
+    @vk_oauth path /vk/oauth/*
+    reverse_proxy @vk_oauth vk-oauth:8090
+
+    root * /srv
+    file_server
+}
