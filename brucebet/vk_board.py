@@ -26,7 +26,7 @@ TOPIC_HREF_RE = re.compile(
 )
 EPL_TOPIC_RE = re.compile(r"\b(?:апл|английск\w*\s+премьер|premier\s+league)\b", re.IGNORECASE)
 NON_EPL_TOPIC_RE = re.compile(r"\b(?:рпл|российск\w*\s+премьер)\b", re.IGNORECASE)
-REGISTRATION_TOPIC_RE = re.compile(r"\b(?:регистрац\w*|участник\w*|взнос\w*)\b", re.IGNORECASE)
+REGISTRATION_TOPIC_RE = re.compile(r"\b(?:регистрац\w*|заявк\w*|участник\w*|взнос\w*)\b", re.IGNORECASE)
 PREDICTIONS_TOPIC_RE = re.compile(r"\b(?:прогноз\w*|ставк\w*)\b", re.IGNORECASE)
 
 

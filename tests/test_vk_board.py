@@ -89,6 +89,7 @@ class VkBoardTests(unittest.TestCase):
         self.assertEqual((topics[1].league_hint, topics[1].topic_kind), ("epl", "registration"))
         self.assertTrue(topics[2].is_epl_candidate)
         self.assertFalse(topics[0].is_epl_candidate)
+        self.assertEqual(classify_topic("Заявка на участие в прогнозах АПЛ 2026/2027"), ("registration", "epl"))
         self.assertEqual(classify_topic("Что-то ещё"), ("other", "unknown"))
 
     def test_group_discovery_uses_public_topics_page_before_group_home(self) -> None:
