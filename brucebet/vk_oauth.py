@@ -171,7 +171,7 @@ def handler_factory(settings: VkOAuthSettings):
     class VkOAuthHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
             parsed = urlparse(self.path)
-            if parsed.path == "/healthz":
+            if parsed.path in {"/healthz", "/vk/oauth/healthz"}:
                 status, body = _page("ok", "VK OAuth callback is ready")
             elif parsed.path != "/vk/oauth/callback":
                 status, body = _page("Not found", "Unknown route", status=404)
