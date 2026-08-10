@@ -97,13 +97,17 @@ from .storage import (
     manual_result_history,
     mark_vk_topic_alert_failed,
     mark_vk_topic_alert_sent,
+    mark_vk_registration_alert_failed,
+    mark_vk_registration_alert_sent,
+    record_vk_registration_entries,
     record_vk_topic_discovery,
     set_manual_prediction_override,
     set_manual_match_result,
     upsert_absence,
 )
 from .variable_sync import VariableSyncResult, sync_match_assessments, sync_match_contexts_and_factors, sync_match_variables
-from .vk_board import VkBrowserError, probe_public_group_topics
+from .vk_board import VkBrowserError, build_topic_url, probe_public_group_topics
+from .vk_dry_run import read_public_topic_dry_run
 from .vk_parser import parse_file as parse_vk_file
 
 
@@ -142,6 +146,11 @@ class BotSettings:
     reminder_interval_minutes: int
     reminder_grace_minutes: int
     vk_group_id: int
+    vk_registration_topic_id: int
+    vk_registration_sync_enabled: bool
+    vk_registration_sync_interval_minutes: int
+    vk_registration_sync_first_delay_seconds: int
+    vk_registration_browser_wait_ms: int
     vk_topic_discovery_enabled: bool
     vk_topic_discovery_interval_minutes: int
     vk_topic_discovery_first_delay_seconds: int
@@ -195,6 +204,18 @@ def load_settings() -> BotSettings:
         reminder_interval_minutes=int(os.getenv("BRUCEBET_REMINDER_INTERVAL_MINUTES", "5")),
         reminder_grace_minutes=int(os.getenv("BRUCEBET_REMINDER_GRACE_MINUTES", "35")),
         vk_group_id=int(os.getenv("VK_GROUP_ID", "217130885")),
+        vk_registration_topic_id=int(os.getenv("VK_REGISTRATION_TOPIC_ID", "0")),
+        vk_registration_sync_enabled=parse_bool(
+            os.getenv("VK_REGISTRATION_SYNC_ENABLED"),
+            default=bool(os.getenv("VK_REGISTRATION_TOPIC_ID", "").strip()),
+        ),
+        vk_registration_sync_interval_minutes=int(
+            os.getenv("VK_REGISTRATION_SYNC_INTERVAL_MINUTES", os.getenv("VK_SYNC_INTERVAL_MINUTES", "5"))
+        ),
+        vk_registration_sync_first_delay_seconds=int(os.getenv("VK_REGISTRATION_SYNC_FIRST_DELAY_SECONDS", "20")),
+        vk_registration_browser_wait_ms=int(
+            os.getenv("VK_REGISTRATION_BROWSER_WAIT_MS", os.getenv("VK_BROWSER_WAIT_MS", "8000"))
+        ),
         vk_topic_discovery_enabled=parse_bool(os.getenv("VK_TOPIC_DISCOVERY_ENABLED")),
         vk_topic_discovery_interval_minutes=int(os.getenv("VK_TOPIC_DISCOVERY_INTERVAL_MINUTES", "30")),
         vk_topic_discovery_first_delay_seconds=int(os.getenv("VK_TOPIC_DISCOVERY_FIRST_DELAY_SECONDS", "20")),
@@ -2100,6 +2121,93 @@ async def vk_topic_discovery_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             await asyncio.to_thread(complete_vk_topic_alert_worker, settings, alert)
 
 
+def read_vk_registration_worker(settings: BotSettings):
+    topic_url = build_topic_url(settings.vk_group_id, settings.vk_registration_topic_id)
+    report = read_public_topic_dry_run(
+        topic_url,
+        "registration",
+        chromium_bin=settings.vk_chromium_bin,
+        wait_ms=settings.vk_registration_browser_wait_ms,
+    )
+    if report.league_hint != "epl":
+        raise ValueError(f"registration topic failed EPL gate: {report.league_hint}")
+    return report
+
+
+def record_vk_registration_worker(settings: BotSettings, report: object):
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        activate_profile(
+            conn,
+            competition_code=settings.competition,
+            season_name=settings.season,
+            season_display_name=settings.season_display,
+            lock_minutes=settings.lock_minutes,
+        )
+        return record_vk_registration_entries(
+            conn,
+            report.group_id,
+            report.topic_id,
+            report.registration_entries,
+            seen_at=datetime.now().astimezone().isoformat(),
+        )
+    finally:
+        conn.close()
+
+
+def complete_vk_registration_alert_worker(settings: BotSettings, alert: object, error: str | None = None) -> None:
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        if error:
+            mark_vk_registration_alert_failed(conn, alert, error)
+        else:
+            mark_vk_registration_alert_sent(conn, alert, sent_at=datetime.now().astimezone().isoformat())
+    finally:
+        conn.close()
+
+
+def render_vk_registration_alert(alert: object) -> str:
+    if alert.fee_intent == "paid_declared":
+        amount = f"{alert.fee_amount_rub} руб." if alert.fee_amount_rub is not None else "сумма не указана"
+        status = f"взнос {amount}, участник добавлен как платный."
+    elif alert.fee_intent == "free":
+        status = "без взноса, участник добавлен как бесплатный."
+    else:
+        status = "статус взноса не указан, участник добавлен без взноса до уточнения."
+    return "\n".join(
+        [
+            f"VK-заявка: {alert.participant_name} — {status}",
+            f"Автор VK: {alert.vk_author}.",
+            build_topic_url(alert.group_id, alert.topic_id),
+        ]
+    )
+
+
+async def vk_registration_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    try:
+        report = await asyncio.to_thread(read_vk_registration_worker, settings)
+        alerts = await asyncio.to_thread(record_vk_registration_worker, settings, report)
+    except Exception:  # noqa: BLE001 - VK changes must not stop the bot.
+        LOGGER.exception("VK registration sync failed")
+        return
+
+    for alert in alerts:
+        failures: list[str] = []
+        for chat_id in settings.allowed_chat_ids:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=render_vk_registration_alert(alert))
+            except Exception as exc:  # noqa: BLE001 - keep the registration pending for retry.
+                LOGGER.warning("VK registration alert failed chat=%s key=%s: %s", chat_id, alert.source_key, exc)
+                failures.append(f"chat {chat_id}: {exc}")
+        if failures:
+            await asyncio.to_thread(complete_vk_registration_alert_worker, settings, alert, " | ".join(failures))
+        else:
+            await asyncio.to_thread(complete_vk_registration_alert_worker, settings, alert)
+
+
 async def auto_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = settings_from_context(context)
     try:
@@ -2233,6 +2341,29 @@ def configure_vk_topic_discovery(application: Application, settings: BotSettings
     LOGGER.info("VK topic discovery scheduled every %s minutes", interval)
 
 
+def configure_vk_registration_sync(application: Application, settings: BotSettings) -> None:
+    if not settings.vk_registration_sync_enabled:
+        return
+    if settings.vk_registration_topic_id <= 0:
+        LOGGER.warning("VK registration sync is enabled, but VK_REGISTRATION_TOPIC_ID is unset")
+        return
+    if not settings.allowed_chat_ids:
+        LOGGER.warning("VK registration sync is enabled, but TELEGRAM_ALLOWED_CHAT_IDS is empty")
+        return
+    if application.job_queue is None:
+        LOGGER.warning("VK registration sync requested, but JobQueue is not available")
+        return
+    interval = max(1, settings.vk_registration_sync_interval_minutes)
+    first_delay = max(5, settings.vk_registration_sync_first_delay_seconds)
+    application.job_queue.run_repeating(
+        vk_registration_sync_job,
+        interval=timedelta(minutes=interval),
+        first=timedelta(seconds=first_delay),
+        name="brucebet-vk-registration-sync",
+    )
+    LOGGER.info("VK registration sync scheduled every %s minutes", interval)
+
+
 def build_application(settings: BotSettings) -> Application:
     application = ApplicationBuilder().token(settings.token).build()
     application.bot_data["settings"] = settings
@@ -2286,6 +2417,7 @@ def build_application(settings: BotSettings) -> Application:
     configure_auto_sync(application, settings)
     configure_deadline_reminders(application, settings)
     configure_vk_topic_discovery(application, settings)
+    configure_vk_registration_sync(application, settings)
     return application
 
 

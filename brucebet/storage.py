@@ -11,6 +11,7 @@ from .scoring import parse_datetime, parse_score
 
 if TYPE_CHECKING:
     from .vk_board import VkDiscoveredTopic
+    from .vk_dry_run import VkRegistrationEntry
 
 
 DEFAULT_COMPETITION_CODE = "epl"
@@ -329,6 +330,25 @@ CREATE TABLE IF NOT EXISTS vk_topic_alerts (
     notification_error TEXT,
     PRIMARY KEY(group_id, topic_id)
 );
+
+CREATE TABLE IF NOT EXISTS vk_registration_entries (
+    group_id INTEGER NOT NULL,
+    topic_id INTEGER NOT NULL,
+    source_key TEXT NOT NULL,
+    participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+    vk_author TEXT NOT NULL,
+    participant_name TEXT NOT NULL,
+    submitted_at TEXT NOT NULL,
+    fee_intent TEXT NOT NULL,
+    fee_amount_rub INTEGER,
+    payment_status TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    notification_status TEXT NOT NULL DEFAULT 'pending',
+    notified_at TEXT,
+    notification_error TEXT,
+    PRIMARY KEY(group_id, topic_id, source_key)
+);
 """
 
 
@@ -340,6 +360,19 @@ class VkTopicAlert:
     title: str
     url: str
     first_seen_at: str
+
+
+@dataclass(frozen=True)
+class VkRegistrationAlert:
+    group_id: int
+    topic_id: int
+    source_key: str
+    participant_name: str
+    vk_author: str
+    submitted_at: str
+    fee_intent: str
+    fee_amount_rub: int | None
+    payment_status: str
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -366,6 +399,7 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS reminder_subscriptions;
         DROP TABLE IF EXISTS vk_topic_alerts;
         DROP TABLE IF EXISTS vk_topic_discovery_state;
+        DROP TABLE IF EXISTS vk_registration_entries;
         DROP TABLE IF EXISTS model_forecasts;
         DROP TABLE IF EXISTS round_reviews;
         DROP TABLE IF EXISTS result_sync_runs;
@@ -580,6 +614,162 @@ def mark_vk_topic_alert_failed(conn: sqlite3.Connection, alert: VkTopicAlert, er
         WHERE group_id = ? AND topic_id = ?
         """,
         (error[:500], alert.group_id, alert.topic_id),
+    )
+    conn.commit()
+
+
+def _ensure_vk_registration_participant(
+    conn: sqlite3.Connection,
+    name: str,
+    fee_intent: str,
+) -> int:
+    """Enroll a VK applicant using the registration topic as the fee record."""
+
+    confirmed_paid = {"paid_declared": 1, "free": 0}.get(fee_intent)
+    if confirmed_paid is not None:
+        return ensure_participant(conn, name, paid=confirmed_paid)
+
+    row = conn.execute("SELECT id FROM participants WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        return ensure_participant(conn, name, paid=0)
+
+    participant_id = int(row["id"])
+    season_row = conn.execute(
+        "SELECT paid FROM season_participants WHERE season_id = ? AND participant_id = ?",
+        (active_season_id(conn), participant_id),
+    ).fetchone()
+    if season_row is None:
+        ensure_season_participant(conn, participant_id, paid=0)
+    return participant_id
+
+
+def record_vk_registration_entries(
+    conn: sqlite3.Connection,
+    group_id: int,
+    topic_id: int,
+    entries: Iterable["VkRegistrationEntry"],
+    *,
+    seen_at: str,
+) -> list[VkRegistrationAlert]:
+    """Store registration declarations and return only undelivered Telegram notices.
+
+    The registration discussion is the contest's source of truth: a declared
+    fee immediately marks the participant as paid for this season.
+    """
+
+    for entry in entries:
+        participant_id = _ensure_vk_registration_participant(conn, entry.participant, entry.fee_intent)
+        submitted_at = entry.submitted_at.isoformat()
+        existing = conn.execute(
+            """
+            SELECT vk_author, participant_name, submitted_at, fee_intent,
+                   fee_amount_rub, payment_status
+            FROM vk_registration_entries
+            WHERE group_id = ? AND topic_id = ? AND source_key = ?
+            """,
+            (int(group_id), int(topic_id), entry.source_key),
+        ).fetchone()
+        values = (
+            entry.vk_author,
+            entry.participant,
+            submitted_at,
+            entry.fee_intent,
+            entry.fee_amount_rub,
+            entry.payment_status,
+        )
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO vk_registration_entries(
+                    group_id, topic_id, source_key, participant_id, vk_author,
+                    participant_name, submitted_at, fee_intent, fee_amount_rub,
+                    payment_status, first_seen_at, last_seen_at, notification_status
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                """,
+                (int(group_id), int(topic_id), entry.source_key, participant_id, *values, seen_at, seen_at),
+            )
+            continue
+
+        previous = tuple(existing[column] for column in existing.keys())
+        if previous != values:
+            conn.execute(
+                """
+                UPDATE vk_registration_entries
+                SET participant_id = ?, vk_author = ?, participant_name = ?, submitted_at = ?,
+                    fee_intent = ?, fee_amount_rub = ?, payment_status = ?,
+                    last_seen_at = ?, notification_status = 'pending',
+                    notified_at = NULL, notification_error = NULL
+                WHERE group_id = ? AND topic_id = ? AND source_key = ?
+                """,
+                (participant_id, *values, seen_at, int(group_id), int(topic_id), entry.source_key),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE vk_registration_entries
+                SET participant_id = ?, last_seen_at = ?
+                WHERE group_id = ? AND topic_id = ? AND source_key = ?
+                """,
+                (participant_id, seen_at, int(group_id), int(topic_id), entry.source_key),
+            )
+
+    rows = conn.execute(
+        """
+        SELECT group_id, topic_id, source_key, participant_name, vk_author,
+               submitted_at, fee_intent, fee_amount_rub, payment_status
+        FROM vk_registration_entries
+        WHERE group_id = ? AND topic_id = ? AND notification_status = 'pending'
+        ORDER BY submitted_at, source_key
+        """,
+        (int(group_id), int(topic_id)),
+    ).fetchall()
+    conn.commit()
+    return [
+        VkRegistrationAlert(
+            group_id=int(row["group_id"]),
+            topic_id=int(row["topic_id"]),
+            source_key=row["source_key"],
+            participant_name=row["participant_name"],
+            vk_author=row["vk_author"],
+            submitted_at=row["submitted_at"],
+            fee_intent=row["fee_intent"],
+            fee_amount_rub=row["fee_amount_rub"],
+            payment_status=row["payment_status"],
+        )
+        for row in rows
+    ]
+
+
+def mark_vk_registration_alert_sent(
+    conn: sqlite3.Connection,
+    alert: VkRegistrationAlert,
+    *,
+    sent_at: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE vk_registration_entries
+        SET notification_status = 'sent', notified_at = ?, notification_error = NULL
+        WHERE group_id = ? AND topic_id = ? AND source_key = ?
+        """,
+        (sent_at, alert.group_id, alert.topic_id, alert.source_key),
+    )
+    conn.commit()
+
+
+def mark_vk_registration_alert_failed(
+    conn: sqlite3.Connection,
+    alert: VkRegistrationAlert,
+    error: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE vk_registration_entries
+        SET notification_status = 'pending', notification_error = ?
+        WHERE group_id = ? AND topic_id = ? AND source_key = ?
+        """,
+        (error[:500], alert.group_id, alert.topic_id, alert.source_key),
     )
     conn.commit()
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import os
 import re
@@ -18,7 +18,7 @@ from .vk_board import (
     parse_topic_url,
     probe_public_topic,
 )
-from .vk_parser import MONTHS, MatchTemplate, RoundTemplate, parse_author, parse_ru_datetime, parse_templates
+from .vk_parser import MSK, MONTHS, MatchTemplate, RoundTemplate, parse_author, parse_ru_datetime, parse_templates
 
 
 TopicKind = Literal["registration", "predictions"]
@@ -30,14 +30,23 @@ DATE_ONLY_RE = re.compile(
     r"^(?P<day>\d{1,2})\s+(?P<month>[а-яё]{3})\s+(?P<year>\d{4})\s+в\s+(?P<time>\d{1,2}:\d{2})$",
     re.IGNORECASE,
 )
+RELATIVE_DATE_RE = re.compile(
+    r"^(?P<day>today|yesterday|сегодня|вчера)\s+(?:at|в)\s+(?P<time>\d{1,2}:\d{2})(?:\s*(?P<meridiem>am|pm))?$",
+    re.IGNORECASE,
+)
 SCORE_TAIL_RE = re.compile(r"(?P<score>\d+\s*[:;\-]\s*\d+)\s*$")
 IDENTITY_RE = re.compile(r"^[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё .'-]{0,79}$")
+PARENTHETICAL_IDENTITY_RE = re.compile(r"\((?P<name>[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё .'-]{0,79})\)")
 FREE_FEE_RE = re.compile(
     r"\b(?:без\s+(?:взнос\w*|оплат\w*)|не\s+вношу|без\s+участия\s+в\s+приз)\b",
     re.IGNORECASE,
 )
 PAID_FEE_RE = re.compile(
-    r"\b(?:взнос|вн[её]с|оплатил|отправил|перев[её]л|закинул)\b",
+    r"\b(?:взнос|взн\w*|вн[её]с|оплатил|отправил|перев[её]л|закинул|[1-9]\d{2,3}\s*(?:р(?:уб)?\.?|₽)?)\b",
+    re.IGNORECASE,
+)
+REGISTRATION_MARKER_SUFFIX_RE = re.compile(
+    r"\s*[,.;:—–-]?\s*(?:без\s+(?:взнос\w*|оплат\w*)|не\s+вношу|взнос\w*\s*\d{2,4}|взн\w*\s*\d{2,4}|\d{2,4}\s*(?:р(?:уб)?\.?|₽)?)\s*$",
     re.IGNORECASE,
 )
 CLOSED_RE = re.compile(
@@ -94,7 +103,8 @@ class VkRegistrationEntry:
     participant: str
     submitted_at: datetime
     fee_intent: FeeIntent
-    payment_status: Literal["unverified", "not_applicable"]
+    fee_amount_rub: int | None
+    payment_status: Literal["confirmed", "not_applicable", "unknown"]
     source_line: int
 
 
@@ -127,12 +137,23 @@ def _clean_lines(text: str) -> list[str]:
 
 def _date_only(line: str) -> datetime | None:
     match = DATE_ONLY_RE.match(line.strip())
-    if not match:
+    if match:
+        month = match.group("month").lower()
+        if month in MONTHS:
+            return parse_ru_datetime(match.group("day"), month, match.group("year"), match.group("time"))
+
+    relative = RELATIVE_DATE_RE.match(line.strip())
+    if relative is None:
         return None
-    month = match.group("month").lower()
-    if month not in MONTHS:
-        return None
-    return parse_ru_datetime(match.group("day"), month, match.group("year"), match.group("time"))
+    hour, minute = (int(value) for value in relative.group("time").split(":"))
+    meridiem = (relative.group("meridiem") or "").lower()
+    if meridiem == "pm" and hour != 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+    now = datetime.now(MSK)
+    date_value = now.date() - timedelta(days=1 if relative.group("day").casefold() in {"yesterday", "вчера"} else 0)
+    return datetime(date_value.year, date_value.month, date_value.day, hour, minute, tzinfo=MSK)
 
 
 def _comment_key(group_id: int, topic_id: int, author: str, submitted_at: datetime, ordinal: int) -> str:
@@ -207,6 +228,12 @@ def _participant_for_comment(comment: VkComment) -> str:
     for line in comment.body_lines:
         if SCORE_TAIL_RE.search(line) or " - " in line:
             continue
+        parenthetical = PARENTHETICAL_IDENTITY_RE.search(line)
+        if parenthetical is not None and _looks_like_identity(parenthetical.group("name")):
+            return " ".join(parenthetical.group("name").split())
+        without_marker = REGISTRATION_MARKER_SUFFIX_RE.sub("", line).strip(" .,;:-—–")
+        if without_marker != line and _looks_like_identity(without_marker):
+            return without_marker
         if _looks_like_identity(line):
             return line.rstrip(".")
     return comment.author
@@ -275,6 +302,18 @@ def _fee_intent(comment: VkComment) -> FeeIntent:
     return "unknown"
 
 
+def _fee_amount_rub(comment: VkComment, fee_intent: FeeIntent) -> int | None:
+    """Return the declared entry fee without treating it as confirmed payment."""
+
+    if fee_intent != "paid_declared":
+        return None
+    for line in comment.body_lines:
+        match = re.search(r"(?<!\d)([1-9]\d{2,3})(?!\d)", line)
+        if match is not None:
+            return int(match.group(1))
+    return None
+
+
 def _league_hint(text: str) -> LeagueHint:
     if NON_EPL_RE.search(text):
         return "non_epl"
@@ -333,7 +372,14 @@ def parse_public_topic_result(result: VkPublicTopicResult, topic_kind: TopicKind
                     participant=_participant_for_comment(comment),
                     submitted_at=comment.submitted_at,
                     fee_intent=fee_intent,
-                    payment_status="not_applicable" if fee_intent == "free" else "unverified",
+                    fee_amount_rub=_fee_amount_rub(comment, fee_intent),
+                    payment_status=(
+                        "confirmed"
+                        if fee_intent == "paid_declared"
+                        else "not_applicable"
+                        if fee_intent == "free"
+                        else "unknown"
+                    ),
                     source_line=comment.source_line,
                 )
             )
@@ -419,7 +465,7 @@ def render_dry_run_report(report: VkTopicDryRunReport, *, limit: int = 60) -> st
         for item in report.registration_entries[: max(0, limit)]:
             lines.append(
                 f"  {item.participant} (VK: {item.vk_author}) fee={item.fee_intent} "
-                f"payment={item.payment_status} at {item.submitted_at.isoformat()}"
+                f"amount={item.fee_amount_rub or '-'} payment={item.payment_status} at {item.submitted_at.isoformat()}"
             )
 
     if report.warnings:

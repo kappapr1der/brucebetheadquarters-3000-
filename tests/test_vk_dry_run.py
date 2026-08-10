@@ -68,6 +68,25 @@ Mr Sam
 """
 
 
+LIVE_REGISTRATION_TEXT = """
+Forecasters Club
+Заявка на участие в прогнозах АПЛ 2026/2027
+Forecasters Club
+today at 6:51 pm
+Для участия пишем имя и статус взноса.
+Georgy Karev
+today at 6:52 pm
+Георгий Карев, без взноса
+Mr Sam
+today at 6:59 pm
+Мр сэм (Сергей) , взн 500
+Yury Efremychev
+today at 7:21 pm
+Ефремычев Юрий
+500
+"""
+
+
 class VkDryRunTests(unittest.TestCase):
     def test_predictions_recognize_split_author_actual_participant_and_partial_blocks(self) -> None:
         report = parse_public_topic_result(topic_result(PREDICTIONS_TEXT), "predictions")
@@ -85,15 +104,27 @@ class VkDryRunTests(unittest.TestCase):
         self.assertEqual(len(partial.forecasts), 2)
         self.assertIn("missing fixture positions", " | ".join(partial.warnings))
 
-    def test_registration_keeps_payment_unverified_and_marks_closure(self) -> None:
+    def test_registration_confirms_payment_and_marks_closure(self) -> None:
         report = parse_public_topic_result(topic_result(REGISTRATION_TEXT), "registration")
 
         self.assertEqual(report.registration_state, "closed")
         self.assertTrue(report.final_roster_detected)
         self.assertEqual(len(report.registration_entries), 2)
         paid, free = report.registration_entries
-        self.assertEqual((paid.participant, paid.fee_intent, paid.payment_status), ("Игорь Григорьев", "paid_declared", "unverified"))
+        self.assertEqual((paid.participant, paid.fee_intent, paid.payment_status), ("Игорь Григорьев", "paid_declared", "confirmed"))
         self.assertEqual((free.participant, free.fee_intent, free.payment_status), ("Сергей", "free", "not_applicable"))
+
+    def test_registration_recognizes_live_relative_dates_names_and_fee_markers(self) -> None:
+        report = parse_public_topic_result(topic_result(LIVE_REGISTRATION_TEXT), "registration")
+
+        self.assertEqual(
+            [(item.participant, item.fee_intent, item.fee_amount_rub) for item in report.registration_entries],
+            [
+                ("Георгий Карев", "free", None),
+                ("Сергей", "paid_declared", 500),
+                ("Ефремычев Юрий", "paid_declared", 500),
+            ],
+        )
 
     def test_non_epl_topic_is_visible_but_never_future_ingestion_ready(self) -> None:
         report = parse_public_topic_result(topic_result("Прогнозы РПЛ\n"), "predictions")
