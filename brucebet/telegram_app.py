@@ -108,7 +108,7 @@ from .storage import (
 from .variable_sync import VariableSyncResult, sync_match_assessments, sync_match_contexts_and_factors, sync_match_variables
 from .vk_board import VkAccessChallengeError, VkBrowserError, build_topic_url, probe_public_group_topics
 from .vk_api import VkApiError, VkApiNotConnectedError, read_api_topic_dry_run
-from .vk_dry_run import read_public_topic_dry_run
+from .vk_dry_run import capture_public_topic_dry_run
 from .vk_oauth import (
     VkOAuthConfigurationError,
     VkOAuthError,
@@ -117,6 +117,7 @@ from .vk_oauth import (
     create_authorization_url,
 )
 from .vk_parser import parse_file as parse_vk_file
+from .vk_snapshot_archive import VkSnapshotArchiveResult, archive_public_topic_capture
 
 
 LOGGER = logging.getLogger(__name__)
@@ -160,12 +161,16 @@ class BotSettings:
     vk_api_credentials_path: Path
     vk_api_version: str
     vk_api_timeout_seconds: int
+    vk_oauth_enabled: bool
     vk_oauth_worker_url: str
     vk_oauth_worker_poll_interval_seconds: int
     vk_registration_sync_enabled: bool
     vk_registration_sync_interval_minutes: int
     vk_registration_sync_first_delay_seconds: int
     vk_registration_browser_wait_ms: int
+    vk_predictions_snapshot_enabled: bool
+    vk_predictions_snapshot_interval_minutes: int
+    vk_public_snapshot_dir: Path
     vk_challenge_alert_cooldown_minutes: int
     vk_topic_discovery_enabled: bool
     vk_topic_discovery_interval_minutes: int
@@ -222,12 +227,13 @@ def load_settings() -> BotSettings:
         vk_group_id=int(os.getenv("VK_GROUP_ID", "217130885")),
         vk_registration_topic_id=int(os.getenv("VK_REGISTRATION_TOPIC_ID", "0")),
         vk_predictions_topic_id=int(os.getenv("VK_PREDICTIONS_TOPIC_ID", "0")),
-        vk_api_read_enabled=parse_bool(os.getenv("VK_API_READ_ENABLED"), default=True),
+        vk_api_read_enabled=parse_bool(os.getenv("VK_API_READ_ENABLED"), default=False),
         vk_api_credentials_path=Path(
             os.getenv("VK_OAUTH_CREDENTIALS_PATH", str(Path(os.getenv("BRUCEBET_DATA_DIR", "data")) / "vk_oauth_credentials.json"))
         ),
         vk_api_version=os.getenv("VK_API_VERSION", "5.199").strip() or "5.199",
         vk_api_timeout_seconds=int(os.getenv("VK_API_TIMEOUT_SECONDS", "20")),
+        vk_oauth_enabled=parse_bool(os.getenv("VK_OAUTH_ENABLED"), default=False),
         vk_oauth_worker_url=os.getenv("VK_OAUTH_WORKER_URL", "").strip(),
         vk_oauth_worker_poll_interval_seconds=int(os.getenv("VK_OAUTH_WORKER_POLL_INTERVAL_SECONDS", "15")),
         vk_registration_sync_enabled=parse_bool(
@@ -240,6 +246,14 @@ def load_settings() -> BotSettings:
         vk_registration_sync_first_delay_seconds=int(os.getenv("VK_REGISTRATION_SYNC_FIRST_DELAY_SECONDS", "20")),
         vk_registration_browser_wait_ms=int(
             os.getenv("VK_REGISTRATION_BROWSER_WAIT_MS", os.getenv("VK_BROWSER_WAIT_MS", "8000"))
+        ),
+        vk_predictions_snapshot_enabled=parse_bool(
+            os.getenv("VK_PREDICTIONS_SNAPSHOT_ENABLED"),
+            default=bool(os.getenv("VK_PREDICTIONS_TOPIC_ID", "").strip()),
+        ),
+        vk_predictions_snapshot_interval_minutes=int(os.getenv("VK_PREDICTIONS_SNAPSHOT_INTERVAL_MINUTES", "20")),
+        vk_public_snapshot_dir=Path(
+            os.getenv("VK_PUBLIC_SNAPSHOT_DIR", str(Path(os.getenv("BRUCEBET_DATA_DIR", "data")) / "vk_snapshots"))
         ),
         vk_challenge_alert_cooldown_minutes=int(os.getenv("VK_CHALLENGE_ALERT_COOLDOWN_MINUTES", "360")),
         vk_topic_discovery_enabled=parse_bool(os.getenv("VK_TOPIC_DISCOVERY_ENABLED")),
@@ -1371,6 +1385,14 @@ async def sources_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 @require_access
 async def vk_connect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    if not settings.vk_oauth_enabled:
+        await send_text(
+            update,
+            "VK API-подключение отключено: оно не даёт BruceBet доступ к обсуждениям. "
+            "Рабочий маршрут - публичный read-only reader; /vk_snapshot снимет и проверит две EPL-темы.",
+        )
+        return
     try:
         oauth_settings = VkOAuthSettings.from_env()
         authorization_url = await asyncio.to_thread(create_authorization_url, oauth_settings)
@@ -1455,6 +1477,13 @@ def vk_api_status_worker(settings: BotSettings) -> list[str]:
 @require_access
 async def vk_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = settings_from_context(context)
+    if not settings.vk_oauth_enabled:
+        await send_text(
+            update,
+            "VK API отключён, чтобы бот не отправлял в нерабочую авторизацию. "
+            "Публичный reader и архив снимков активны; используй /vk_snapshot для проверки тем.",
+        )
+        return
     try:
         if await asyncio.to_thread(complete_vk_worker_oauth, settings):
             await send_text(update, "VK OAuth подключен. Проверяю две EPL-темы через VK API...")
@@ -2290,9 +2319,32 @@ def read_vk_topic_worker(
     topic_kind: str,
     title: str,
 ):
+    topic_url = build_topic_url(settings.vk_group_id, topic_id)
+    try:
+        capture = capture_public_topic_dry_run(
+            topic_url,
+            topic_kind,
+            chromium_bin=settings.vk_chromium_bin,
+            wait_ms=settings.vk_registration_browser_wait_ms,
+        )
+        archive = archive_public_topic_capture(settings.vk_public_snapshot_dir, capture)
+        LOGGER.info(
+            "VK public topic captured topic=%s kind=%s snapshot=%s created=%s",
+            topic_id,
+            topic_kind,
+            archive.path,
+            archive.created,
+        )
+        return capture.report, archive
+    except VkBrowserError as public_error:
+        if not settings.vk_api_read_enabled:
+            raise
+        LOGGER.warning("VK public read failed topic=%s; API fallback enabled: %s", topic_id, public_error)
+
     if settings.vk_api_read_enabled:
         try:
-            return read_api_topic_dry_run(
+            return (
+                read_api_topic_dry_run(
                 credentials_path=settings.vk_api_credentials_path,
                 group_id=settings.vk_group_id,
                 topic_id=topic_id,
@@ -2300,23 +2352,19 @@ def read_vk_topic_worker(
                 title=title,
                 api_version=settings.vk_api_version,
                 timeout=settings.vk_api_timeout_seconds,
+                ),
+                None,
             )
-        except VkApiNotConnectedError:
-            pass
+        except VkApiNotConnectedError as exc:
+            raise VkBrowserError("VK public read failed and API is not connected") from exc
         except VkApiError as exc:
-            LOGGER.warning("VK API read failed topic=%s; trying public reader: %s", topic_id, exc)
+            raise VkBrowserError(f"VK public read failed and API fallback failed: {exc}") from exc
 
-    topic_url = build_topic_url(settings.vk_group_id, topic_id)
-    return read_public_topic_dry_run(
-        topic_url,
-        topic_kind,
-        chromium_bin=settings.vk_chromium_bin,
-        wait_ms=settings.vk_registration_browser_wait_ms,
-    )
+    raise VkBrowserError("VK reader is not configured")
 
 
 def read_vk_registration_worker(settings: BotSettings):
-    report = read_vk_topic_worker(
+    report, _archive = read_vk_topic_worker(
         settings,
         topic_id=settings.vk_registration_topic_id,
         topic_kind="registration",
@@ -2325,6 +2373,67 @@ def read_vk_registration_worker(settings: BotSettings):
     if report.league_hint != "epl":
         raise ValueError(f"registration topic failed EPL gate: {report.league_hint}")
     return report
+
+
+def read_vk_predictions_worker(settings: BotSettings):
+    if settings.vk_predictions_topic_id <= 0:
+        raise ValueError("VK_PREDICTIONS_TOPIC_ID is not set")
+    report, archive = read_vk_topic_worker(
+        settings,
+        topic_id=settings.vk_predictions_topic_id,
+        topic_kind="predictions",
+        title="Premier League predictions",
+    )
+    if report.league_hint != "epl":
+        raise ValueError(f"predictions topic failed EPL gate: {report.league_hint}")
+    return report, archive
+
+
+def render_vk_snapshot_status(label: str, report: object, archive: VkSnapshotArchiveResult | None) -> str:
+    stored = "новый снимок сохранён" if archive is not None and archive.created else "без изменений в поле"
+    if archive is None:
+        stored = "прочитано через API без публичного снимка"
+    if getattr(report, "topic_kind", "") == "registration":
+        return f"{label}: {stored}; заявок {len(report.registration_entries)}, статус {report.registration_state}."
+    full = sum(1 for item in report.forecast_submissions if item.is_full)
+    return (
+        f"{label}: {stored}; шаблонов {len(report.templates)}, "
+        f"блоков прогнозов {len(report.forecast_submissions)} (полных {full})."
+    )
+
+
+@require_access
+async def vk_snapshot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    topics = [
+        ("Регистрация", settings.vk_registration_topic_id, "registration", "Premier League registration"),
+        ("Прогнозы", settings.vk_predictions_topic_id, "predictions", "Premier League predictions"),
+    ]
+    configured = [item for item in topics if item[1] > 0]
+    if not configured:
+        await send_text(update, "VK-темы АПЛ ещё не подключены: нужны ID темы регистрации и темы прогнозов.")
+        return
+    await send_text(update, "Снимаю публичные EPL-темы и сверяю архив поля...")
+    lines: list[str] = ["VK snapshot:"]
+    for label, topic_id, topic_kind, title in configured:
+        try:
+            report, archive = await asyncio.to_thread(
+                read_vk_topic_worker,
+                settings,
+                topic_id=topic_id,
+                topic_kind=topic_kind,
+                title=title,
+            )
+            if report.league_hint != "epl":
+                lines.append(f"{label}: остановлено EPL-проверкой ({report.league_hint}).")
+            else:
+                lines.append(render_vk_snapshot_status(label, report, archive))
+        except VkAccessChallengeError:
+            lines.append(f"{label}: VK показал антибот-проверку; предыдущий снимок сохранён.")
+        except Exception as exc:  # noqa: BLE001 - report a concise per-topic error to the operator.
+            LOGGER.exception("Manual VK snapshot failed topic=%s", topic_id)
+            lines.append(f"{label}: не удалось прочитать ({exc}).")
+    await send_text(update, "\n".join(lines))
 
 
 def record_vk_registration_worker(settings: BotSettings, report: object):
@@ -2403,6 +2512,31 @@ async def vk_registration_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             await asyncio.to_thread(complete_vk_registration_alert_worker, settings, alert, " | ".join(failures))
         else:
             await asyncio.to_thread(complete_vk_registration_alert_worker, settings, alert)
+
+
+async def vk_predictions_snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Keep an auditable, read-only copy of the prediction field.
+
+    Forecast blocks stay out of SQLite until an explicit future import flow is
+    approved; this job only records a changed public page in the local archive.
+    """
+
+    settings = settings_from_context(context)
+    try:
+        report, archive = await asyncio.to_thread(read_vk_predictions_worker, settings)
+    except VkAccessChallengeError:
+        LOGGER.warning("VK predictions snapshot hit an anti-bot challenge")
+        await notify_vk_access_challenge(context, settings)
+        return
+    except Exception:  # noqa: BLE001 - an unavailable public page must not stop Telegram polling.
+        LOGGER.exception("VK predictions snapshot failed")
+        return
+    LOGGER.info(
+        "VK predictions snapshot topic=%s created=%s blocks=%s",
+        report.topic_id,
+        getattr(archive, "created", False),
+        len(report.forecast_submissions),
+    )
 
 
 async def auto_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2561,7 +2695,28 @@ def configure_vk_registration_sync(application: Application, settings: BotSettin
     LOGGER.info("VK registration sync scheduled every %s minutes", interval)
 
 
+def configure_vk_predictions_snapshot(application: Application, settings: BotSettings) -> None:
+    if not settings.vk_predictions_snapshot_enabled:
+        return
+    if settings.vk_predictions_topic_id <= 0:
+        LOGGER.warning("VK predictions snapshots are enabled, but VK_PREDICTIONS_TOPIC_ID is unset")
+        return
+    if application.job_queue is None:
+        LOGGER.warning("VK predictions snapshots requested, but JobQueue is not available")
+        return
+    interval = max(10, settings.vk_predictions_snapshot_interval_minutes)
+    application.job_queue.run_repeating(
+        vk_predictions_snapshot_job,
+        interval=timedelta(minutes=interval),
+        first=timedelta(minutes=1),
+        name="brucebet-vk-predictions-snapshot",
+    )
+    LOGGER.info("VK predictions snapshots scheduled every %s minutes", interval)
+
+
 def configure_vk_oauth_worker_poll(application: Application, settings: BotSettings) -> None:
+    if not settings.vk_oauth_enabled:
+        return
     if not settings.vk_oauth_worker_url:
         return
     if not os.getenv("VK_OAUTH_WORKER_RELAY_SECRET", "").strip():
@@ -2606,6 +2761,7 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("vk_connect", vk_connect_cmd))
     application.add_handler(CommandHandler("vk_status", vk_status_cmd))
     application.add_handler(CommandHandler("vk_topics", vk_topics_cmd))
+    application.add_handler(CommandHandler("vk_snapshot", vk_snapshot_cmd))
     application.add_handler(CommandHandler("sync_fixtures", sync_fixtures_cmd))
     application.add_handler(CommandHandler("sync_results", sync_results_cmd))
     application.add_handler(CommandHandler("sync_odds", sync_odds_cmd))
@@ -2639,6 +2795,7 @@ def build_application(settings: BotSettings) -> Application:
     configure_deadline_reminders(application, settings)
     configure_vk_topic_discovery(application, settings)
     configure_vk_registration_sync(application, settings)
+    configure_vk_predictions_snapshot(application, settings)
     configure_vk_oauth_worker_poll(application, settings)
     return application
 

@@ -316,6 +316,8 @@ python -m brucebet.cli vk-discover
 
 Set `VK_TOPIC_DISCOVERY_ENABLED=1` to poll the public Forecasters Club discussion list. The first pass with at least one discovered topic is a quiet baseline; later newly discovered EPL registration or prediction topics produce one Telegram alert. `/vk_topics` runs the same public, read-only check manually. RPL is ignored by the alert queue and no VK discovery result imports contest data.
 
+`/vk_snapshot` reads the configured EPL registration and prediction topics, keeps a local archive of changed public fields in `data/vk_snapshots/`, and reports the recognized entry/block counts. Set `VK_PREDICTIONS_SNAPSHOT_ENABLED=1` to run the same read-only archive job every 20 minutes. No forecast from this route is written to SQLite.
+
 Для прогнозов выводятся шаблон, дедлайн, автор комментария, фактический участник, нормализованные счета и статус `FULL`/`PARTIAL`. Для регистрации отдельно сохраняется заявленный выбор взноса и статус проверки оплаты: перевод считается только заявленным, пока организатор его не подтвердил. Тестовая тема РПЛ допускается лишь для проверки формата: dry-run пометит её как `non_epl`, а будущий импорт останется заблокированным.
 
 Реальные прогнозы, участники, SQLite и выгрузки должны жить только в серверном `data/`.

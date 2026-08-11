@@ -131,6 +131,17 @@ class VkTopicDryRunReport:
         return self.league_hint == "epl"
 
 
+@dataclass(frozen=True)
+class VkPublicTopicCapture:
+    """One read-only public VK fetch plus its structured interpretation."""
+
+    report: VkTopicDryRunReport
+    visible_text: str
+    html_chars: int
+    visible_chars: int
+    score_line_count: int
+
+
 def _clean_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
@@ -466,6 +477,25 @@ def read_public_topic_dry_run(
     wait_ms: int = DEFAULT_BROWSER_WAIT_MS,
     timeout: int = 45,
 ) -> VkTopicDryRunReport:
+    return capture_public_topic_dry_run(
+        topic_url,
+        topic_kind,
+        chromium_bin=chromium_bin,
+        wait_ms=wait_ms,
+        timeout=timeout,
+    ).report
+
+
+def capture_public_topic_dry_run(
+    topic_url: str,
+    topic_kind: TopicKind,
+    *,
+    chromium_bin: str = DEFAULT_CHROMIUM_BIN,
+    wait_ms: int = DEFAULT_BROWSER_WAIT_MS,
+    timeout: int = 45,
+) -> VkPublicTopicCapture:
+    """Read a public topic once and retain the exact visible source text."""
+
     group_id, topic_id = parse_topic_url(topic_url)
     result = probe_public_topic(
         group_id,
@@ -474,7 +504,13 @@ def read_public_topic_dry_run(
         virtual_time_ms=wait_ms,
         timeout=timeout,
     )
-    return parse_public_topic_result(result, topic_kind)
+    return VkPublicTopicCapture(
+        report=parse_public_topic_result(result, topic_kind),
+        visible_text=result.text,
+        html_chars=result.html_chars,
+        visible_chars=result.visible_chars,
+        score_line_count=result.score_line_count,
+    )
 
 
 def render_dry_run_report(report: VkTopicDryRunReport, *, limit: int = 60) -> str:

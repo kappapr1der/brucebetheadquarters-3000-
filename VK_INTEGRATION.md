@@ -33,12 +33,15 @@ VK_PREDICTIONS_TOPIC_ID=
 VK_REGISTRATION_SYNC_ENABLED=0
 VK_REGISTRATION_SYNC_INTERVAL_MINUTES=5
 VK_REGISTRATION_SYNC_FIRST_DELAY_SECONDS=20
-VK_REGISTRATION_BROWSER_WAIT_MS=30000
+VK_REGISTRATION_BROWSER_WAIT_MS=12000
+VK_PREDICTIONS_SNAPSHOT_ENABLED=0
+VK_PREDICTIONS_SNAPSHOT_INTERVAL_MINUTES=20
+VK_PUBLIC_SNAPSHOT_DIR=data/vk_snapshots
 VK_TOPIC_DISCOVERY_ENABLED=1
 VK_TOPIC_DISCOVERY_INTERVAL_MINUTES=30
 VK_TOPIC_DISCOVERY_FIRST_DELAY_SECONDS=20
 VK_CHROMIUM_BIN=chromium
-VK_BROWSER_WAIT_MS=8000
+VK_BROWSER_WAIT_MS=12000
 ```
 
 The topic IDs are deliberately separate: one registration topic and one prediction topic. Set `VK_REGISTRATION_SYNC_ENABLED=1` only after `VK_REGISTRATION_TOPIC_ID` points to the real EPL registration discussion.
@@ -110,6 +113,8 @@ For a registration topic it reports each declaration separately: VK author, decl
 
 Every report contains a content fingerprint and provisional per-comment source key. The registration monitor uses the key for idempotency, updates `last_seen_at` on repeated reads, and sends Telegram notices only for new or changed entries. The source key remains auditable in SQLite.
 
+`/vk_snapshot` reads each configured EPL topic now and reports whether the field changed. Every changed read is stored locally under `VK_PUBLIC_SNAPSHOT_DIR`: it contains the original visible text, the parser result and a content fingerprint. These files never enter the contest SQLite tables or a public GitHub repository. When `VK_PREDICTIONS_SNAPSHOT_ENABLED=1`, the predictions topic receives the same read-only snapshot every `VK_PREDICTIONS_SNAPSHOT_INTERVAL_MINUTES` minutes. It is deliberately not a forecast import.
+
 The dry-run shows `league gate: epl`, `non_epl`, or `unknown`. Non-EPL topics, including the temporary RPL probe topic, may be parsed for format testing but are explicitly not future-ingestion-ready.
 
 ## Safety rules
@@ -133,6 +138,6 @@ After the EPL topic appears:
 
 1. Point `VK_PREDICTIONS_TOPIC_ID` at that EPL topic.
 2. Keep the registration and prediction topic monitors separate. The registration monitor polls the configured discussion every five minutes by default and emits one notice per new/changed applicant.
-3. Poll the prediction topic frequently before the round deadline, save immutable parsed snapshots, and capture one final field snapshot immediately before `/recommend` evaluates a match.
+3. Set `VK_PREDICTIONS_SNAPSHOT_ENABLED=1` to archive changed prediction fields every 20 minutes by default, then use `/vk_snapshot` immediately before `/recommend` to capture the final field snapshot.
 4. Extract durable VK comment IDs from the rendered DOM, then add idempotent persistence and edit detection.
 5. Only after validation, enable scheduled sync into the active EPL season.
