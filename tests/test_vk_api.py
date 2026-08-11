@@ -120,7 +120,7 @@ class VkOAuthTests(unittest.TestCase):
                 state_ttl_minutes=15,
                 api_version="5.199",
             )
-            url = create_authorization_url(settings, now=datetime(2026, 8, 11, tzinfo=timezone.utc))
+            url = create_authorization_url(settings, now=datetime.now(timezone.utc))
             query = parse_qs(urlparse(url).query)
             state = query["state"][0]
             self.assertEqual(urlparse(url).netloc, "id.vk.com")
