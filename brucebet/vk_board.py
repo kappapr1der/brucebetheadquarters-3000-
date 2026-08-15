@@ -346,7 +346,14 @@ def run_chromium_command(
     finally:
         # Chromium may let the browser leader exit before renderer/crashpad
         # descendants. Clean the group even after a successful --dump-dom.
-        _cleanup_chromium_process(process, process_group_id)
+        try:
+            _cleanup_chromium_process(process, process_group_id)
+        finally:
+            # communicate() leaves its wrappers open when it raises on a
+            # timeout. Close them after the process group has been stopped.
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None and not pipe.closed:
+                    pipe.close()
 
     completed = subprocess.CompletedProcess(command, int(process.returncode or 0), stdout, stderr)
     if check:

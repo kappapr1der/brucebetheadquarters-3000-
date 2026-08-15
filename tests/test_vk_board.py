@@ -201,6 +201,27 @@ class VkBoardTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0)
             self.assertIn("<html>", completed.stdout)
 
+    def test_timeout_closes_capture_pipes(self) -> None:
+        processes: list[subprocess.Popen[str]] = []
+
+        def popen_factory(*args, **kwargs):
+            process = subprocess.Popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run_chromium_command(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                capture_output=True,
+                text=True,
+                timeout=0.1,
+                popen_factory=popen_factory,
+            )
+
+        self.assertEqual(len(processes), 1)
+        self.assertTrue(processes[0].stdout.closed)
+        self.assertTrue(processes[0].stderr.closed)
+
     @unittest.skipUnless(os.name == "posix", "POSIX process groups are used in the production container")
     def test_normal_completion_kills_orphaned_descendants(self) -> None:
         script = (
