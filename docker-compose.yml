@@ -2,6 +2,7 @@ services:
   brucebet:
     build: .
     container_name: brucebet-3000
+    init: true
     restart: unless-stopped
     env_file:
       - .env

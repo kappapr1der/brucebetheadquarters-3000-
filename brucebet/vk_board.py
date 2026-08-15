@@ -4,17 +4,25 @@ import argparse
 from dataclasses import dataclass
 from html import unescape
 from html.parser import HTMLParser
+import logging
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
+import threading
+import time
 from typing import Callable
 
 
 DEFAULT_FORECASTERS_GROUP_ID = 217130885
 DEFAULT_CHROMIUM_BIN = "chromium"
 DEFAULT_BROWSER_WAIT_MS = 8000
+CHROMIUM_TERMINATE_GRACE_SECONDS = 0.75
+CHROMIUM_KILL_GRACE_SECONDS = 0.75
+VK_CHROMIUM_PROBE_LOCK = threading.Lock()
+LOGGER = logging.getLogger(__name__)
 TOPIC_URL_RE = re.compile(
     r"^https?://(?:m\.)?(?:vk\.com|vk\.ru)/topic-(?P<group>\d+)_(?P<topic>\d+)(?:[/?#].*)?$",
     re.IGNORECASE,
@@ -219,6 +227,8 @@ def chromium_command(
         "--disable-dev-shm-usage",
         "--disable-gpu",
         "--disable-background-networking",
+        "--disable-breakpad",
+        "--disable-crash-reporter",
         "--disable-default-apps",
         "--disable-sync",
         "--no-first-run",
@@ -229,23 +239,141 @@ def chromium_command(
     ]
 
 
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_process_group_exit(process_group_id: int, timeout: float) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        if not _process_group_exists(process_group_id):
+            return True
+        time.sleep(0.02)
+    return not _process_group_exists(process_group_id)
+
+
+def _wait_for_direct_process(process: subprocess.Popen[str], timeout: float) -> bool:
+    try:
+        process.wait(timeout=max(0.0, timeout))
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:  # noqa: BLE001 - cleanup must not hide the probe result.
+        return process.poll() is not None
+    return True
+
+
+def _cleanup_chromium_process(
+    process: subprocess.Popen[str],
+    process_group_id: int | None,
+) -> None:
+    """Reap Chromium and terminate every process left in its isolated group."""
+
+    if process_group_id is not None:
+        if _process_group_exists(process_group_id):
+            try:
+                os.killpg(process_group_id, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                LOGGER.warning("Could not terminate Chromium process group %s: %s", process_group_id, exc)
+
+        _wait_for_direct_process(process, CHROMIUM_TERMINATE_GRACE_SECONDS)
+        if _wait_for_process_group_exit(process_group_id, CHROMIUM_TERMINATE_GRACE_SECONDS):
+            return
+
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            LOGGER.warning("Could not kill Chromium process group %s: %s", process_group_id, exc)
+        _wait_for_direct_process(process, CHROMIUM_KILL_GRACE_SECONDS)
+        if not _wait_for_process_group_exit(process_group_id, CHROMIUM_KILL_GRACE_SECONDS):
+            LOGGER.warning("Chromium process group %s still exists after SIGKILL", process_group_id)
+        return
+
+    # The production container is POSIX and uses the process-group path above.
+    # Keep a direct-process fallback so local tests and CLI use remain portable.
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    if _wait_for_direct_process(process, CHROMIUM_TERMINATE_GRACE_SECONDS):
+        return
+    try:
+        process.kill()
+    except OSError:
+        pass
+    _wait_for_direct_process(process, CHROMIUM_KILL_GRACE_SECONDS)
+
+
+def run_chromium_command(
+    command: list[str],
+    *,
+    capture_output: bool = False,
+    text: bool = False,
+    timeout: float | None = None,
+    check: bool = False,
+    popen_factory: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
+) -> subprocess.CompletedProcess[str]:
+    """Run one Chromium probe in an isolated session and always clean it up."""
+
+    popen_kwargs: dict[str, object] = {
+        "stdout": subprocess.PIPE if capture_output else None,
+        "stderr": subprocess.PIPE if capture_output else None,
+        "text": text,
+    }
+    process_group_id: int | None = None
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+    process = popen_factory(command, **popen_kwargs)
+    if os.name == "posix":
+        # start_new_session makes the Chromium leader PID the process-group ID.
+        process_group_id = int(process.pid)
+
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    finally:
+        # Chromium may let the browser leader exit before renderer/crashpad
+        # descendants. Clean the group even after a successful --dump-dom.
+        _cleanup_chromium_process(process, process_group_id)
+
+    completed = subprocess.CompletedProcess(command, int(process.returncode or 0), stdout, stderr)
+    if check:
+        completed.check_returncode()
+    return completed
+
+
 def fetch_public_html(
     url: str,
     *,
     chromium_bin: str = DEFAULT_CHROMIUM_BIN,
     virtual_time_ms: int = DEFAULT_BROWSER_WAIT_MS,
     timeout: int = 45,
-    runner: Callable[..., object] = subprocess.run,
+    runner: Callable[..., object] | None = None,
 ) -> str:
     command = chromium_command(url, chromium_bin=chromium_bin, virtual_time_ms=virtual_time_ms)
     try:
-        completed = runner(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=max(5, int(timeout)),
-            check=False,
-        )
+        # Registration, discovery, predictions and manual snapshots all pass
+        # through this one lock. Chromium probes must never overlap.
+        with VK_CHROMIUM_PROBE_LOCK:
+            completed = (runner or run_chromium_command)(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=max(5, int(timeout)),
+                check=False,
+            )
     except FileNotFoundError as exc:
         raise VkBrowserError(f"Chromium executable not found: {chromium_bin}") from exc
     except subprocess.TimeoutExpired as exc:
@@ -272,7 +400,7 @@ def fetch_topic_html(
     chromium_bin: str = DEFAULT_CHROMIUM_BIN,
     virtual_time_ms: int = DEFAULT_BROWSER_WAIT_MS,
     timeout: int = 45,
-    runner: Callable[..., object] = subprocess.run,
+    runner: Callable[..., object] | None = None,
 ) -> str:
     return fetch_public_html(
         url,
@@ -290,7 +418,7 @@ def probe_public_topic(
     chromium_bin: str = DEFAULT_CHROMIUM_BIN,
     virtual_time_ms: int = DEFAULT_BROWSER_WAIT_MS,
     timeout: int = 45,
-    runner: Callable[..., object] = subprocess.run,
+    runner: Callable[..., object] | None = None,
 ) -> VkPublicTopicResult:
     url = build_topic_url(group_id, topic_id)
     html = fetch_topic_html(
@@ -319,7 +447,7 @@ def probe_public_group_topics(
     chromium_bin: str = DEFAULT_CHROMIUM_BIN,
     virtual_time_ms: int = DEFAULT_BROWSER_WAIT_MS,
     timeout: int = 45,
-    runner: Callable[..., object] = subprocess.run,
+    runner: Callable[..., object] | None = None,
 ) -> VkGroupTopicsResult:
     failures: list[str] = []
     first_success: tuple[str, str] | None = None
