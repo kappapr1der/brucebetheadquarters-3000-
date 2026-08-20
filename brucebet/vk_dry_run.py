@@ -30,6 +30,10 @@ DATE_ONLY_RE = re.compile(
     r"^(?P<day>\d{1,2})\s+(?P<month>[а-яё]{3})\s+(?P<year>\d{4})\s+в\s+(?P<time>\d{1,2}:\d{2})$",
     re.IGNORECASE,
 )
+EN_DATE_ONLY_RE = re.compile(
+    r"^(?P<day>\d{1,2})\s+(?P<month>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(?P<year>\d{4})\s+at\s+(?P<time>\d{1,2}:\d{2})(?:\s*(?P<meridiem>am|pm))?$",
+    re.IGNORECASE,
+)
 RELATIVE_DATE_RE = re.compile(
     r"^(?P<day>today|yesterday|сегодня|вчера)\s+(?:at|в)\s+(?P<time>\d{1,2}:\d{2})(?:\s*(?P<meridiem>am|pm))?$",
     re.IGNORECASE,
@@ -57,6 +61,20 @@ OPEN_RE = re.compile(r"\b(?:регистрац\w*|для\s+участия|зап
 FINAL_ROSTER_RE = re.compile(r"\b(?:финальн\w*\s+(?:состав|список)|итогов\w*\s+состав)\b", re.IGNORECASE)
 NON_EPL_RE = re.compile(r"\b(?:рпл|российск\w*\s+премьер)\b", re.IGNORECASE)
 EPL_RE = re.compile(r"\b(?:апл|английск\w*\s+премьер|premier\s+league)\b", re.IGNORECASE)
+EN_MONTHS = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
 NOISE = {
     "",
     "показать список оценивших",
@@ -174,6 +192,17 @@ def _date_only(line: str) -> datetime | None:
         month = match.group("month").lower()
         if month in MONTHS:
             return parse_ru_datetime(match.group("day"), month, match.group("year"), match.group("time"))
+
+    english = EN_DATE_ONLY_RE.match(line.strip())
+    if english is not None:
+        hour, minute = (int(value) for value in english.group("time").split(":"))
+        meridiem = (english.group("meridiem") or "").lower()
+        if meridiem == "pm" and hour != 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+        month = EN_MONTHS[english.group("month")[:3].lower()]
+        return datetime(int(english.group("year")), month, int(english.group("day")), hour, minute, tzinfo=MSK)
 
     relative = RELATIVE_DATE_RE.match(line.strip())
     if relative is None:
