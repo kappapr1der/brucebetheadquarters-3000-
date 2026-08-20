@@ -163,7 +163,7 @@ def run_rehearsal(lock_minutes: int = 90) -> dict[str, object]:
         )
         override_history = manual_prediction_history(conn, "Bruce Wayne", match_ids[0])
 
-        captured = capture_model_forecasts(conn, now=deadline - timedelta(days=1))
+        captured = capture_model_forecasts(conn, now=deadline + timedelta(minutes=1), lock_minutes=lock_minutes)
         saved = finalize_completed_rounds(conn, lock_minutes=lock_minutes)
         review = round_review(conn, round_name, lock_minutes=lock_minutes)
         calibration = model_calibration_summary(conn, round_name=round_name)
