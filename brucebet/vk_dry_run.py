@@ -218,9 +218,9 @@ def _date_only(line: str) -> datetime | None:
     return datetime(date_value.year, date_value.month, date_value.day, hour, minute, tzinfo=MSK)
 
 
-def _comment_key(group_id: int, topic_id: int, author: str, submitted_at: datetime, ordinal: int) -> str:
+def _comment_key(group_id: int, topic_id: int, author: str, submitted_at: datetime) -> str:
     author_key = re.sub(r"\s+", "-", author.casefold()).strip("-") or "unknown"
-    return f"vk:{group_id}:{topic_id}:{submitted_at.isoformat()}:{author_key}:{ordinal}"
+    return f"vk:{group_id}:{topic_id}:{submitted_at.isoformat()}:{author_key}"
 
 
 def parse_comment_blocks(text: str, *, group_id: int, topic_id: int) -> list[VkComment]:
@@ -253,7 +253,7 @@ def parse_comment_blocks(text: str, *, group_id: int, topic_id: int) -> list[VkC
         body = tuple(lines[body_start:next_start])
         comments.append(
             VkComment(
-                source_key=_comment_key(group_id, topic_id, author, submitted_at, ordinal),
+                source_key=_comment_key(group_id, topic_id, author, submitted_at),
                 author=author,
                 submitted_at=submitted_at,
                 source_line=source_start + 1,
