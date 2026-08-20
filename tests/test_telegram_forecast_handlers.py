@@ -16,7 +16,7 @@ except ModuleNotFoundError as exc:
         raise
     TELEGRAM_AVAILABLE = False
 
-from brucebet.storage import connect, reset_db, upsert_match
+from brucebet.storage import connect, ensure_participant, reset_db, upsert_match
 
 
 class FakeMessage:
@@ -55,6 +55,10 @@ class TelegramForecastHandlerTests(unittest.IsolatedAsyncioTestCase):
             self.settings = load_settings()
         conn = connect(self.db_path)
         reset_db(conn)
+        # Forecast ingestion must not create contestants implicitly. These are
+        # the explicit roster entries used by the handler scenarios below.
+        ensure_participant(conn, "Igor", paid=1)
+        ensure_participant(conn, "Anna", paid=1)
         upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2030-08-21T20:00:00+01:00", None)
         conn.commit()
         conn.close()
