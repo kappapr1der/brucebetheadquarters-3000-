@@ -113,6 +113,58 @@ def active_season_snapshot_tables(season_id: int) -> Iterable[SnapshotTable]:
         (season_id,),
     )
     yield SnapshotTable(
+        "fixture_identity_events.csv",
+        """
+        SELECT
+            event.id,
+            event.event_type,
+            event.source,
+            event.source_fixture_id,
+            r.name AS round,
+            m.position,
+            m.home AS current_home,
+            m.away AS current_away,
+            event.old_home,
+            event.old_away,
+            event.new_home,
+            event.new_away,
+            event.old_round_id,
+            event.new_round_id,
+            event.old_position,
+            event.new_position,
+            event.created_at,
+            event.details
+        FROM fixture_identity_events event
+        JOIN matches m ON m.id = event.match_id
+        JOIN rounds r ON r.id = m.round_id
+        WHERE r.season_id = ?
+        ORDER BY event.id
+        """,
+        (season_id,),
+    )
+    yield SnapshotTable(
+        "fixture_sync_runs.csv",
+        """
+        SELECT
+            id,
+            source,
+            started_at,
+            finished_at,
+            source_item_count,
+            created,
+            updated,
+            moved,
+            unmatched,
+            stale_factors_removed,
+            before_hash,
+            after_hash,
+            status,
+            notes
+        FROM fixture_sync_runs
+        ORDER BY id
+        """,
+    )
+    yield SnapshotTable(
         "predictions.csv",
         """
         SELECT
