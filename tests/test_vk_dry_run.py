@@ -93,6 +93,7 @@ Forecasters Club
 Sergey Kirillov
 today at 6:59 pm
 Show likes
+Show more posts
 Сергей Кириллов
 Без взноса
 Alexey Zakharov
@@ -153,6 +154,7 @@ class VkDryRunTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("Show likes", [item.participant for item in report.registration_entries])
+        self.assertNotIn("Show more posts", [item.participant for item in report.registration_entries])
 
     def test_non_epl_topic_is_visible_but_never_future_ingestion_ready(self) -> None:
         report = parse_public_topic_result(topic_result("Прогнозы РПЛ\n"), "predictions")
