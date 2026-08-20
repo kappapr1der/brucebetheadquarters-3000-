@@ -25,7 +25,7 @@ MONTHS = {
 }
 
 TEMPLATE_RE = re.compile(
-    r"^Шаблон .*?,\s*(?P<round>\d+)-й тур\.\s*Дедлайн\s*"
+    r"^Шаблон(?:\s+на)?(?:\s+[^,]+,)?\s+(?P<round>\d+)(?:-й)?\s+тур\.\s*Дедлайн\s*"
     r"(?P<date>\d{2}\.\d{2}\.\d{4}),\s*(?P<time>\d{1,2}:\d{2})$"
 )
 AUTHOR_RE = re.compile(

@@ -127,6 +127,49 @@ Andrzej Wisniewski
 """
 
 
+LIVE_PREDICTIONS_TEXT = """
+Forecasters Club
+Прогнозы на АПЛ 2026/2027
+Forecasters Club
+10 Aug 2026 at 6:35 pm
+Шаблон на 1 тур. Дедлайн 21.08.2026, 22:00
+Арсенал - Ковентри
+Халл - Манчестер Юнайтед
+Эвертон - Кристал Пэлас
+Ипсвич - Сандерленд
+Ноттингем Форест - Лидс
+Брентфорд - Тоттенхэм
+Брайтон - Астон Вилла
+Манчестер Сити - Борнмут
+Ньюкасл - Ливерпуль
+Фулхэм - Челси
+Mikhail Makarov
+10 Aug 2026 at 6:51 pm
+Арсенал - Ковентри 2:0
+Халл - Манчестер Юнайтед 1:3
+Эвертон - Кристал Пэлас 1:2
+Ипсвич - Сандерленд 1:0
+Ноттингем Форест - Лидс 1:3
+Брентфорд - Тоттенхэм 1:2
+Брайтон - Астон Вилла 1:3
+Манчестер Сити - Борнмут 3:1
+Ньюкасл - Ливерпуль 1:2
+Фулхэм - Челси 1:3
+Mr Sam
+13 Aug 2026 at 8:52 pm
+Арсенал - Ковентри 2-1
+Халл - Манчестер Юнайтед 1-1
+Эвертон - Кристал Пэлас 1-3
+Ипсвич - Сандерленд 2-1
+Ноттингем Форест - Лидс 0-1
+Брентфорд - Тоттенхэм 1-3
+Брайтон - Астон Вилла 2-3
+Манчестер Сити - Борнмут 2-0
+Ньюкасл - Ливерпуль 1-2
+Фулхэм - Челси 0-1
+"""
+
+
 class VkDryRunTests(unittest.TestCase):
     def test_predictions_recognize_split_author_actual_participant_and_partial_blocks(self) -> None:
         report = parse_public_topic_result(topic_result(PREDICTIONS_TEXT), "predictions")
@@ -191,6 +234,16 @@ class VkDryRunTests(unittest.TestCase):
                 ("Andrzej Wisniewski", "Andrzej Wisniewski", "paid_declared", 500),
             ],
         )
+
+    def test_predictions_recognize_live_vk_template_without_ordinal_suffix(self) -> None:
+        report = parse_public_topic_result(topic_result(LIVE_PREDICTIONS_TEXT), "predictions")
+
+        self.assertEqual([(item.round_name, len(item.matches)) for item in report.templates], [("1", 10)])
+        self.assertEqual([(item.participant, item.status, len(item.forecasts)) for item in report.forecast_submissions], [
+            ("Mikhail Makarov", "full", 10),
+            ("Mr Sam", "full", 10),
+        ])
+        self.assertEqual(report.forecast_submissions[0].submitted_at.isoformat(), "2026-08-10T18:51:00+03:00")
 
     def test_comment_key_does_not_change_when_earlier_comments_are_added(self) -> None:
         complete = """
