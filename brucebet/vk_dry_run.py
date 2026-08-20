@@ -66,6 +66,12 @@ NOISE = {
     "show likes",
     "show reactions",
     "show more posts",
+    "загружается",
+    "go up",
+    "read only the most interesting posts",
+    "we'll find posts according to your preferences and create a whole feed from them. just sign in to check it out",
+    "sign up",
+    "sign in",
     "reply",
     "share",
 }
@@ -158,7 +164,8 @@ def _clean_lines(text: str) -> list[str]:
 
 
 def _is_noise_line(value: str) -> bool:
-    return " ".join(value.casefold().split()) in NOISE
+    compact = " ".join(value.casefold().split()).rstrip(".…")
+    return compact in NOISE
 
 
 def _date_only(line: str) -> datetime | None:
