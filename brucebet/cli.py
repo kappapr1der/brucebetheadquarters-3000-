@@ -1132,6 +1132,13 @@ def cmd_sync_fixtures(args: argparse.Namespace) -> int:
             ("fetched", result.fetched),
             ("imported", result.imported),
             ("rounds", result.rounds),
+            ("created", result.created),
+            ("updated", result.updated),
+            ("moved", result.moved),
+            ("unmatched", result.unmatched),
+            ("stale_factors_removed", result.stale_factors_removed),
+            ("before_hash", result.before_hash),
+            ("after_hash", result.after_hash),
             ("first_kickoff", result.first_kickoff),
             ("last_kickoff", result.last_kickoff),
         ]

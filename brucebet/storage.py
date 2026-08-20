@@ -36,6 +36,10 @@ VK_UI_NOISE_PARTICIPANTS = frozenset(
 )
 
 
+class FixtureIdentityError(RuntimeError):
+    """Raised when a stable external fixture identity would change meaning."""
+
+
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 
@@ -114,6 +118,8 @@ CREATE TABLE IF NOT EXISTS matches (
     away TEXT NOT NULL,
     kickoff_at TEXT,
     result TEXT,
+    source TEXT,
+    source_fixture_id TEXT,
     UNIQUE(round_id, position)
 );
 
@@ -260,6 +266,41 @@ CREATE TABLE IF NOT EXISTS result_sync_runs (
     updated INTEGER NOT NULL DEFAULT 0,
     unmatched INTEGER NOT NULL DEFAULT 0,
     notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS fixture_sync_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    source_item_count INTEGER NOT NULL DEFAULT 0,
+    created INTEGER NOT NULL DEFAULT 0,
+    updated INTEGER NOT NULL DEFAULT 0,
+    moved INTEGER NOT NULL DEFAULT 0,
+    unmatched INTEGER NOT NULL DEFAULT 0,
+    stale_factors_removed INTEGER NOT NULL DEFAULT 0,
+    before_hash TEXT NOT NULL,
+    after_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS fixture_identity_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    source TEXT,
+    source_fixture_id TEXT,
+    old_home TEXT,
+    old_away TEXT,
+    new_home TEXT,
+    new_away TEXT,
+    old_round_id INTEGER,
+    new_round_id INTEGER,
+    old_position INTEGER,
+    new_position INTEGER,
+    created_at TEXT NOT NULL,
+    details TEXT
 );
 
 CREATE TABLE IF NOT EXISTS manual_result_overrides (
@@ -438,6 +479,8 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS model_forecast_legacy_audit;
         DROP TABLE IF EXISTS model_forecasts;
         DROP TABLE IF EXISTS round_reviews;
+        DROP TABLE IF EXISTS fixture_identity_events;
+        DROP TABLE IF EXISTS fixture_sync_runs;
         DROP TABLE IF EXISTS result_sync_runs;
         DROP TABLE IF EXISTS manual_result_overrides;
         DROP TABLE IF EXISTS manual_prediction_overrides;
@@ -538,6 +581,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     has_legacy_round_name_unique = ("name",) in unique_indexes
     if "season_id" not in rounds_columns or has_legacy_round_name_unique:
         rebuild_rounds_for_seasons(conn, ensure_legacy_season(conn))
+
     model_forecast_columns = table_columns(conn, "model_forecasts")
     for column, definition in (
         ("deadline_at", "TEXT"),
@@ -547,6 +591,19 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         if column not in model_forecast_columns:
             conn.execute(f"ALTER TABLE model_forecasts ADD COLUMN {column} {definition}")
 
+    match_columns = table_columns(conn, "matches")
+    if "source" not in match_columns:
+        conn.execute("ALTER TABLE matches ADD COLUMN source TEXT")
+    if "source_fixture_id" not in match_columns:
+        conn.execute("ALTER TABLE matches ADD COLUMN source_fixture_id TEXT")
+
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS matches_source_fixture_unique
+        ON matches(source, source_fixture_id)
+        WHERE source IS NOT NULL AND source_fixture_id IS NOT NULL
+        """
+    )
 
 def _utc_comparable(value: datetime | None) -> datetime | None:
     if value is None or value.tzinfo is None or value.utcoffset() is None:
@@ -594,7 +651,6 @@ def mark_premature_model_forecasts(conn: sqlite3.Connection) -> int:
         )
         marked += int(cursor.rowcount)
     return marked
-
 
 def record_vk_topic_discovery(
     conn: sqlite3.Connection,
@@ -1217,12 +1273,127 @@ def upsert_match(
     kickoff_at: str | None,
     result: str | None,
     round_deadline_at: str | None = None,
+    *,
+    source: str | None = None,
+    source_fixture_id: str | None = None,
+    allow_source_team_change: bool = False,
 ) -> int:
     round_id = ensure_round(conn, round_name, round_deadline_at)
-    ensure_team(conn, home)
-    ensure_team(conn, away)
     kickoff = parse_datetime(kickoff_at).isoformat() if kickoff_at else None
     result_value = result.strip() if result and parse_score(result.strip()) else None
+
+    if (source is None) != (source_fixture_id is None):
+        raise ValueError("source and source_fixture_id must be provided together")
+    if source is not None and source_fixture_id is not None:
+        normalized_source = source.strip()
+        normalized_fixture_id = str(source_fixture_id).strip()
+        if not normalized_source or not normalized_fixture_id:
+            raise ValueError("source and source_fixture_id must not be blank")
+        existing = conn.execute(
+            """
+            SELECT id, round_id, position, home, away
+            FROM matches
+            WHERE source = ? AND source_fixture_id = ?
+            """,
+            (normalized_source, normalized_fixture_id),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO matches(
+                    round_id, position, home, away, kickoff_at, result,
+                    source, source_fixture_id
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    round_id,
+                    position,
+                    home.strip(),
+                    away.strip(),
+                    kickoff,
+                    result_value,
+                    normalized_source,
+                    normalized_fixture_id,
+                ),
+            )
+        else:
+            old_home = str(existing["home"]).strip()
+            old_away = str(existing["away"]).strip()
+            new_home = home.strip()
+            new_away = away.strip()
+            if (old_home.casefold(), old_away.casefold()) != (new_home.casefold(), new_away.casefold()):
+                if not allow_source_team_change:
+                    raise FixtureIdentityError(
+                        "Stable fixture "
+                        f"{normalized_source}:{normalized_fixture_id} changed teams "
+                        f"from {old_home} - {old_away} to {new_home} - {new_away}"
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO fixture_identity_events(
+                        match_id, event_type, source, source_fixture_id,
+                        old_home, old_away, new_home, new_away,
+                        old_round_id, new_round_id, old_position, new_position,
+                        created_at, details
+                    )
+                    VALUES(?, 'team_pair_changed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(existing["id"]),
+                        normalized_source,
+                        normalized_fixture_id,
+                        old_home,
+                        old_away,
+                        new_home,
+                        new_away,
+                        int(existing["round_id"]),
+                        round_id,
+                        int(existing["position"]),
+                        position,
+                        datetime.now().astimezone().isoformat(),
+                        "Explicit source fixture team change",
+                    ),
+                )
+            ensure_team(conn, new_home)
+            ensure_team(conn, new_away)
+            conn.execute(
+                """
+                UPDATE matches
+                SET round_id = ?, position = ?, home = ?, away = ?, kickoff_at = ?,
+                    result = COALESCE(?, result)
+                WHERE id = ?
+                """,
+                (round_id, position, new_home, new_away, kickoff, result_value, int(existing["id"])),
+            )
+        if existing is None:
+            ensure_team(conn, home)
+            ensure_team(conn, away)
+        row = conn.execute(
+            "SELECT id FROM matches WHERE source = ? AND source_fixture_id = ?",
+            (normalized_source, normalized_fixture_id),
+        ).fetchone()
+        return int(row["id"])
+
+    position_match = conn.execute(
+        """
+        SELECT id, home, away, source, source_fixture_id
+        FROM matches
+        WHERE round_id = ? AND position = ?
+        """,
+        (round_id, position),
+    ).fetchone()
+    if position_match is not None and position_match["source"] and (
+        str(position_match["home"]).strip().casefold(),
+        str(position_match["away"]).strip().casefold(),
+    ) != (home.strip().casefold(), away.strip().casefold()):
+        raise FixtureIdentityError(
+            "Position-based update cannot change stable fixture "
+            f"{position_match['source']}:{position_match['source_fixture_id']} from "
+            f"{position_match['home']} - {position_match['away']} to {home.strip()} - {away.strip()}"
+        )
+    ensure_team(conn, home)
+    ensure_team(conn, away)
     conn.execute(
         """
         INSERT INTO matches(round_id, position, home, away, kickoff_at, result)
@@ -1231,7 +1402,7 @@ def upsert_match(
             home = excluded.home,
             away = excluded.away,
             kickoff_at = excluded.kickoff_at,
-            result = excluded.result
+            result = COALESCE(excluded.result, matches.result)
         """,
         (round_id, position, home.strip(), away.strip(), kickoff, result_value),
     )
@@ -2041,3 +2212,4 @@ def find_match(conn: sqlite3.Connection, query: str) -> sqlite3.Row:
     if row is None:
         raise ValueError(f"Match not found: {query}")
     return row
+

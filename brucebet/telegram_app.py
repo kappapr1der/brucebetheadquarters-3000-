@@ -1556,6 +1556,11 @@ async def sync_fixtures_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"fetched: {result.fetched}",
         f"imported: {result.imported}",
         f"rounds: {result.rounds}",
+        f"created: {result.created}",
+        f"updated: {result.updated}",
+        f"moved: {result.moved}",
+        f"unmatched: {result.unmatched}",
+        f"stale_factors_removed: {result.stale_factors_removed}",
         f"first_kickoff: {result.first_kickoff}",
         f"last_kickoff: {result.last_kickoff}",
     ]
@@ -2842,3 +2847,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

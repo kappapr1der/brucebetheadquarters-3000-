@@ -62,6 +62,11 @@ class SnapshotTest(unittest.TestCase):
             self.assertIn("participant", rows[0])
             self.assertIn("score", rows[0])
 
+            with (out_dir / "matches.csv").open("r", encoding="utf-8", newline="") as handle:
+                match_rows = list(csv.DictReader(handle))
+            self.assertIn("source", match_rows[0])
+            self.assertIn("source_fixture_id", match_rows[0])
+
             filenames = {path.name for path in out_dir.iterdir()}
             self.assertIn("manifest.json", filenames)
             self.assertIn("match_assessments.csv", filenames)
