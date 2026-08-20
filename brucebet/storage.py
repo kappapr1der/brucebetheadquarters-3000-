@@ -665,28 +665,22 @@ def _is_vk_ui_noise_participant(name: str) -> bool:
 def _purge_vk_ui_noise_entries(conn: sqlite3.Connection) -> None:
     """Remove legacy rows that came from VK controls, never from a person."""
 
-    placeholders = ", ".join("?" for _ in VK_UI_NOISE_PARTICIPANTS)
     rows = conn.execute(
-        f"""
-        SELECT DISTINCT participant_id
-        FROM vk_registration_entries
-        WHERE lower(trim(participant_name)) IN ({placeholders})
-        """,
-        tuple(VK_UI_NOISE_PARTICIPANTS),
+        "SELECT rowid, participant_id, participant_name FROM vk_registration_entries"
     ).fetchall()
-    if not rows:
+    noise_rows = [row for row in rows if _is_vk_ui_noise_participant(str(row["participant_name"]))]
+    if not noise_rows:
         return
 
-    participant_ids = tuple(int(row["participant_id"]) for row in rows)
-    conn.execute(
-        f"DELETE FROM vk_registration_entries WHERE lower(trim(participant_name)) IN ({placeholders})",
-        tuple(VK_UI_NOISE_PARTICIPANTS),
-    )
+    participant_ids = {int(row["participant_id"]) for row in noise_rows}
+    conn.executemany("DELETE FROM vk_registration_entries WHERE rowid = ?", [(int(row["rowid"]),) for row in noise_rows])
     for participant_id in participant_ids:
         prediction = conn.execute("SELECT 1 FROM predictions WHERE participant_id = ? LIMIT 1", (participant_id,)).fetchone()
-        if prediction is None:
+        registration = conn.execute(
+            "SELECT 1 FROM vk_registration_entries WHERE participant_id = ? LIMIT 1", (participant_id,)
+        ).fetchone()
+        if prediction is None and registration is None:
             conn.execute("DELETE FROM participants WHERE id = ?", (participant_id,))
-
 
 def record_vk_registration_entries(
     conn: sqlite3.Connection,
