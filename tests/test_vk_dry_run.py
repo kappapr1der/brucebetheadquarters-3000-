@@ -101,6 +101,17 @@ today at 7:21 pm
 Show likes
 Алексей Захаров
 Взнос 500 рублей
+Andrzej Wisniewski
+today at 8:00 pm
+Взнос 500
+Show likes
+Show more posts
+Загружается...
+Go up
+Read only the most interesting posts
+We'll find posts according to your preferences and create a whole feed from them. Just sign in to check it out.
+Sign up
+Sign in
 """
 
 
@@ -151,10 +162,12 @@ class VkDryRunTests(unittest.TestCase):
             [
                 ("Сергей Кириллов", "free", None),
                 ("Алексей Захаров", "paid_declared", 500),
+                ("Andrzej Wisniewski", "paid_declared", 500),
             ],
         )
         self.assertNotIn("Show likes", [item.participant for item in report.registration_entries])
         self.assertNotIn("Show more posts", [item.participant for item in report.registration_entries])
+        self.assertNotIn("Загружается", [item.participant for item in report.registration_entries])
 
     def test_non_epl_topic_is_visible_but_never_future_ingestion_ready(self) -> None:
         report = parse_public_topic_result(topic_result("Прогнозы РПЛ\n"), "predictions")
