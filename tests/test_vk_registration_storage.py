@@ -139,6 +139,7 @@ class VkRegistrationStorageTests(unittest.TestCase):
             FROM participants WHERE name = 'Сергей Кириллов'
             """
         )
+        init_db(self.conn)
         record_vk_registration_entries(
             self.conn,
             217130885,
