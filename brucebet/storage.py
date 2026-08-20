@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 from typing import Iterable, TYPE_CHECKING
@@ -302,7 +302,25 @@ CREATE TABLE IF NOT EXISTS model_forecasts (
     risk_level TEXT,
     captured_at TEXT NOT NULL,
     assessment_updated_at TEXT,
+    deadline_at TEXT,
+    freeze_reason TEXT NOT NULL DEFAULT 'legacy',
+    legacy_premature INTEGER NOT NULL DEFAULT 0,
     UNIQUE(match_id, model_key)
+);
+
+CREATE TABLE IF NOT EXISTS model_forecast_legacy_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_forecast_id INTEGER NOT NULL REFERENCES model_forecasts(id) ON DELETE CASCADE,
+    match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+    model_key TEXT NOT NULL,
+    suggested_score TEXT NOT NULL,
+    confidence REAL,
+    risk_level TEXT,
+    captured_at TEXT NOT NULL,
+    assessment_updated_at TEXT,
+    deadline_at TEXT,
+    archived_at TEXT NOT NULL,
+    reason TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS reminder_subscriptions (
@@ -401,6 +419,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     migrate_db(conn)
     activate_profile(conn)
+    mark_premature_model_forecasts(conn)
     _purge_vk_ui_noise_entries(conn)
     _dedupe_vk_registration_entries(conn)
     conn.commit()
@@ -416,6 +435,7 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS vk_topic_alerts;
         DROP TABLE IF EXISTS vk_topic_discovery_state;
         DROP TABLE IF EXISTS vk_registration_entries;
+        DROP TABLE IF EXISTS model_forecast_legacy_audit;
         DROP TABLE IF EXISTS model_forecasts;
         DROP TABLE IF EXISTS round_reviews;
         DROP TABLE IF EXISTS result_sync_runs;
@@ -518,6 +538,62 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     has_legacy_round_name_unique = ("name",) in unique_indexes
     if "season_id" not in rounds_columns or has_legacy_round_name_unique:
         rebuild_rounds_for_seasons(conn, ensure_legacy_season(conn))
+    model_forecast_columns = table_columns(conn, "model_forecasts")
+    for column, definition in (
+        ("deadline_at", "TEXT"),
+        ("freeze_reason", "TEXT NOT NULL DEFAULT 'legacy'"),
+        ("legacy_premature", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column not in model_forecast_columns:
+            conn.execute(f"ALTER TABLE model_forecasts ADD COLUMN {column} {definition}")
+
+
+def _utc_comparable(value: datetime | None) -> datetime | None:
+    if value is None or value.tzinfo is None or value.utcoffset() is None:
+        return None
+    return value.astimezone(timezone.utc)
+
+
+def mark_premature_model_forecasts(conn: sqlite3.Connection) -> int:
+    """Quarantine pre-deadline legacy freezes without deleting their evidence."""
+
+    rows = conn.execute(
+        """
+        SELECT
+            f.id,
+            f.captured_at,
+            (
+                SELECT MIN(m2.kickoff_at)
+                FROM matches m2
+                WHERE m2.round_id = r.id
+            ) AS first_kickoff_at
+        FROM model_forecasts f
+        JOIN matches m ON m.id = f.match_id
+        JOIN rounds r ON r.id = m.round_id
+        WHERE f.legacy_premature = 0 AND r.season_id = ?
+        """
+        ,
+        (active_season_id(conn),),
+    ).fetchall()
+    marked = 0
+    for row in rows:
+        captured_at = _utc_comparable(parse_datetime(row["captured_at"]))
+        first_kickoff_at = _utc_comparable(parse_datetime(row["first_kickoff_at"]))
+        if captured_at is None or first_kickoff_at is None:
+            continue
+        deadline_at = first_kickoff_at - timedelta(minutes=int(active_season(conn)["deadline_lock_minutes"]))
+        if captured_at >= deadline_at:
+            continue
+        cursor = conn.execute(
+            """
+            UPDATE model_forecasts
+            SET legacy_premature = 1, freeze_reason = 'premature_legacy', deadline_at = ?
+            WHERE id = ? AND legacy_premature = 0
+            """,
+            (deadline_at.isoformat(), int(row["id"])),
+        )
+        marked += int(cursor.rowcount)
+    return marked
 
 
 def record_vk_topic_discovery(
@@ -948,6 +1024,28 @@ def active_season_id(conn: sqlite3.Connection) -> int:
     return int(active_season(conn)["id"])
 
 
+def active_participant_id(conn: sqlite3.Connection, name: str) -> int | None:
+    """Return an active participant in the current season without enrolling anyone."""
+
+    requested = name.strip().casefold()
+    if not requested:
+        return None
+    rows = conn.execute(
+        """
+        SELECT p.id, p.name, sp.alias
+        FROM participants p
+        JOIN season_participants sp ON sp.participant_id = p.id
+        WHERE sp.season_id = ? AND sp.active = 1
+        """,
+        (active_season_id(conn),),
+    ).fetchall()
+    for row in rows:
+        labels = (str(row["name"]), str(row["alias"] or ""))
+        if any(label.casefold() == requested for label in labels if label):
+            return int(row["id"])
+    return None
+
+
 def ensure_season_participant(
     conn: sqlite3.Connection,
     participant_id: int,
@@ -1363,6 +1461,46 @@ def upsert_prediction(
             source = excluded.source
         """,
         (participant_id, int(match["id"]), score.strip(), submitted, source),
+    )
+    row = conn.execute(
+        "SELECT id FROM predictions WHERE participant_id = ? AND match_id = ?",
+        (participant_id, int(match["id"])),
+    ).fetchone()
+    return int(row["id"])
+
+
+def upsert_prediction_for_active_participant(
+    conn: sqlite3.Connection,
+    participant_id: int,
+    round_name: str,
+    position: int,
+    score: str,
+    submitted_at: str,
+    source: str | None,
+) -> int:
+    """Store a forecast without implicitly creating or reactivating a participant."""
+
+    match = conn.execute(
+        """
+        SELECT m.id
+        FROM matches m
+        JOIN rounds r ON r.id = m.round_id
+        WHERE r.season_id = ? AND r.name = ? AND m.position = ?
+        """,
+        (active_season_id(conn), round_name.strip(), position),
+    ).fetchone()
+    if match is None:
+        raise ValueError(f"Unknown match: round={round_name}, position={position}")
+    conn.execute(
+        """
+        INSERT INTO predictions(participant_id, match_id, score, submitted_at, source)
+        VALUES(?, ?, ?, ?, ?)
+        ON CONFLICT(participant_id, match_id) DO UPDATE SET
+            score = excluded.score,
+            submitted_at = excluded.submitted_at,
+            source = excluded.source
+        """,
+        (participant_id, int(match["id"]), score.strip(), submitted_at, source),
     )
     row = conn.execute(
         "SELECT id FROM predictions WHERE participant_id = ? AND match_id = ?",
@@ -1903,4 +2041,3 @@ def find_match(conn: sqlite3.Connection, query: str) -> sqlite3.Row:
     if row is None:
         raise ValueError(f"Match not found: {query}")
     return row
-
