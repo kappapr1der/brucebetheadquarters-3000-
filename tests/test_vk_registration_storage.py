@@ -161,6 +161,31 @@ class VkRegistrationStorageTests(unittest.TestCase):
             self.conn.execute("SELECT 1 FROM vk_registration_entries WHERE participant_name = 'Загружается'").fetchone()
         )
 
+    def test_reconciles_legacy_source_key_without_duplicate_registration_alert(self) -> None:
+        first = entry("vk:legacy", "Сергей", "paid_declared", 500)
+        alerts = record_vk_registration_entries(
+            self.conn,
+            217130885,
+            67251857,
+            [first],
+            seen_at="2026-08-20T12:00:00+03:00",
+        )
+        mark_vk_registration_alert_sent(self.conn, alerts[0], sent_at="2026-08-20T12:01:00+03:00")
+
+        refreshed = record_vk_registration_entries(
+            self.conn,
+            217130885,
+            67251857,
+            [entry("vk:stable", "Сергей", "paid_declared", 500)],
+            seen_at="2026-08-20T12:05:00+03:00",
+        )
+
+        self.assertEqual(refreshed, [])
+        rows = self.conn.execute(
+            "SELECT source_key FROM vk_registration_entries WHERE vk_author = 'Сергей'"
+        ).fetchall()
+        self.assertEqual([row["source_key"] for row in rows], ["vk:stable"])
+
 
 if __name__ == "__main__":
     unittest.main()
