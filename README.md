@@ -121,6 +121,7 @@ BRUCEBET_AUTO_SYNC_INTERVAL_HOURS=12
 BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES=5
 BRUCEBET_REMINDER_INTERVAL_MINUTES=5
 BRUCEBET_REMINDER_GRACE_MINUTES=35
+BRUCEBET_FINAL_PICK_LEAD_MINUTES=10
 BRUCEBET_VARIABLE_DAYS_AHEAD=365
 BRUCEBET_WEATHER_DAYS_AHEAD=16
 BRUCEBET_SNAPSHOT_LABEL=server-auto
@@ -153,6 +154,7 @@ THESPORTSDB_KEY=123
 - `/table`
 - `/field <матч>`
 - `/recommend <матч>`
+- `/picks [тур]`
 - `/edge [тур]`
 - `/odds <матч>`
 - `/quota`
@@ -327,6 +329,14 @@ Set `VK_TOPIC_DISCOVERY_ENABLED=1` to poll the public Forecasters Club discussio
 VK forecast imports append immutable `prediction_revisions`. Repeating the same capture is a no-op, a changed comment becomes one revision, and an edit first observed after the deadline is rejected without changing the current projection. Ambiguous comment identities, unknown participants, and incomplete fixture mappings go to `vk_prediction_quarantine` rather than being guessed.
 
 When the explicit import gate is enabled, every new meaningful VK forecast event also enters a durable SQLite outbox. Telegram delivery is tracked per whitelisted chat ID: a failed chat stays pending for the next poll, while successful chats are never sent the same event twice. The sanitized operational snapshot includes the event and delivery ledgers, but never Telegram tokens.
+
+## Contest Pick Ledger
+
+`match_assessments` remains an independent football assessment. It never reads participant forecasts and remains suitable for post-season calibration. Bruce's actual contest recommendation is a separate append-only `contest_recommendations` ledger, exposed through `/picks [тур]`; it never inserts or changes Bruce's row in `predictions`.
+
+For each match the deterministic synthesis combines available sources at 55% independent model, 25% market implied probability, and 20% eligible competitor field, normalized when a source is absent. Bruce is excluded from the field. The current standings strategy only applies a bounded adjustment, while the exact score normally stays with the assessment unless a strong field consensus or high volatility triggers the documented fallback. Every input fingerprint, source snapshot, strategy, readiness warning and predecessor record is retained.
+
+Only accepted VK projections for a specific round trigger a field recomputation. Repeated snapshots, quarantined blocks and rejected late edits do not change the contest pick. A durable Telegram delta is queued only when a displayed score/status changes. The final dispatcher checks every minute and freezes a pre-deadline snapshot at `BRUCEBET_FINAL_PICK_LEAD_MINUTES` before the effective deadline (10 minutes by default). A snapshot with incomplete field or intelligence remains explicitly provisional rather than being labelled final.
 
 Для прогнозов выводятся шаблон, дедлайн, автор комментария, фактический участник, нормализованные счета и статус `FULL`/`PARTIAL`. Для регистрации отдельно сохраняется заявленный выбор взноса и статус проверки оплаты: перевод считается только заявленным, пока организатор его не подтвердил. Тестовая тема РПЛ допускается лишь для проверки формата: dry-run пометит её как `non_epl`, а будущий импорт останется заблокированным.
 

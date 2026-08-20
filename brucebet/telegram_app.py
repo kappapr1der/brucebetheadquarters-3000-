@@ -125,6 +125,14 @@ from .vk_prediction_notifications import (
     pending_vk_prediction_notification_deliveries,
     render_vk_prediction_notification,
 )
+from .contest_recommendations import (
+    due_final_contest_rounds,
+    mark_contest_recommendation_delivery_failed,
+    mark_contest_recommendation_delivery_sent,
+    pending_contest_recommendation_deliveries,
+    recompute_contest_recommendations,
+    render_contest_recommendations,
+)
 from .vk_snapshot_archive import VkSnapshotArchiveResult, archive_public_topic_capture
 
 
@@ -163,6 +171,7 @@ class BotSettings:
     auto_sync_first_delay_minutes: int
     reminder_interval_minutes: int
     reminder_grace_minutes: int
+    final_pick_lead_minutes: int
     vk_group_id: int
     vk_registration_topic_id: int
     vk_predictions_topic_id: int
@@ -244,6 +253,7 @@ def load_settings() -> BotSettings:
         auto_sync_first_delay_minutes=int(os.getenv("BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES", "5")),
         reminder_interval_minutes=int(os.getenv("BRUCEBET_REMINDER_INTERVAL_MINUTES", "5")),
         reminder_grace_minutes=int(os.getenv("BRUCEBET_REMINDER_GRACE_MINUTES", "35")),
+        final_pick_lead_minutes=int(os.getenv("BRUCEBET_FINAL_PICK_LEAD_MINUTES", "10")),
         vk_group_id=int(os.getenv("VK_GROUP_ID", "217130885")),
         vk_registration_topic_id=int(os.getenv("VK_REGISTRATION_TOPIC_ID", "0")),
         vk_predictions_topic_id=int(os.getenv("VK_PREDICTIONS_TOPIC_ID", "0")),
@@ -940,6 +950,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/table - таблица конкурса",
                 "/field <матч> - поле прогнозов",
                 "/recommend <матч> - рекомендация по матчу",
+                "/picks [тур] - конкурсный прогноз Brucebet: модель, поле, рынок и риск",
                 "/odds <матч> - последние сохранённые кэфы",
                 "/quota - остаток кредитов The Odds API",
                 "/sources - проверить все источники данных",
@@ -1376,6 +1387,25 @@ async def recommend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         ]
     )
     await send_text(update, "\n".join(lines))
+
+
+@require_access
+async def picks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show Bruce's separate contest pick ledger without creating a prediction row."""
+
+    settings = settings_from_context(context)
+    conn = conn_from_context(context)
+    try:
+        batch = recompute_contest_recommendations(
+            conn,
+            round_name=query_text(context) or None,
+            user_participant=settings.user_participant,
+            lock_minutes=settings.lock_minutes,
+        )
+    except ValueError as exc:
+        await send_text(update, f"Не могу собрать конкурсный прогноз: {exc}")
+        return
+    await send_text(update, render_contest_recommendations(batch, final=batch.frozen_final))
 
 
 @require_access
@@ -2460,7 +2490,7 @@ def record_vk_predictions_worker(settings: BotSettings, report: object) -> VkPre
             season_display_name=settings.season_display,
             lock_minutes=settings.lock_minutes,
         )
-        return import_vk_prediction_report(
+        result = import_vk_prediction_report(
             conn,
             report,
             expected_group_id=settings.vk_group_id,
@@ -2468,6 +2498,18 @@ def record_vk_predictions_worker(settings: BotSettings, report: object) -> VkPre
             lock_minutes=settings.lock_minutes,
             notification_chat_ids=tuple(settings.allowed_chat_ids),
         )
+        # Only accepted projections change the field. Late edits, quarantines,
+        # and duplicate reads retain their audit trail but cannot move Bruce's pick.
+        for round_name in result.accepted_rounds:
+            recompute_contest_recommendations(
+                conn,
+                round_name=round_name,
+                user_participant=settings.user_participant,
+                lock_minutes=settings.lock_minutes,
+                notification_chat_ids=settings.allowed_chat_ids,
+                enqueue_update=True,
+            )
+        return result
     finally:
         conn.close()
 
@@ -2498,6 +2540,32 @@ def complete_vk_prediction_notification_delivery_worker(
         conn.close()
 
 
+def pending_contest_recommendation_delivery_worker(settings: BotSettings):
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        return pending_contest_recommendation_deliveries(conn, settings.allowed_chat_ids)
+    finally:
+        conn.close()
+
+
+def complete_contest_recommendation_delivery_worker(
+    settings: BotSettings,
+    delivery: object,
+    error: str | None = None,
+) -> None:
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        timestamp = datetime.now().astimezone().isoformat()
+        if error:
+            mark_contest_recommendation_delivery_failed(conn, delivery, error, attempted_at=timestamp)
+        else:
+            mark_contest_recommendation_delivery_sent(conn, delivery, sent_at=timestamp)
+    finally:
+        conn.close()
+
+
 async def deliver_pending_vk_prediction_notifications(context: ContextTypes.DEFAULT_TYPE, settings: BotSettings) -> None:
     """Retry durable VK prediction outbox deliveries without reimporting forecasts."""
 
@@ -2520,6 +2588,33 @@ async def deliver_pending_vk_prediction_notifications(context: ContextTypes.DEFA
             )
             continue
         await asyncio.to_thread(complete_vk_prediction_notification_delivery_worker, settings, delivery)
+
+
+async def deliver_pending_contest_recommendation_notifications(
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: BotSettings,
+) -> None:
+    """Deliver the separate contest-pick outbox; never replay VK imports."""
+
+    deliveries = await asyncio.to_thread(pending_contest_recommendation_delivery_worker, settings)
+    for delivery in deliveries:
+        try:
+            await context.bot.send_message(chat_id=delivery.chat_id, text=delivery.text)
+        except Exception as exc:  # noqa: BLE001 - retain a per-chat retry record.
+            LOGGER.warning(
+                "Contest recommendation alert failed chat=%s event=%s: %s",
+                delivery.chat_id,
+                delivery.event_key,
+                exc,
+            )
+            await asyncio.to_thread(
+                complete_contest_recommendation_delivery_worker,
+                settings,
+                delivery,
+                str(exc),
+            )
+            continue
+        await asyncio.to_thread(complete_contest_recommendation_delivery_worker, settings, delivery)
 
 
 def render_vk_snapshot_status(label: str, report: object, archive: VkSnapshotArchiveResult | None) -> str:
@@ -2647,6 +2742,70 @@ async def vk_registration_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             await asyncio.to_thread(complete_vk_registration_alert_worker, settings, alert)
 
 
+def finalize_due_contest_recommendations_worker(settings: BotSettings):
+    """Refresh stored football inputs, then freeze only rounds in the final window."""
+
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        activate_profile(
+            conn,
+            competition_code=settings.competition,
+            season_name=settings.season,
+            season_display_name=settings.season_display,
+            lock_minutes=settings.lock_minutes,
+        )
+        now = datetime.now().astimezone()
+        due_rounds = due_final_contest_rounds(
+            conn,
+            now=now,
+            lock_minutes=settings.lock_minutes,
+            lead_minutes=settings.final_pick_lead_minutes,
+        )
+        if not due_rounds:
+            return ()
+        sync_match_assessments(
+            conn,
+            now.isoformat(),
+            now=now,
+            days_ahead=settings.variables_days_ahead,
+            timezone_name=settings.timezone,
+        )
+        return tuple(
+            recompute_contest_recommendations(
+                conn,
+                round_name=round_name,
+                user_participant=settings.user_participant,
+                lock_minutes=settings.lock_minutes,
+                now=now,
+                finalize=True,
+                notification_chat_ids=settings.allowed_chat_ids,
+                enqueue_update=True,
+            )
+            for round_name in due_rounds
+        )
+    finally:
+        conn.close()
+
+
+async def final_contest_recommendation_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = settings_from_context(context)
+    try:
+        batches = await asyncio.to_thread(finalize_due_contest_recommendations_worker, settings)
+    except Exception:  # noqa: BLE001 - keep normal Telegram polling alive on a bad data snapshot.
+        LOGGER.exception("Final contest recommendation pass failed")
+        return
+    if batches:
+        LOGGER.info(
+            "Final contest recommendations frozen rounds=%s",
+            ",".join(batch.round_name for batch in batches),
+        )
+    try:
+        await deliver_pending_contest_recommendation_notifications(context, settings)
+    except Exception:  # noqa: BLE001 - delivery must not alter a frozen recommendation.
+        LOGGER.exception("Contest recommendation notification delivery pass failed")
+
+
 async def vk_predictions_snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Archive the read-only VK capture and optionally project it into SQLite."""
 
@@ -2691,6 +2850,10 @@ async def vk_predictions_snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> Non
         await deliver_pending_vk_prediction_notifications(context, settings)
     except Exception:  # noqa: BLE001 - delivery failures must never undo a committed import.
         LOGGER.exception("VK prediction notification delivery pass failed")
+    try:
+        await deliver_pending_contest_recommendation_notifications(context, settings)
+    except Exception:  # noqa: BLE001 - recommendation notifications are independently durable.
+        LOGGER.exception("Contest recommendation notification delivery pass failed")
 
 
 async def auto_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2809,6 +2972,25 @@ def configure_deadline_reminders(application: Application, settings: BotSettings
         name="brucebet-deadline-reminders",
     )
     LOGGER.info("Deadline reminder dispatcher scheduled every %s minutes", interval)
+
+
+def configure_final_contest_recommendations(application: Application, settings: BotSettings) -> None:
+    if not settings.allowed_chat_ids:
+        LOGGER.warning("Contest recommendations requested, but TELEGRAM_ALLOWED_CHAT_IDS is empty")
+        return
+    if application.job_queue is None:
+        LOGGER.warning("Final contest recommendations requested, but JobQueue is not available")
+        return
+    application.job_queue.run_repeating(
+        final_contest_recommendation_job,
+        interval=timedelta(minutes=1),
+        first=timedelta(seconds=25),
+        name="brucebet-final-contest-recommendations",
+    )
+    LOGGER.info(
+        "Contest recommendation finalizer checks every minute, lead=%s minutes",
+        max(1, settings.final_pick_lead_minutes),
+    )
 
 
 def configure_auto_sync(application: Application, settings: BotSettings) -> None:
@@ -2933,6 +3115,7 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("table", table_cmd))
     application.add_handler(CommandHandler("field", field_cmd))
     application.add_handler(CommandHandler("recommend", recommend_cmd))
+    application.add_handler(CommandHandler("picks", picks_cmd))
     application.add_handler(CommandHandler("odds", odds_cmd))
     application.add_handler(CommandHandler("quota", quota_cmd))
     application.add_handler(CommandHandler("sources", sources_cmd))
@@ -2971,6 +3154,7 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     configure_auto_sync(application, settings)
     configure_deadline_reminders(application, settings)
+    configure_final_contest_recommendations(application, settings)
     configure_vk_topic_discovery(application, settings)
     configure_vk_registration_sync(application, settings)
     configure_vk_predictions_snapshot(application, settings)

@@ -485,6 +485,80 @@ def active_season_snapshot_tables(season_id: int) -> Iterable[SnapshotTable]:
         (season_id,),
     )
     yield SnapshotTable(
+        "contest_recommendations.csv",
+        """
+        SELECT
+            r.name AS round,
+            cr.position,
+            cr.home,
+            cr.away,
+            cr.recommended_score,
+            cr.recommended_outcome,
+            cr.status,
+            cr.confidence,
+            cr.risk_level,
+            cr.model_suggested_score,
+            cr.model_probabilities_json,
+            cr.model_assessment_updated_at,
+            cr.field_prediction_count,
+            cr.field_expected_count,
+            cr.field_scores_json,
+            cr.field_outcomes_json,
+            cr.field_top_outcome,
+            cr.field_top_share,
+            cr.field_top_scores_json,
+            cr.market_present,
+            cr.market_captured_at,
+            cr.market_probabilities_json,
+            cr.market_top_outcome,
+            cr.market_top_share,
+            cr.strategy_mode,
+            cr.volatility,
+            cr.readiness_status,
+            cr.readiness_warnings_json,
+            cr.input_fingerprint,
+            cr.generated_at,
+            cr.frozen_final,
+            cr.freeze_reason,
+            cr.previous_recommendation_id
+        FROM contest_recommendations cr
+        JOIN rounds r ON r.id = cr.round_id
+        WHERE cr.season_id = ?
+        ORDER BY r.sort_order, cr.position, cr.id
+        """,
+        (season_id,),
+    )
+    yield SnapshotTable(
+        "contest_recommendation_notifications.csv",
+        """
+        SELECT event_key, season_id, round_id, kind, batch_fingerprint, text, created_at
+        FROM contest_recommendation_notifications
+        WHERE season_id = ?
+        ORDER BY created_at, event_key
+        """,
+        (season_id,),
+    )
+    yield SnapshotTable(
+        "contest_recommendation_notification_deliveries.csv",
+        """
+        SELECT
+            delivery.event_key,
+            event.kind,
+            delivery.chat_id,
+            delivery.status,
+            delivery.attempts,
+            delivery.created_at,
+            delivery.last_attempt_at,
+            delivery.sent_at,
+            delivery.error
+        FROM contest_recommendation_notification_deliveries delivery
+        JOIN contest_recommendation_notifications event ON event.event_key = delivery.event_key
+        WHERE event.season_id = ?
+        ORDER BY event.created_at, delivery.event_key, delivery.chat_id
+        """,
+        (season_id,),
+    )
+    yield SnapshotTable(
         "model_forecasts.csv",
         """
         SELECT

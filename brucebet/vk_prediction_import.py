@@ -39,6 +39,7 @@ class VkPredictionImportReport:
     quarantined: int
     issues: tuple[VkPredictionImportIssue, ...]
     notification_events_created: int = 0
+    accepted_rounds: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -360,6 +361,7 @@ def import_vk_prediction_report(
     rejected = 0
     quarantined = 0
     notification_events_created = 0
+    accepted_rounds: set[str] = set()
     issues: list[VkPredictionImportIssue] = []
     forecasts_seen = sum(len(item.forecasts) for item in report.forecast_submissions)
 
@@ -512,6 +514,7 @@ def import_vk_prediction_report(
                 item for item in created_details if str(item["eligibility_decision"]) == "quarantined"
             ]
             if accepted_details:
+                accepted_rounds.add(round_name)
                 is_edit = any(item["previous_revision_id"] is not None for item in accepted_details)
                 if is_edit:
                     kind = "edit"
@@ -583,4 +586,5 @@ def import_vk_prediction_report(
         quarantined=quarantined,
         issues=tuple(issues),
         notification_events_created=notification_events_created,
+        accepted_rounds=tuple(sorted(accepted_rounds)),
     )

@@ -510,6 +510,72 @@ CREATE TABLE IF NOT EXISTS vk_prediction_notification_deliveries (
     error TEXT,
     PRIMARY KEY(event_key, chat_id)
 );
+
+CREATE TABLE IF NOT EXISTS contest_recommendations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    season_id INTEGER NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+    round_id INTEGER NOT NULL REFERENCES rounds(id) ON DELETE CASCADE,
+    match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+    round_name TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    home TEXT NOT NULL,
+    away TEXT NOT NULL,
+    recommended_score TEXT NOT NULL,
+    recommended_outcome TEXT NOT NULL,
+    status TEXT NOT NULL,
+    confidence REAL,
+    risk_level TEXT,
+    model_suggested_score TEXT,
+    model_probabilities_json TEXT NOT NULL,
+    model_assessment_updated_at TEXT,
+    field_prediction_count INTEGER NOT NULL,
+    field_expected_count INTEGER NOT NULL,
+    field_scores_json TEXT NOT NULL,
+    field_outcomes_json TEXT NOT NULL,
+    field_top_outcome TEXT,
+    field_top_share REAL,
+    field_top_scores_json TEXT NOT NULL,
+    market_present INTEGER NOT NULL DEFAULT 0,
+    market_captured_at TEXT,
+    market_probabilities_json TEXT NOT NULL,
+    market_top_outcome TEXT,
+    market_top_share REAL,
+    strategy_mode TEXT NOT NULL,
+    volatility REAL,
+    readiness_status TEXT NOT NULL,
+    readiness_warnings_json TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    frozen_final INTEGER NOT NULL DEFAULT 0,
+    freeze_reason TEXT NOT NULL,
+    previous_recommendation_id INTEGER REFERENCES contest_recommendations(id),
+    UNIQUE(match_id, input_fingerprint, frozen_final)
+);
+
+CREATE INDEX IF NOT EXISTS contest_recommendations_round_latest_idx
+ON contest_recommendations(round_id, match_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS contest_recommendation_notifications (
+    event_key TEXT PRIMARY KEY,
+    season_id INTEGER NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+    round_id INTEGER NOT NULL REFERENCES rounds(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    batch_fingerprint TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS contest_recommendation_notification_deliveries (
+    event_key TEXT NOT NULL REFERENCES contest_recommendation_notifications(event_key) ON DELETE CASCADE,
+    chat_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    last_attempt_at TEXT,
+    sent_at TEXT,
+    error TEXT,
+    PRIMARY KEY(event_key, chat_id)
+);
 """
 
 
@@ -564,6 +630,9 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS vk_topic_alerts;
         DROP TABLE IF EXISTS vk_topic_discovery_state;
         DROP TABLE IF EXISTS vk_registration_entries;
+        DROP TABLE IF EXISTS contest_recommendation_notification_deliveries;
+        DROP TABLE IF EXISTS contest_recommendation_notifications;
+        DROP TABLE IF EXISTS contest_recommendations;
         DROP TABLE IF EXISTS vk_prediction_notification_deliveries;
         DROP TABLE IF EXISTS vk_prediction_notifications;
         DROP TABLE IF EXISTS vk_prediction_quarantine;

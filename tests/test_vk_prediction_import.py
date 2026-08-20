@@ -123,6 +123,8 @@ class VkPredictionImportTests(unittest.TestCase):
 
         self.assertEqual((first.revisions_created, first.accepted, first.duplicates), (10, 10, 0))
         self.assertEqual((repeated.revisions_created, repeated.accepted, repeated.duplicates), (0, 0, 10))
+        self.assertEqual(first.accepted_rounds, ("1",))
+        self.assertEqual(repeated.accepted_rounds, ())
         arsenal = self.conn.execute(
             """
             SELECT m.position, pr.score
