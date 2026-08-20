@@ -38,6 +38,7 @@ Recommended env:
 - `BRUCEBET_TIMEZONE=Europe/Moscow`
 - `PREMIER_LEAGUE_COMPSEASON_ID=841`
 - `PREMIER_LEAGUE_SEASON_LABEL=2026/2027`
+- `BRUCEBET_ALLOW_UNRESTRICTED_CHATS=0` (development override; never enable in production)
 - `BRUCEBET_AUTO_SYNC=1`
 - `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS=12`
 - `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES=5`
@@ -119,6 +120,13 @@ the round. On the first migration it requires complete one-to-one coverage of th
 fails atomically on missing or ambiguous team pairs. Take and restore-check an SQLite online backup
 before enabling that migration in production; inspect `fixture_sync_runs` and run `/sync_variables`
 afterward to refresh the retained 760 current team-match factors.
+
+Startup is fail-closed: an empty `TELEGRAM_ALLOWED_CHAT_IDS` aborts before polling or jobs start.
+Before rollout, run `python -m brucebet.telegram_app --smoke-test` with a non-empty test whitelist.
+Forecast writes append immutable `prediction_revisions`; missing, invalid, or timezone-naive source
+timestamps are quarantined and late edits are rejected without changing the current projection.
+Include `prediction_revisions.csv` in every operational snapshot and retain the SQLite backup for
+full restore.
 
 ## Updating data
 

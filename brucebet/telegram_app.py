@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import sys
 import tempfile
 from typing import Callable, Iterable
 
@@ -93,7 +94,6 @@ from .storage import (
     import_participants,
     import_predictions,
     init_db,
-    manual_prediction_history,
     manual_result_history,
     mark_vk_topic_alert_failed,
     mark_vk_topic_alert_sent,
@@ -101,6 +101,7 @@ from .storage import (
     mark_vk_registration_alert_sent,
     record_vk_registration_entries,
     record_vk_topic_discovery,
+    prediction_revision_history,
     set_manual_prediction_override,
     set_manual_match_result,
     upsert_absence,
@@ -134,6 +135,7 @@ class BotSettings:
     season: str
     season_display: str
     allowed_chat_ids: frozenset[int]
+    allow_unrestricted_chats: bool
     lock_minutes: int
     odds_api_key: str
     odds_sport: str
@@ -195,6 +197,15 @@ def load_settings() -> BotSettings:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
+    allowed_chat_ids = parse_chat_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS"))
+    allow_unrestricted_chats = parse_bool(os.getenv("BRUCEBET_ALLOW_UNRESTRICTED_CHATS"), default=False)
+    if not allowed_chat_ids and not allow_unrestricted_chats:
+        raise RuntimeError(
+            "TELEGRAM_ALLOWED_CHAT_IDS must contain at least one chat id; "
+            "BRUCEBET_ALLOW_UNRESTRICTED_CHATS=1 is a development-only override"
+        )
+    if allow_unrestricted_chats:
+        LOGGER.warning("Development override enabled: Telegram access is unrestricted")
     return BotSettings(
         token=token,
         db_path=Path(os.getenv("BRUCEBET_DB_PATH", "data/forecasters.sqlite")),
@@ -203,7 +214,8 @@ def load_settings() -> BotSettings:
         competition=os.getenv("BRUCEBET_COMPETITION", "epl"),
         season=os.getenv("BRUCEBET_SEASON", "2026/27"),
         season_display=os.getenv("BRUCEBET_SEASON_DISPLAY", "EPL 2026/27"),
-        allowed_chat_ids=parse_chat_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS")),
+        allowed_chat_ids=allowed_chat_ids,
+        allow_unrestricted_chats=allow_unrestricted_chats,
         lock_minutes=int(os.getenv("BRUCEBET_LOCK_MINUTES", "90")),
         odds_api_key=os.getenv("THE_ODDS_API_KEY", "").strip(),
         odds_sport=os.getenv("THE_ODDS_API_SPORT", DEFAULT_ODDS_SPORT).strip() or DEFAULT_ODDS_SPORT,
@@ -295,7 +307,8 @@ def require_access(func: Callable) -> Callable:
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         settings = settings_from_context(context)
         chat = update.effective_chat
-        if settings.allowed_chat_ids and (chat is None or chat.id not in settings.allowed_chat_ids):
+        allowed = chat is not None and chat.id in settings.allowed_chat_ids
+        if not allowed and not settings.allow_unrestricted_chats:
             LOGGER.warning("Rejected chat_id=%s", chat.id if chat else None)
             if update.effective_message:
                 await update.effective_message.reply_text("Нет доступа к этому боту.")
@@ -441,9 +454,21 @@ def render_forecast_import(participant: str, round_name: str, report: ForecastIm
             + ", ".join(str(row) for row in report.protected_positions)
             + ". Для осознанной правки используй /overrideforecast - она попадёт в журнал."
         )
+    if report.rejected_positions:
+        sections.append(
+            "После дедлайна отклонены позиции: "
+            + ", ".join(str(row) for row in report.rejected_positions)
+            + ". Решение сохранено в журнале, но текущий прогноз не изменён."
+        )
+    if report.quarantined_positions:
+        sections.append(
+            "На ручную проверку помещены позиции: "
+            + ", ".join(str(row) for row in report.quarantined_positions)
+            + ". Нужен корректный timezone-aware timestamp."
+        )
     if report.missing_positions or report.duplicate_positions or report.invalid_lines or report.extra_lines:
         sections.append("Корректные строки уже сохранены. Исправь отмеченное и пришли блок повторно до дедлайна.")
-    elif report.protected_positions:
+    elif report.protected_positions or report.rejected_positions or report.quarantined_positions:
         sections.append("Ранние прогнозы оставлены как есть; поздняя вставка не перетёрла их.")
     else:
         sections.append("Блок чистый. Теперь кидай следующий прогноз или смотри /field и /edge.")
@@ -934,7 +959,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/setresult Матч | 2:1 | причина - ручной резервный результат с журналом",
                 "/resulthistory <матч> - история ручных исправлений результата",
                 "/overrideforecast Участник | Матч | 2:1 | причина - ручная правка прогноза с журналом",
-                "/forecasthistory Участник | Матч - история ручных правок прогноза",
+                "/forecasthistory Участник | Матч - полная история импорта и правок прогноза",
             ]
         ),
     )
@@ -1234,17 +1259,24 @@ async def forecasthistory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     except ValueError as exc:
         await send_text(update, str(exc))
         return
-    rows = manual_prediction_history(conn, participant, int(match["id"]))
+    rows = prediction_revision_history(conn, participant, int(match["id"]))
     if not rows:
-        await send_text(update, f"Ручных правок для {participant} по этому матчу пока нет.")
+        await send_text(update, f"Истории прогнозов для {participant} по этому матчу пока нет.")
         return
     await send_text(
         update,
         f"{participant}: {match_header(match)}\n\n"
         + render_rows(
-            ["previous", "new", "changed_at", "chat_id", "reason"],
+            ["source", "raw", "normalized", "submitted_at", "decision", "reason"],
             [
-                [row["previous_score"], row["new_score"], row["changed_at"], clean(row["actor_chat_id"]), clean(row["reason"])]
+                [
+                    row["source_kind"],
+                    clean(row["raw_score"]),
+                    clean(row["normalized_score"]),
+                    clean(row["source_submitted_at"]),
+                    row["eligibility_decision"],
+                    row["reason"],
+                ]
                 for row in rows
             ],
         ),
@@ -2126,7 +2158,12 @@ async def process_forecast_block(
 ) -> None:
     settings = settings_from_context(context)
     conn = conn_from_context(context)
-    submitted_at = update.effective_message.date if update.effective_message else datetime.now().astimezone()
+    settings = settings_from_context(context)
+    message = update.effective_message
+    submitted_at = message.date if message else datetime.now().astimezone()
+    chat_id = update.effective_chat.id if update.effective_chat is not None else None
+    message_id = message.message_id if message is not None else None
+    source_item_id = f"telegram:{chat_id}:{message_id}" if chat_id is not None and message_id is not None else None
     try:
         report = import_forecast_block(
             conn,
@@ -2136,6 +2173,9 @@ async def process_forecast_block(
             submitted_at=submitted_at,
             source="telegram-forecast",
             lock_minutes=settings.lock_minutes,
+            source_item_id=source_item_id,
+            observed_at=datetime.now(timezone.utc),
+            actor=f"telegram-chat:{chat_id}" if chat_id is not None else "telegram",
         )
     except ValueError as exc:
         await send_text(update, str(exc))
@@ -2842,9 +2882,14 @@ def main() -> None:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
     LOGGER.info("Starting BruceBet Telegram bot db=%s data_dir=%s", settings.db_path, settings.data_dir)
-    build_application(settings).run_polling(close_loop=False)
+    application = build_application(settings)
+    if "--smoke-test" in sys.argv[1:]:
+        LOGGER.info("Telegram startup smoke passed handlers=%s jobs=%s", len(application.handlers), len(application.job_queue.jobs()))
+        return
+    application.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
     main()
+
 

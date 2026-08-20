@@ -5,13 +5,12 @@ from datetime import datetime
 import re
 import sqlite3
 
-from .scoring import normalize_score, parse_datetime
+from .scoring import normalize_score
 from .storage import (
     active_participant_id,
     active_season_id,
     ensure_participant,
-    prediction_update_is_locked,
-    upsert_prediction_for_active_participant,
+    ingest_prediction_revision,
 )
 
 
@@ -42,6 +41,14 @@ class ParsedForecast:
 
 
 @dataclass(frozen=True)
+class InvalidForecast:
+    position: int
+    raw_score: str
+    line_number: int
+    raw_line: str
+
+
+@dataclass(frozen=True)
 class ForecastImportReport:
     matches: tuple[ExpectedMatch, ...]
     forecasts: tuple[ParsedForecast, ...]
@@ -50,8 +57,11 @@ class ForecastImportReport:
     duplicate_positions: tuple[int, ...]
     extra_lines: tuple[str, ...]
     missing_positions: tuple[int, ...]
+    invalid_forecasts: tuple[InvalidForecast, ...] = ()
     stored_positions: tuple[int, ...] = ()
     protected_positions: tuple[int, ...] = ()
+    rejected_positions: tuple[int, ...] = ()
+    quarantined_positions: tuple[int, ...] = ()
 
     @property
     def expected_count(self) -> int:
@@ -159,6 +169,7 @@ def parse_forecast_block(text: str, matches: list[ExpectedMatch]) -> ForecastImp
     parsed: list[ParsedForecast] = []
     normalized: list[ParsedForecast] = []
     invalid_lines: list[str] = []
+    invalid_forecasts: list[InvalidForecast] = []
     duplicate_positions: list[int] = []
     extra_lines: list[str] = []
     assigned: set[int] = set()
@@ -170,21 +181,29 @@ def parse_forecast_block(text: str, matches: list[ExpectedMatch]) -> ForecastImp
         tokens = SCORE_TOKEN_RE.findall(line)
         if not tokens:
             continue
+        labelled = _labelled_match(line, matches)
+        candidate_position = labelled.position if labelled is not None else next(
+            (match.position for match in matches if match.position not in assigned),
+            None,
+        )
         if len(tokens) != 1:
             invalid_lines.append(f"line {line_number}: more than one score ({line})")
+            if labelled is not None:
+                invalid_forecasts.append(InvalidForecast(labelled.position, line, line_number, line))
             continue
 
         raw_score = tokens[0]
         score = normalize_score(raw_score)
         if score is None:
             invalid_lines.append(f"line {line_number}: unsupported score {raw_score}")
+            if candidate_position is not None:
+                invalid_forecasts.append(InvalidForecast(candidate_position, raw_score, line_number, line))
             continue
 
-        labelled = _labelled_match(line, matches)
         if labelled is not None:
             position = labelled.position
         else:
-            position = next((match.position for match in matches if match.position not in assigned), None)
+            position = candidate_position
             if position is None:
                 extra_lines.append(f"line {line_number}: {line}")
                 continue
@@ -208,15 +227,8 @@ def parse_forecast_block(text: str, matches: list[ExpectedMatch]) -> ForecastImp
         duplicate_positions=tuple(sorted(set(duplicate_positions))),
         extra_lines=tuple(extra_lines),
         missing_positions=tuple(sorted(expected - assigned)),
+        invalid_forecasts=tuple(invalid_forecasts),
     )
-
-
-def _aware_submission_timestamp(submitted_at: datetime | str | None) -> str:
-    raw = submitted_at.isoformat() if isinstance(submitted_at, datetime) else submitted_at
-    timestamp = parse_datetime(raw)
-    if timestamp is None or timestamp.tzinfo is None or timestamp.utcoffset() is None:
-        raise ValueError("Нужна дата отправки с часовым поясом; прогноз не записан.")
-    return timestamp.isoformat()
 
 
 def import_forecast_block(
@@ -227,52 +239,69 @@ def import_forecast_block(
     submitted_at: datetime | str | None = None,
     source: str = "direct-import",
     lock_minutes: int = 90,
+    source_item_id: str | None = None,
+    observed_at: datetime | str | None = None,
+    actor: str | None = None,
 ) -> ForecastImportReport:
     matches = expected_matches(conn, round_name)
     report = parse_forecast_block(text, matches)
+    timestamp = submitted_at.isoformat() if isinstance(submitted_at, datetime) else submitted_at
     participant_name = participant.strip()
-    participant_id = active_participant_id(conn, participant_name)
-    if participant_id is None:
+    if active_participant_id(conn, participant_name) is None:
         raise ValueError(
             f"Участник {participant_name!r} не зарегистрирован в активном сезоне. "
             "Сначала добавь его через список участников или дождись заявки из VK."
         )
-    timestamp = _aware_submission_timestamp(submitted_at)
     stored_positions: list[int] = []
     protected_positions: list[int] = []
-    conn.execute("SAVEPOINT forecast_block_import")
-    try:
-        for forecast in report.forecasts:
-            if prediction_update_is_locked(
-                conn,
-                participant=participant_name,
-                round_name=round_name,
-                position=forecast.position,
-                submitted_at=timestamp,
-                lock_minutes=lock_minutes,
-            ):
-                protected_positions.append(forecast.position)
-                continue
-            upsert_prediction_for_active_participant(
-                conn,
-                participant_id=participant_id,
-                round_name=round_name.strip(),
-                position=forecast.position,
-                score=forecast.score,
-                submitted_at=timestamp,
-                source=f"{source}:line-{forecast.line_number}",
-            )
+    rejected_positions: list[int] = []
+    quarantined_positions: list[int] = []
+    source_item_base = source_item_id or f"{source}:{participant_name.casefold()}:{round_name.strip()}:{timestamp or 'missing'}"
+    for forecast in report.forecasts:
+        result = ingest_prediction_revision(
+            conn,
+            participant=participant_name,
+            round_name=round_name,
+            position=forecast.position,
+            score=forecast.raw_score,
+            submitted_at=submitted_at,
+            source=f"{source}:line-{forecast.line_number}",
+            stable_source_item_id=f"{source_item_base}:position-{forecast.position}",
+            observed_at=observed_at,
+            actor=actor,
+            lock_minutes=lock_minutes,
+        )
+        if result.accepted:
             stored_positions.append(forecast.position)
-    except Exception:
-        conn.execute("ROLLBACK TO SAVEPOINT forecast_block_import")
-        conn.execute("RELEASE SAVEPOINT forecast_block_import")
-        raise
-    conn.execute("RELEASE SAVEPOINT forecast_block_import")
+        elif result.reason == "late_edit":
+            protected_positions.append(forecast.position)
+        elif result.decision == "rejected":
+            rejected_positions.append(forecast.position)
+        else:
+            quarantined_positions.append(forecast.position)
+    for invalid in report.invalid_forecasts:
+        result = ingest_prediction_revision(
+            conn,
+            participant=participant_name,
+            round_name=round_name,
+            position=invalid.position,
+            score=invalid.raw_score,
+            submitted_at=submitted_at,
+            source=f"{source}:line-{invalid.line_number}",
+            stable_source_item_id=f"{source_item_base}:position-{invalid.position}",
+            observed_at=observed_at,
+            actor=actor,
+            lock_minutes=lock_minutes,
+        )
+        if result.decision == "quarantined":
+            quarantined_positions.append(invalid.position)
     conn.commit()
     return replace(
         report,
         stored_positions=tuple(stored_positions),
         protected_positions=tuple(protected_positions),
+        rejected_positions=tuple(rejected_positions),
+        quarantined_positions=tuple(sorted(set(quarantined_positions))),
     )
 
 
