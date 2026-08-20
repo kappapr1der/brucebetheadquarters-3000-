@@ -349,7 +349,10 @@ def active_season_snapshot_tables(season_id: int) -> Iterable[SnapshotTable]:
             f.confidence,
             f.risk_level,
             f.captured_at,
-            f.assessment_updated_at
+            f.assessment_updated_at,
+            f.deadline_at,
+            f.freeze_reason,
+            f.legacy_premature
         FROM model_forecasts f
         JOIN matches m ON m.id = f.match_id
         JOIN rounds r ON r.id = m.round_id
