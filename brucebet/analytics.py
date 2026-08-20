@@ -429,12 +429,14 @@ def next_calendar_match(
     conn: sqlite3.Connection,
     user_participant: str = "Bruce Wayne",
     lock_minutes: int = 90,
+    start_at: datetime | None = None,
 ) -> CalendarItem | None:
     matches = calendar_matches(
         conn,
         days=370,
         user_participant=user_participant,
         lock_minutes=lock_minutes,
+        start_at=start_at,
         limit=50,
     )
     return next((item for item in matches if not item.result), None)
@@ -1705,3 +1707,4 @@ def match_dossier(conn: sqlite3.Connection, match_id: int) -> dict[str, object]:
         "factors": factors,
         "absences": absences,
     }
+
