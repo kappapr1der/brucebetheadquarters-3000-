@@ -119,6 +119,12 @@ from .vk_oauth import (
 )
 from .vk_parser import parse_file as parse_vk_file
 from .vk_prediction_import import VkPredictionImportReport, import_vk_prediction_report
+from .vk_prediction_notifications import (
+    mark_vk_prediction_notification_delivery_failed,
+    mark_vk_prediction_notification_delivery_sent,
+    pending_vk_prediction_notification_deliveries,
+    render_vk_prediction_notification,
+)
 from .vk_snapshot_archive import VkSnapshotArchiveResult, archive_public_topic_capture
 
 
@@ -2460,9 +2466,60 @@ def record_vk_predictions_worker(settings: BotSettings, report: object) -> VkPre
             expected_group_id=settings.vk_group_id,
             expected_topic_id=settings.vk_predictions_topic_id,
             lock_minutes=settings.lock_minutes,
+            notification_chat_ids=tuple(settings.allowed_chat_ids),
         )
     finally:
         conn.close()
+
+
+def pending_vk_prediction_notification_worker(settings: BotSettings):
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        return pending_vk_prediction_notification_deliveries(conn, settings.allowed_chat_ids)
+    finally:
+        conn.close()
+
+
+def complete_vk_prediction_notification_delivery_worker(
+    settings: BotSettings,
+    delivery: object,
+    error: str | None = None,
+) -> None:
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        timestamp = datetime.now().astimezone().isoformat()
+        if error:
+            mark_vk_prediction_notification_delivery_failed(conn, delivery, error, attempted_at=timestamp)
+        else:
+            mark_vk_prediction_notification_delivery_sent(conn, delivery, sent_at=timestamp)
+    finally:
+        conn.close()
+
+
+async def deliver_pending_vk_prediction_notifications(context: ContextTypes.DEFAULT_TYPE, settings: BotSettings) -> None:
+    """Retry durable VK prediction outbox deliveries without reimporting forecasts."""
+
+    deliveries = await asyncio.to_thread(pending_vk_prediction_notification_worker, settings)
+    for delivery in deliveries:
+        try:
+            await context.bot.send_message(chat_id=delivery.chat_id, text=render_vk_prediction_notification(delivery))
+        except Exception as exc:  # noqa: BLE001 - keep this chat's delivery pending for a later poll.
+            LOGGER.warning(
+                "VK prediction alert failed chat=%s event=%s: %s",
+                delivery.chat_id,
+                delivery.event_key,
+                exc,
+            )
+            await asyncio.to_thread(
+                complete_vk_prediction_notification_delivery_worker,
+                settings,
+                delivery,
+                str(exc),
+            )
+            continue
+        await asyncio.to_thread(complete_vk_prediction_notification_delivery_worker, settings, delivery)
 
 
 def render_vk_snapshot_status(label: str, report: object, archive: VkSnapshotArchiveResult | None) -> str:
@@ -2618,7 +2675,7 @@ async def vk_predictions_snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     LOGGER.info(
         "VK predictions import topic=%s submissions=%s forecasts=%s revisions=%s duplicates=%s "
-        "accepted=%s rejected=%s quarantined=%s issues=%s",
+        "accepted=%s rejected=%s quarantined=%s issues=%s notification_events=%s",
         imported.topic_id,
         imported.submissions_seen,
         imported.forecasts_seen,
@@ -2628,7 +2685,12 @@ async def vk_predictions_snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> Non
         imported.rejected,
         imported.quarantined,
         len(imported.issues),
+        getattr(imported, "notification_events_created", 0),
     )
+    try:
+        await deliver_pending_vk_prediction_notifications(context, settings)
+    except Exception:  # noqa: BLE001 - delivery failures must never undo a committed import.
+        LOGGER.exception("VK prediction notification delivery pass failed")
 
 
 async def auto_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:

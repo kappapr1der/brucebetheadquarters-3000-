@@ -326,6 +326,8 @@ Set `VK_TOPIC_DISCOVERY_ENABLED=1` to poll the public Forecasters Club discussio
 
 VK forecast imports append immutable `prediction_revisions`. Repeating the same capture is a no-op, a changed comment becomes one revision, and an edit first observed after the deadline is rejected without changing the current projection. Ambiguous comment identities, unknown participants, and incomplete fixture mappings go to `vk_prediction_quarantine` rather than being guessed.
 
+When the explicit import gate is enabled, every new meaningful VK forecast event also enters a durable SQLite outbox. Telegram delivery is tracked per whitelisted chat ID: a failed chat stays pending for the next poll, while successful chats are never sent the same event twice. The sanitized operational snapshot includes the event and delivery ledgers, but never Telegram tokens.
+
 Для прогнозов выводятся шаблон, дедлайн, автор комментария, фактический участник, нормализованные счета и статус `FULL`/`PARTIAL`. Для регистрации отдельно сохраняется заявленный выбор взноса и статус проверки оплаты: перевод считается только заявленным, пока организатор его не подтвердил. Тестовая тема РПЛ допускается лишь для проверки формата: dry-run пометит её как `non_epl`, а будущий импорт останется заблокированным.
 
 Реальные прогнозы, участники, SQLite и выгрузки должны жить только в серверном `data/`.

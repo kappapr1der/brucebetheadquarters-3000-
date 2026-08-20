@@ -484,6 +484,32 @@ CREATE TABLE IF NOT EXISTS vk_prediction_quarantine (
     resolved_at TEXT,
     UNIQUE(group_id, topic_id, source_key, content_fingerprint, reason)
 );
+
+CREATE TABLE IF NOT EXISTS vk_prediction_notifications (
+    event_key TEXT PRIMARY KEY,
+    group_id INTEGER NOT NULL,
+    topic_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL,
+    participant_name TEXT NOT NULL,
+    vk_author TEXT NOT NULL,
+    round_name TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vk_prediction_notification_deliveries (
+    event_key TEXT NOT NULL REFERENCES vk_prediction_notifications(event_key) ON DELETE CASCADE,
+    chat_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    last_attempt_at TEXT,
+    sent_at TEXT,
+    error TEXT,
+    PRIMARY KEY(event_key, chat_id)
+);
 """
 
 
@@ -538,6 +564,8 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS vk_topic_alerts;
         DROP TABLE IF EXISTS vk_topic_discovery_state;
         DROP TABLE IF EXISTS vk_registration_entries;
+        DROP TABLE IF EXISTS vk_prediction_notification_deliveries;
+        DROP TABLE IF EXISTS vk_prediction_notifications;
         DROP TABLE IF EXISTS vk_prediction_quarantine;
         DROP TABLE IF EXISTS model_forecast_legacy_audit;
         DROP TABLE IF EXISTS model_forecasts;

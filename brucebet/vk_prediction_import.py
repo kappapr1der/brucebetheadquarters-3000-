@@ -11,6 +11,7 @@ from .storage import active_season_id, ingest_prediction_revision
 from .variable_sync import resolve_existing_team
 from .vk_dry_run import VkForecastSubmission, VkTopicDryRunReport
 from .vk_parser import MatchTemplate, RoundTemplate
+from .vk_prediction_notifications import enqueue_vk_prediction_notification
 
 
 class VkPredictionImportError(ValueError):
@@ -37,6 +38,7 @@ class VkPredictionImportReport:
     rejected: int
     quarantined: int
     issues: tuple[VkPredictionImportIssue, ...]
+    notification_events_created: int = 0
 
 
 @dataclass(frozen=True)
@@ -136,6 +138,74 @@ def _quarantine(
     return cursor.rowcount > 0
 
 
+def _revision_notification_detail(conn: sqlite3.Connection, revision_id: int) -> dict[str, object]:
+    row = conn.execute(
+        """
+        SELECT
+            rev.previous_revision_id,
+            rev.normalized_score AS new_score,
+            rev.eligibility_decision,
+            rev.reason,
+            rev.deadline_at,
+            m.position,
+            m.home,
+            m.away,
+            previous.normalized_score AS old_score,
+            projection.score AS current_score
+        FROM prediction_revisions rev
+        JOIN matches m ON m.id = rev.match_id
+        LEFT JOIN prediction_revisions previous ON previous.id = rev.previous_revision_id
+        LEFT JOIN predictions projection
+          ON projection.participant_id = rev.participant_id AND projection.match_id = rev.match_id
+        WHERE rev.id = ?
+        """,
+        (revision_id,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"missing prediction revision {revision_id}")
+    return dict(row)
+
+
+def _notification_changes(details: list[dict[str, object]]) -> list[dict[str, str]]:
+    return [
+        {
+            "home": str(item["home"]),
+            "away": str(item["away"]),
+            "old_score": str(item["old_score"] or "?"),
+            "new_score": str(item["new_score"] or "?"),
+            "current_score": str(item["current_score"] or item["old_score"] or "?"),
+        }
+        for item in sorted(details, key=lambda item: int(item["position"]))
+    ]
+
+
+def _queue_notification(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    report: VkTopicDryRunReport,
+    submission: VkForecastSubmission,
+    stable_comment_key: str,
+    content_fingerprint: str,
+    payload: dict[str, object],
+    chat_ids: tuple[int, ...],
+) -> bool:
+    return enqueue_vk_prediction_notification(
+        conn,
+        kind=kind,
+        group_id=report.group_id,
+        topic_id=report.topic_id,
+        source_key=stable_comment_key,
+        content_fingerprint=content_fingerprint,
+        participant_name=submission.participant.strip() or "unknown",
+        vk_author=submission.vk_author.strip() or "unknown",
+        round_name=submission.round_name.strip() or "unknown",
+        payload=payload,
+        chat_ids=chat_ids,
+        created_at=report.captured_at.isoformat(),
+    )
+
+
 def _registered_participant(conn: sqlite3.Connection, value: str) -> str | None:
     rows = list(
         conn.execute(
@@ -227,6 +297,7 @@ def import_vk_prediction_report(
     expected_group_id: int,
     expected_topic_id: int,
     lock_minutes: int = 90,
+    notification_chat_ids: tuple[int, ...] | list[int] | set[int] = (),
 ) -> VkPredictionImportReport:
     """Project one read-only VK capture into SQLite through immutable revisions.
 
@@ -243,6 +314,7 @@ def import_vk_prediction_report(
     if report.league_hint != "epl" or not report.future_ingestion_allowed:
         raise VkPredictionImportError(f"VK predictions topic failed EPL gate: {report.league_hint}")
     observed_at = _aware(report.captured_at, "captured_at")
+    notification_recipients = tuple(sorted({int(chat_id) for chat_id in notification_chat_ids}))
     templates = _template_by_round(report)
 
     referenced_rounds = {item.round_name.strip() for item in report.forecast_submissions}
@@ -287,6 +359,7 @@ def import_vk_prediction_report(
     accepted = 0
     rejected = 0
     quarantined = 0
+    notification_events_created = 0
     issues: list[VkPredictionImportIssue] = []
     forecasts_seen = sum(len(item.forecasts) for item in report.forecast_submissions)
 
@@ -295,6 +368,17 @@ def import_vk_prediction_report(
         for submission, stable_comment, reason in immediate_issues:
             if _quarantine(conn, report, submission, stable_comment_key=stable_comment, reason=reason):
                 quarantined += 1
+                if _queue_notification(
+                    conn,
+                    kind="quarantine",
+                    report=report,
+                    submission=submission,
+                    stable_comment_key=stable_comment,
+                    content_fingerprint=_payload_fingerprint(_submission_payload(submission, stable_comment)),
+                    payload={"reason": reason},
+                    chat_ids=notification_recipients,
+                ):
+                    notification_events_created += 1
             issues.append(
                 VkPredictionImportIssue(submission.source_key, submission.participant, submission.round_name, reason)
             )
@@ -309,6 +393,17 @@ def import_vk_prediction_report(
                 reason = str(mapping or f"no fixture mapping for round {round_name}")
                 if _quarantine(conn, report, submission, stable_comment_key=stable_comment, reason=reason):
                     quarantined += 1
+                    if _queue_notification(
+                        conn,
+                        kind="quarantine",
+                        report=report,
+                        submission=submission,
+                        stable_comment_key=stable_comment,
+                        content_fingerprint=_payload_key,
+                        payload={"reason": reason},
+                        chat_ids=notification_recipients,
+                    ):
+                        notification_events_created += 1
                 issues.append(VkPredictionImportIssue(submission.source_key, submission.participant, round_name, reason))
                 continue
 
@@ -327,6 +422,17 @@ def import_vk_prediction_report(
                 reason = "forecast block is incomplete or does not match the VK round template"
                 if _quarantine(conn, report, submission, stable_comment_key=stable_comment, reason=reason):
                     quarantined += 1
+                    if _queue_notification(
+                        conn,
+                        kind="quarantine",
+                        report=report,
+                        submission=submission,
+                        stable_comment_key=stable_comment,
+                        content_fingerprint=_payload_key,
+                        payload={"reason": reason},
+                        chat_ids=notification_recipients,
+                    ):
+                        notification_events_created += 1
                 issues.append(VkPredictionImportIssue(submission.source_key, submission.participant, round_name, reason))
                 continue
 
@@ -335,6 +441,17 @@ def import_vk_prediction_report(
                 reason = "participant is not uniquely registered for the active season"
                 if _quarantine(conn, report, submission, stable_comment_key=stable_comment, reason=reason):
                     quarantined += 1
+                    if _queue_notification(
+                        conn,
+                        kind="quarantine",
+                        report=report,
+                        submission=submission,
+                        stable_comment_key=stable_comment,
+                        content_fingerprint=_payload_key,
+                        payload={"reason": reason},
+                        chat_ids=notification_recipients,
+                    ):
+                        notification_events_created += 1
                 issues.append(VkPredictionImportIssue(submission.source_key, submission.participant, round_name, reason))
                 continue
 
@@ -351,6 +468,7 @@ def import_vk_prediction_report(
                 (len(comment_match_prefix), comment_match_prefix),
             ).fetchone() is not None
             eligibility_at = observed_at if known_comment else submission.submitted_at
+            created_details: list[dict[str, object]] = []
 
             for forecast in submission.forecasts:
                 mapped = mapping.get(forecast.position)
@@ -373,12 +491,78 @@ def import_vk_prediction_report(
                     duplicates += 1
                     continue
                 revisions_created += 1
+                detail = _revision_notification_detail(conn, result.revision_id)
+                created_details.append(detail)
                 if result.accepted:
                     accepted += 1
                 elif result.decision == "rejected":
                     rejected += 1
                 else:
                     quarantined += 1
+
+            accepted_details = [
+                item
+                for item in created_details
+                if str(item["eligibility_decision"]) in {"accepted", "accepted_partial_late", "manual_override"}
+            ]
+            rejected_details = [
+                item for item in created_details if str(item["eligibility_decision"]) == "rejected"
+            ]
+            quarantined_details = [
+                item for item in created_details if str(item["eligibility_decision"]) == "quarantined"
+            ]
+            if accepted_details:
+                is_edit = any(item["previous_revision_id"] is not None for item in accepted_details)
+                if is_edit:
+                    kind = "edit"
+                    payload: dict[str, object] = {"changes": _notification_changes(accepted_details)}
+                else:
+                    kind = "new"
+                    payload = {
+                        "accepted": len(accepted_details),
+                        "expected": len(mapping),
+                        "deadline_at": accepted_details[0]["deadline_at"],
+                    }
+                if _queue_notification(
+                    conn,
+                    kind=kind,
+                    report=report,
+                    submission=submission,
+                    stable_comment_key=stable_comment,
+                    content_fingerprint=_payload_key,
+                    payload=payload,
+                    chat_ids=notification_recipients,
+                ):
+                    notification_events_created += 1
+            if rejected_details:
+                has_late_edit = any(str(item["reason"]) == "late_edit" for item in rejected_details)
+                kind = "late_edit" if has_late_edit else "late_submission"
+                if _queue_notification(
+                    conn,
+                    kind=kind,
+                    report=report,
+                    submission=submission,
+                    stable_comment_key=stable_comment,
+                    content_fingerprint=_payload_key,
+                    payload={
+                        "reason": "late_edit" if has_late_edit else str(rejected_details[0]["reason"]),
+                        "changes": _notification_changes(rejected_details),
+                    },
+                    chat_ids=notification_recipients,
+                ):
+                    notification_events_created += 1
+            if quarantined_details:
+                if _queue_notification(
+                    conn,
+                    kind="quarantine",
+                    report=report,
+                    submission=submission,
+                    stable_comment_key=stable_comment,
+                    content_fingerprint=_payload_key,
+                    payload={"reason": str(quarantined_details[0]["reason"])},
+                    chat_ids=notification_recipients,
+                ):
+                    notification_events_created += 1
 
         conn.execute("RELEASE SAVEPOINT vk_prediction_import")
         conn.commit()
@@ -398,4 +582,5 @@ def import_vk_prediction_report(
         rejected=rejected,
         quarantined=quarantined,
         issues=tuple(issues),
+        notification_events_created=notification_events_created,
     )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime
+import json
 import unittest
 
 from brucebet.storage import connect, ensure_participant, reset_db, upsert_match
@@ -9,6 +10,10 @@ from brucebet.vk_board import VkPublicTopicResult
 from brucebet.vk_dry_run import parse_public_topic_result
 from brucebet.vk_parser import MSK
 from brucebet.vk_prediction_import import VkPredictionImportError, import_vk_prediction_report
+from brucebet.vk_prediction_notifications import (
+    pending_vk_prediction_notification_deliveries,
+    render_vk_prediction_notification,
+)
 
 
 MATCHES = (
@@ -25,8 +30,12 @@ MATCHES = (
 )
 
 
-def prediction_text(first_score: str = "2:1", participant: str = "Сергей") -> str:
-    scores = [first_score, *(score for _home, _away, score in MATCHES[1:])]
+def prediction_text(
+    first_score: str = "2:1",
+    participant: str = "Сергей",
+    scores: tuple[str, ...] | None = None,
+) -> str:
+    scores = scores or (first_score, *(score for _home, _away, score in MATCHES[1:]))
     template_lines = "\n".join(f"{home} - {away}" for home, away, _score in MATCHES)
     forecast_lines = "\n".join(
         f"{home} - {away} {score}" for (home, away, _default), score in zip(MATCHES, scores)
@@ -49,8 +58,9 @@ def make_report(
     *,
     participant: str = "Сергей",
     captured_at: datetime | None = None,
+    scores: tuple[str, ...] | None = None,
 ):
-    text = prediction_text(first_score, participant)
+    text = prediction_text(first_score, participant, scores)
     result = VkPublicTopicResult(
         group_id=217130885,
         topic_id=67251746,
@@ -88,14 +98,20 @@ class VkPredictionImportTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.close()
 
-    def import_report(self, report):
+    def import_report(self, report, *, notification_chat_ids: tuple[int, ...] = ()):
         return import_vk_prediction_report(
             self.conn,
             report,
             expected_group_id=217130885,
             expected_topic_id=67251746,
             lock_minutes=90,
+            notification_chat_ids=notification_chat_ids,
         )
+
+    def notification_rows(self):
+        return self.conn.execute(
+            "SELECT event_key, kind, payload_json FROM vk_prediction_notifications ORDER BY created_at, event_key"
+        ).fetchall()
 
     def test_pair_mapping_survives_position_reorder_and_repeat_is_noop(self) -> None:
         ensure_participant(self.conn, "Сергей", paid=1)
@@ -181,6 +197,98 @@ class VkPredictionImportTests(unittest.TestCase):
         self.assertIsNone(
             self.conn.execute("SELECT id FROM participants WHERE name = 'Незнакомец'").fetchone()
         )
+
+    def test_first_forecast_enqueues_one_grouped_notification_and_replay_is_silent(self) -> None:
+        ensure_participant(self.conn, "Сергей", paid=1)
+        report = make_report()
+
+        first = self.import_report(report, notification_chat_ids=(42, 77))
+        repeated = self.import_report(report, notification_chat_ids=(42, 77))
+
+        self.assertEqual((first.revisions_created, first.notification_events_created), (10, 1))
+        self.assertEqual((repeated.revisions_created, repeated.notification_events_created), (0, 0))
+        rows = self.notification_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "new")
+        self.assertEqual(json.loads(rows[0]["payload_json"])["accepted"], 10)
+        deliveries = pending_vk_prediction_notification_deliveries(self.conn, (42, 77))
+        self.assertEqual([(item.chat_id, item.kind) for item in deliveries], [(42, "new"), (77, "new")])
+        text = render_vk_prediction_notification(deliveries[0])
+        self.assertIn("🎯 Новый прогноз — Тур 1", text)
+        self.assertIn("Принято: 10/10", text)
+
+    def test_one_and_many_match_edits_each_enqueue_one_grouped_event(self) -> None:
+        ensure_participant(self.conn, "Сергей", paid=1)
+        self.import_report(make_report(), notification_chat_ids=(42,))
+
+        one_match = self.import_report(
+            make_report("1:1", captured_at=datetime(2030, 8, 11, 12, 0, tzinfo=MSK)),
+            notification_chat_ids=(42,),
+        )
+        self.assertEqual((one_match.revisions_created, one_match.notification_events_created), (1, 1))
+        one_event = self.notification_rows()[-1]
+        self.assertEqual(one_event["kind"], "edit")
+        one_payload = json.loads(one_event["payload_json"])
+        self.assertEqual(len(one_payload["changes"]), 1)
+        self.assertIn("Arsenal — Chelsea: 2:1 → 1:1", render_vk_prediction_notification(
+            pending_vk_prediction_notification_deliveries(self.conn, (42,))[-1]
+        ))
+
+        scores = ("3:0", "2:2", *(score for _home, _away, score in MATCHES[2:]))
+        many_match = self.import_report(
+            make_report(captured_at=datetime(2030, 8, 12, 12, 0, tzinfo=MSK), scores=scores),
+            notification_chat_ids=(42,),
+        )
+        self.assertEqual((many_match.revisions_created, many_match.notification_events_created), (2, 1))
+        many_event = self.notification_rows()[-1]
+        self.assertEqual(many_event["kind"], "edit")
+        self.assertEqual(len(json.loads(many_event["payload_json"])["changes"]), 2)
+
+    def test_late_edit_alert_preserves_current_projection(self) -> None:
+        ensure_participant(self.conn, "Сергей", paid=1)
+        self.import_report(make_report(), notification_chat_ids=(42,))
+        self.import_report(
+            make_report("1:1", captured_at=datetime(2030, 8, 11, 12, 0, tzinfo=MSK)),
+            notification_chat_ids=(42,),
+        )
+
+        late = self.import_report(
+            make_report("0:0", captured_at=datetime(2030, 8, 22, 12, 0, tzinfo=MSK)),
+            notification_chat_ids=(42,),
+        )
+
+        self.assertEqual((late.revisions_created, late.rejected, late.notification_events_created), (1, 1, 1))
+        event = self.notification_rows()[-1]
+        self.assertEqual(event["kind"], "late_edit")
+        late_delivery = pending_vk_prediction_notification_deliveries(self.conn, (42,))[-1]
+        rendered = render_vk_prediction_notification(late_delivery)
+        self.assertIn("⛔ Поздняя правка отклонена", rendered)
+        self.assertIn("Arsenal — Chelsea: 1:1 → 0:0 (текущий: 1:1)", rendered)
+        self.assertIn("Текущий прогноз сохранён без изменений.", rendered)
+        score = self.conn.execute(
+            """
+            SELECT prediction.score
+            FROM predictions prediction
+            JOIN matches match ON match.id = prediction.match_id
+            WHERE match.home = 'Arsenal' AND match.away = 'Chelsea'
+            """
+        ).fetchone()[0]
+        self.assertEqual(score, "1:1")
+
+    def test_quarantine_is_visible_and_unknown_participant_is_not_created(self) -> None:
+        report = make_report(participant="Незнакомец")
+
+        first = self.import_report(report, notification_chat_ids=(42,))
+        repeated = self.import_report(report, notification_chat_ids=(42,))
+
+        self.assertEqual((first.quarantined, first.notification_events_created), (1, 1))
+        self.assertEqual((repeated.quarantined, repeated.notification_events_created), (0, 0))
+        event = self.notification_rows()[0]
+        self.assertEqual(event["kind"], "quarantine")
+        rendered = render_vk_prediction_notification(pending_vk_prediction_notification_deliveries(self.conn, (42,))[0])
+        self.assertIn("⚠️ Прогноз отправлен на проверку", rendered)
+        self.assertIn("Участник: Незнакомец", rendered)
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM participants WHERE name = 'Незнакомец'").fetchone())
 
     def test_fixture_mismatch_quarantines_the_whole_submission(self) -> None:
         ensure_participant(self.conn, "Сергей", paid=1)

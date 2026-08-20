@@ -241,6 +241,45 @@ def active_season_snapshot_tables(season_id: int) -> Iterable[SnapshotTable]:
         """,
     )
     yield SnapshotTable(
+        "vk_prediction_notifications.csv",
+        """
+        SELECT
+            event_key,
+            group_id,
+            topic_id,
+            kind,
+            source_key,
+            content_fingerprint,
+            participant_name,
+            vk_author,
+            round_name,
+            payload_json,
+            created_at
+        FROM vk_prediction_notifications
+        ORDER BY created_at, event_key
+        """,
+    )
+    yield SnapshotTable(
+        "vk_prediction_notification_deliveries.csv",
+        """
+        SELECT
+            delivery.event_key,
+            event.kind,
+            event.participant_name,
+            event.round_name,
+            delivery.chat_id,
+            delivery.status,
+            delivery.attempts,
+            delivery.created_at,
+            delivery.last_attempt_at,
+            delivery.sent_at,
+            delivery.error
+        FROM vk_prediction_notification_deliveries delivery
+        JOIN vk_prediction_notifications event ON event.event_key = delivery.event_key
+        ORDER BY event.created_at, delivery.event_key, delivery.chat_id
+        """,
+    )
+    yield SnapshotTable(
         "teams.csv",
         """
         SELECT

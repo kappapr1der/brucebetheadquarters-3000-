@@ -8,7 +8,13 @@ import unittest
 from unittest.mock import patch
 
 try:
-    from brucebet.telegram_app import forecast_cmd, load_settings, text_handler, vk_predictions_snapshot_job
+    from brucebet.telegram_app import (
+        deliver_pending_vk_prediction_notifications,
+        forecast_cmd,
+        load_settings,
+        text_handler,
+        vk_predictions_snapshot_job,
+    )
 
     TELEGRAM_AVAILABLE = True
 except ModuleNotFoundError as exc:
@@ -17,6 +23,7 @@ except ModuleNotFoundError as exc:
     TELEGRAM_AVAILABLE = False
 
 from brucebet.storage import connect, ensure_participant, reset_db, upsert_match
+from brucebet.vk_prediction_notifications import enqueue_vk_prediction_notification
 
 
 class FakeMessage:
@@ -28,6 +35,17 @@ class FakeMessage:
 
     async def reply_text(self, text: str) -> None:
         self.replies.append(text)
+
+
+class FakeBot:
+    def __init__(self, failing_chat_ids: set[int] | None = None) -> None:
+        self.failing_chat_ids = failing_chat_ids or set()
+        self.messages: list[tuple[int, str]] = []
+
+    async def send_message(self, *, chat_id: int, text: str) -> None:
+        if chat_id in self.failing_chat_ids:
+            raise RuntimeError(f"chat {chat_id} is unavailable")
+        self.messages.append((chat_id, text))
 
 
 def fake_update(text: str, date: str, message_id: int = 100, chat_id: int = 42):
@@ -159,11 +177,70 @@ class TelegramForecastHandlerTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("brucebet.telegram_app.read_vk_predictions_worker", return_value=(report, archive)),
             patch("brucebet.telegram_app.record_vk_predictions_worker", return_value=imported) as record,
+            patch("brucebet.telegram_app.deliver_pending_vk_prediction_notifications") as deliver,
         ):
             await vk_predictions_snapshot_job(disabled_context)
             record.assert_not_called()
+            deliver.assert_not_called()
             await vk_predictions_snapshot_job(enabled_context)
             record.assert_called_once_with(enabled_context.application.bot_data["settings"], report)
+            deliver.assert_awaited_once_with(enabled_context, enabled_context.application.bot_data["settings"])
+
+    async def test_vk_prediction_outbox_retries_per_allowed_chat_without_duplicate_delivery(self) -> None:
+        conn = connect(self.db_path)
+        event_created = enqueue_vk_prediction_notification(
+            conn,
+            kind="new",
+            group_id=217130885,
+            topic_id=67251746,
+            source_key="vk:sergey:2030-08-10T12:10:00+03:00",
+            content_fingerprint="fixture-content",
+            participant_name="Сергей",
+            vk_author="Mr Sam",
+            round_name="1",
+            payload={"accepted": 10, "expected": 10, "deadline_at": "2030-08-21T18:30:00+01:00"},
+            chat_ids=(42, 77),
+            created_at="2030-08-10T13:00:00+03:00",
+        )
+        conn.commit()
+        conn.close()
+        self.assertTrue(event_created)
+        settings = replace(self.settings, allowed_chat_ids=frozenset({42, 77}), vk_predictions_import_enabled=True)
+        failing_bot = FakeBot({42})
+        context = SimpleNamespace(bot=failing_bot)
+
+        await deliver_pending_vk_prediction_notifications(context, settings)
+
+        self.assertEqual([chat_id for chat_id, _text in failing_bot.messages], [77])
+        conn = connect(self.db_path)
+        first_attempt = [
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT chat_id, status, attempts, error IS NOT NULL
+                FROM vk_prediction_notification_deliveries
+                ORDER BY chat_id
+                """
+            )
+        ]
+        conn.close()
+        self.assertEqual(first_attempt, [(42, "pending", 1, 1), (77, "sent", 0, 0)])
+
+        retry_bot = FakeBot()
+        retry_context = SimpleNamespace(bot=retry_bot)
+        await deliver_pending_vk_prediction_notifications(retry_context, settings)
+        await deliver_pending_vk_prediction_notifications(retry_context, settings)
+
+        self.assertEqual([chat_id for chat_id, _text in retry_bot.messages], [42])
+        conn = connect(self.db_path)
+        final_attempt = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT chat_id, status, attempts FROM vk_prediction_notification_deliveries ORDER BY chat_id"
+            )
+        ]
+        conn.close()
+        self.assertEqual(final_attempt, [(42, "sent", 1), (77, "sent", 0)])
 
 
 @unittest.skipUnless(TELEGRAM_AVAILABLE, "python-telegram-bot is installed in Docker and CI")

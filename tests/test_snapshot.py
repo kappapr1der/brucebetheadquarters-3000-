@@ -78,8 +78,12 @@ class SnapshotTest(unittest.TestCase):
             self.assertIn("prediction_revisions.csv", filenames)
             self.assertIn("fixture_identity_events.csv", filenames)
             self.assertIn("fixture_sync_runs.csv", filenames)
+            self.assertIn("vk_prediction_notifications.csv", filenames)
+            self.assertIn("vk_prediction_notification_deliveries.csv", filenames)
             self.assertEqual(result.tables["fixture_identity_events.csv"], 0)
             self.assertEqual(result.tables["fixture_sync_runs.csv"], 0)
+            self.assertEqual(result.tables["vk_prediction_notifications.csv"], 0)
+            self.assertEqual(result.tables["vk_prediction_notification_deliveries.csv"], 0)
             self.assertFalse(any(path.suffix == ".sqlite" for path in out_dir.iterdir()))
 
 
