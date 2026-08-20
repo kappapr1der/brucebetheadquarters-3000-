@@ -37,6 +37,7 @@
 - `/quota`, `/sync_odds`, `/odds`: проверка квоты The Odds API, синк кэфов, просмотр снимков.
 - `/sources`: health-check всех подключенных источников данных.
 - `/sync_fixtures`: официальный календарь Premier League из public API сайта PL.
+- `vk_board`: публичное read-only чтение VK-темы через Chromium; `vk_dry_run` структурирует регистрацию или прогнозы без SQLite.
 - `/sync_results`: только финальные результаты из официального PL feed, затем автоматическое закрытие завершённого тура.
 - Сервисные сообщения: “принято”, “теперь кидай прогнозы участников”, “проверь аудит”.
 - Устойчивые напоминания за 24 часа, 6 часов, 3 часа, 1 час и 20 минут до дедлайна: доставки лежат в SQLite и переживают рестарт контейнера.
@@ -251,7 +252,7 @@ python -m brucebet.cli --db brucebet.sqlite import --reset `
 - Team match factors: lineup confidence, absences impact, fatigue, baseline motivation.
 - Draft `match_assessments` based on Elo and latest stored odds when available.
 
-Telegram has `/sync_variables`, `/sync_results`, and `/dossier <match>`. The bot also runs a quiet background sync every `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS` when `BRUCEBET_AUTO_SYNC=1`, after `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES` on startup. It freezes available model drafts before kickoff and checks finished official results without spending Odds API credits.
+Telegram has `/sync_variables`, `/sync_results`, and `/dossier <match>`. The bot also runs a quiet background sync every `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS` when `BRUCEBET_AUTO_SYNC=1`, after `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES` on startup. Model drafts are frozen only once the relevant tour deadline has arrived; the deadline dispatcher checks this every `BRUCEBET_REMINDER_INTERVAL_MINUTES`. Finished official results are checked without spending Odds API credits.
 
 The background sync does not call The Odds API, so it does not spend odds credits. Use `/sync_odds` manually closer to deadline. `/schedule` subscribes the current chat to persistent reminders; the dispatcher checks due deliveries every `BRUCEBET_REMINDER_INTERVAL_MINUTES` and retries failed sends inside the configured grace window.
 
@@ -302,6 +303,22 @@ Then send a forecast with the participant name on the first line and scores belo
 New names without a payment marker are added outside the prize bank until they are resent with `300р`; this prevents accidental prize eligibility.
 
 ## Runtime Data
+
+## VK Dry Run
+
+Будущие темы АПЛ пока не заданы: передавай URL явно. Команда читает только публичную страницу через Chromium, не открывает SQLite и ничего не публикует во VK:
+
+```powershell
+python -m brucebet.cli vk-dry-run --kind registration --topic-url <VK_REGISTRATION_TOPIC_URL>
+python -m brucebet.cli vk-dry-run --kind predictions --topic-url <VK_PREDICTIONS_TOPIC_URL>
+python -m brucebet.cli vk-discover
+```
+
+Set `VK_TOPIC_DISCOVERY_ENABLED=1` to poll the public Forecasters Club discussion list. The first pass with at least one discovered topic is a quiet baseline; later newly discovered EPL registration or prediction topics produce one Telegram alert. `/vk_topics` runs the same public, read-only check manually. RPL is ignored by the alert queue and no VK discovery result imports contest data.
+
+`/vk_snapshot` reads the configured EPL registration and prediction topics, keeps a local archive of changed public fields in `data/vk_snapshots/`, and reports the recognized entry/block counts. Set `VK_PREDICTIONS_SNAPSHOT_ENABLED=1` to run the same read-only archive job every 20 minutes. No forecast from this route is written to SQLite.
+
+Для прогнозов выводятся шаблон, дедлайн, автор комментария, фактический участник, нормализованные счета и статус `FULL`/`PARTIAL`. Для регистрации отдельно сохраняется заявленный выбор взноса и статус проверки оплаты: перевод считается только заявленным, пока организатор его не подтвердил. Тестовая тема РПЛ допускается лишь для проверки формата: dry-run пометит её как `non_epl`, а будущий импорт останется заблокированным.
 
 Реальные прогнозы, участники, SQLite и выгрузки должны жить только в серверном `data/`.
 

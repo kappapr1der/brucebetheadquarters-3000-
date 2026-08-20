@@ -85,7 +85,11 @@ class EplHeadquartersTest(unittest.TestCase):
 
     def test_calendar_finds_next_match_and_round(self) -> None:
         conn = load_epl_sample()
-        item = next_calendar_match(conn, user_participant="Bruce Wayne")
+        item = next_calendar_match(
+            conn,
+            user_participant="Bruce Wayne",
+            start_at=datetime(2026, 8, 1).astimezone(),
+        )
 
         self.assertIsNotNone(item)
         self.assertEqual(item.label, "Brighton - Newcastle")
@@ -144,3 +148,4 @@ class EplHeadquartersTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

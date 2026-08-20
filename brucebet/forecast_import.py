@@ -5,8 +5,14 @@ from datetime import datetime
 import re
 import sqlite3
 
-from .scoring import normalize_score
-from .storage import active_season_id, ensure_participant, prediction_update_is_locked, upsert_prediction
+from .scoring import normalize_score, parse_datetime
+from .storage import (
+    active_participant_id,
+    active_season_id,
+    ensure_participant,
+    prediction_update_is_locked,
+    upsert_prediction_for_active_participant,
+)
 
 
 SCORE_TOKEN_RE = re.compile(r"(?<!\d)(\d+\s*[:;\-–—]\s*\d+)(?!\d)")
@@ -205,6 +211,14 @@ def parse_forecast_block(text: str, matches: list[ExpectedMatch]) -> ForecastImp
     )
 
 
+def _aware_submission_timestamp(submitted_at: datetime | str | None) -> str:
+    raw = submitted_at.isoformat() if isinstance(submitted_at, datetime) else submitted_at
+    timestamp = parse_datetime(raw)
+    if timestamp is None or timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("Нужна дата отправки с часовым поясом; прогноз не записан.")
+    return timestamp.isoformat()
+
+
 def import_forecast_block(
     conn: sqlite3.Connection,
     participant: str,
@@ -216,32 +230,44 @@ def import_forecast_block(
 ) -> ForecastImportReport:
     matches = expected_matches(conn, round_name)
     report = parse_forecast_block(text, matches)
-    timestamp = submitted_at.isoformat() if isinstance(submitted_at, datetime) else submitted_at
     participant_name = participant.strip()
-    ensure_participant(conn, participant_name, paid=None)
+    participant_id = active_participant_id(conn, participant_name)
+    if participant_id is None:
+        raise ValueError(
+            f"Участник {participant_name!r} не зарегистрирован в активном сезоне. "
+            "Сначала добавь его через список участников или дождись заявки из VK."
+        )
+    timestamp = _aware_submission_timestamp(submitted_at)
     stored_positions: list[int] = []
     protected_positions: list[int] = []
-    for forecast in report.forecasts:
-        if prediction_update_is_locked(
-            conn,
-            participant=participant_name,
-            round_name=round_name,
-            position=forecast.position,
-            submitted_at=timestamp,
-            lock_minutes=lock_minutes,
-        ):
-            protected_positions.append(forecast.position)
-            continue
-        upsert_prediction(
-            conn,
-            participant=participant_name,
-            round_name=round_name.strip(),
-            position=forecast.position,
-            score=forecast.score,
-            submitted_at=timestamp,
-            source=f"{source}:line-{forecast.line_number}",
-        )
-        stored_positions.append(forecast.position)
+    conn.execute("SAVEPOINT forecast_block_import")
+    try:
+        for forecast in report.forecasts:
+            if prediction_update_is_locked(
+                conn,
+                participant=participant_name,
+                round_name=round_name,
+                position=forecast.position,
+                submitted_at=timestamp,
+                lock_minutes=lock_minutes,
+            ):
+                protected_positions.append(forecast.position)
+                continue
+            upsert_prediction_for_active_participant(
+                conn,
+                participant_id=participant_id,
+                round_name=round_name.strip(),
+                position=forecast.position,
+                score=forecast.score,
+                submitted_at=timestamp,
+                source=f"{source}:line-{forecast.line_number}",
+            )
+            stored_positions.append(forecast.position)
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT forecast_block_import")
+        conn.execute("RELEASE SAVEPOINT forecast_block_import")
+        raise
+    conn.execute("RELEASE SAVEPOINT forecast_block_import")
     conn.commit()
     return replace(
         report,

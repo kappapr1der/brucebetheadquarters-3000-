@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
+from typing import Iterable, TYPE_CHECKING
 
 from .scoring import parse_datetime, parse_score
+
+if TYPE_CHECKING:
+    from .vk_board import VkDiscoveredTopic
+    from .vk_dry_run import VkRegistrationEntry
 
 
 DEFAULT_COMPETITION_CODE = "epl"
@@ -14,6 +20,20 @@ DEFAULT_SEASON_NAME = "2026/27"
 LEGACY_COMPETITION_CODE = "legacy"
 LEGACY_COMPETITION_NAME = "Legacy imported data"
 LEGACY_SEASON_NAME = "pre-season-model"
+VK_UI_NOISE_PARTICIPANTS = frozenset(
+    {
+        "show likes",
+        "show reactions",
+        "show more posts",
+        "загружается",
+        "показать список оценивших",
+        "показать реакции",
+        "reply",
+        "share",
+        "ответить",
+        "поделиться",
+    }
+)
 
 
 SCHEMA = """
@@ -282,7 +302,25 @@ CREATE TABLE IF NOT EXISTS model_forecasts (
     risk_level TEXT,
     captured_at TEXT NOT NULL,
     assessment_updated_at TEXT,
+    deadline_at TEXT,
+    freeze_reason TEXT NOT NULL DEFAULT 'legacy',
+    legacy_premature INTEGER NOT NULL DEFAULT 0,
     UNIQUE(match_id, model_key)
+);
+
+CREATE TABLE IF NOT EXISTS model_forecast_legacy_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_forecast_id INTEGER NOT NULL REFERENCES model_forecasts(id) ON DELETE CASCADE,
+    match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+    model_key TEXT NOT NULL,
+    suggested_score TEXT NOT NULL,
+    confidence REAL,
+    risk_level TEXT,
+    captured_at TEXT NOT NULL,
+    assessment_updated_at TEXT,
+    deadline_at TEXT,
+    archived_at TEXT NOT NULL,
+    reason TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS reminder_subscriptions (
@@ -304,7 +342,69 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries (
     error TEXT,
     UNIQUE(chat_id, round_id, reminder_key)
 );
+
+CREATE TABLE IF NOT EXISTS vk_topic_discovery_state (
+    group_id INTEGER PRIMARY KEY,
+    initialized_at TEXT NOT NULL,
+    last_checked_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vk_topic_alerts (
+    group_id INTEGER NOT NULL,
+    topic_id INTEGER NOT NULL,
+    topic_kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    notification_status TEXT NOT NULL DEFAULT 'pending',
+    notified_at TEXT,
+    notification_error TEXT,
+    PRIMARY KEY(group_id, topic_id)
+);
+
+CREATE TABLE IF NOT EXISTS vk_registration_entries (
+    group_id INTEGER NOT NULL,
+    topic_id INTEGER NOT NULL,
+    source_key TEXT NOT NULL,
+    participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+    vk_author TEXT NOT NULL,
+    participant_name TEXT NOT NULL,
+    submitted_at TEXT NOT NULL,
+    fee_intent TEXT NOT NULL,
+    fee_amount_rub INTEGER,
+    payment_status TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    notification_status TEXT NOT NULL DEFAULT 'pending',
+    notified_at TEXT,
+    notification_error TEXT,
+    PRIMARY KEY(group_id, topic_id, source_key)
+);
 """
+
+
+@dataclass(frozen=True)
+class VkTopicAlert:
+    group_id: int
+    topic_id: int
+    topic_kind: str
+    title: str
+    url: str
+    first_seen_at: str
+
+
+@dataclass(frozen=True)
+class VkRegistrationAlert:
+    group_id: int
+    topic_id: int
+    source_key: str
+    participant_name: str
+    vk_author: str
+    submitted_at: str
+    fee_intent: str
+    fee_amount_rub: int | None
+    payment_status: str
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -319,6 +419,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     migrate_db(conn)
     activate_profile(conn)
+    mark_premature_model_forecasts(conn)
+    _purge_vk_ui_noise_entries(conn)
+    _dedupe_vk_registration_entries(conn)
     conn.commit()
 
 
@@ -329,6 +432,10 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS match_assessments;
         DROP TABLE IF EXISTS reminder_deliveries;
         DROP TABLE IF EXISTS reminder_subscriptions;
+        DROP TABLE IF EXISTS vk_topic_alerts;
+        DROP TABLE IF EXISTS vk_topic_discovery_state;
+        DROP TABLE IF EXISTS vk_registration_entries;
+        DROP TABLE IF EXISTS model_forecast_legacy_audit;
         DROP TABLE IF EXISTS model_forecasts;
         DROP TABLE IF EXISTS round_reviews;
         DROP TABLE IF EXISTS result_sync_runs;
@@ -431,6 +538,408 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     has_legacy_round_name_unique = ("name",) in unique_indexes
     if "season_id" not in rounds_columns or has_legacy_round_name_unique:
         rebuild_rounds_for_seasons(conn, ensure_legacy_season(conn))
+    model_forecast_columns = table_columns(conn, "model_forecasts")
+    for column, definition in (
+        ("deadline_at", "TEXT"),
+        ("freeze_reason", "TEXT NOT NULL DEFAULT 'legacy'"),
+        ("legacy_premature", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column not in model_forecast_columns:
+            conn.execute(f"ALTER TABLE model_forecasts ADD COLUMN {column} {definition}")
+
+
+def _utc_comparable(value: datetime | None) -> datetime | None:
+    if value is None or value.tzinfo is None or value.utcoffset() is None:
+        return None
+    return value.astimezone(timezone.utc)
+
+
+def mark_premature_model_forecasts(conn: sqlite3.Connection) -> int:
+    """Quarantine pre-deadline legacy freezes without deleting their evidence."""
+
+    rows = conn.execute(
+        """
+        SELECT
+            f.id,
+            f.captured_at,
+            (
+                SELECT MIN(m2.kickoff_at)
+                FROM matches m2
+                WHERE m2.round_id = r.id
+            ) AS first_kickoff_at
+        FROM model_forecasts f
+        JOIN matches m ON m.id = f.match_id
+        JOIN rounds r ON r.id = m.round_id
+        WHERE f.legacy_premature = 0 AND r.season_id = ?
+        """
+        ,
+        (active_season_id(conn),),
+    ).fetchall()
+    marked = 0
+    for row in rows:
+        captured_at = _utc_comparable(parse_datetime(row["captured_at"]))
+        first_kickoff_at = _utc_comparable(parse_datetime(row["first_kickoff_at"]))
+        if captured_at is None or first_kickoff_at is None:
+            continue
+        deadline_at = first_kickoff_at - timedelta(minutes=int(active_season(conn)["deadline_lock_minutes"]))
+        if captured_at >= deadline_at:
+            continue
+        cursor = conn.execute(
+            """
+            UPDATE model_forecasts
+            SET legacy_premature = 1, freeze_reason = 'premature_legacy', deadline_at = ?
+            WHERE id = ? AND legacy_premature = 0
+            """,
+            (deadline_at.isoformat(), int(row["id"])),
+        )
+        marked += int(cursor.rowcount)
+    return marked
+
+
+def record_vk_topic_discovery(
+    conn: sqlite3.Connection,
+    group_id: int,
+    candidates: Iterable["VkDiscoveredTopic"],
+    *,
+    checked_at: str,
+) -> tuple[bool, list[VkTopicAlert]]:
+    """Persist discovery state and return candidate topics that still need a Telegram alert.
+
+    The first successful pass is a baseline. It deliberately produces no alert,
+    so old discussions cannot be mistaken for newly opened EPL topics.
+    """
+
+    observed = list(candidates)
+    # A blank render can mean that VK changed its page shell. Do not establish
+    # a baseline until the browser has actually exposed at least one topic link.
+    if not observed:
+        return False, []
+    normalized = [item for item in observed if item.is_epl_candidate]
+    state = conn.execute(
+        "SELECT group_id FROM vk_topic_discovery_state WHERE group_id = ?",
+        (int(group_id),),
+    ).fetchone()
+    baseline = state is None
+
+    for item in normalized:
+        status = "baseline" if baseline else "pending"
+        conn.execute(
+            """
+            INSERT INTO vk_topic_alerts(
+                group_id, topic_id, topic_kind, title, url,
+                first_seen_at, last_seen_at, notification_status
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(group_id, topic_id) DO UPDATE SET
+                topic_kind = excluded.topic_kind,
+                title = excluded.title,
+                url = excluded.url,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (
+                int(item.group_id),
+                int(item.topic_id),
+                item.topic_kind,
+                item.title,
+                item.url,
+                checked_at,
+                checked_at,
+                status,
+            ),
+        )
+
+    if baseline:
+        conn.execute(
+            """
+            INSERT INTO vk_topic_discovery_state(group_id, initialized_at, last_checked_at)
+            VALUES(?, ?, ?)
+            """,
+            (int(group_id), checked_at, checked_at),
+        )
+        conn.commit()
+        return True, []
+
+    conn.execute(
+        "UPDATE vk_topic_discovery_state SET last_checked_at = ? WHERE group_id = ?",
+        (checked_at, int(group_id)),
+    )
+    rows = conn.execute(
+        """
+        SELECT group_id, topic_id, topic_kind, title, url, first_seen_at
+        FROM vk_topic_alerts
+        WHERE group_id = ? AND notification_status = 'pending'
+        ORDER BY first_seen_at, topic_id
+        """,
+        (int(group_id),),
+    ).fetchall()
+    conn.commit()
+    return False, [
+        VkTopicAlert(
+            group_id=int(row["group_id"]),
+            topic_id=int(row["topic_id"]),
+            topic_kind=row["topic_kind"],
+            title=row["title"],
+            url=row["url"],
+            first_seen_at=row["first_seen_at"],
+        )
+        for row in rows
+    ]
+
+
+def mark_vk_topic_alert_sent(conn: sqlite3.Connection, alert: VkTopicAlert, *, sent_at: str) -> None:
+    conn.execute(
+        """
+        UPDATE vk_topic_alerts
+        SET notification_status = 'sent', notified_at = ?, notification_error = NULL
+        WHERE group_id = ? AND topic_id = ?
+        """,
+        (sent_at, alert.group_id, alert.topic_id),
+    )
+    conn.commit()
+
+
+def mark_vk_topic_alert_failed(conn: sqlite3.Connection, alert: VkTopicAlert, error: str) -> None:
+    conn.execute(
+        """
+        UPDATE vk_topic_alerts
+        SET notification_status = 'pending', notification_error = ?
+        WHERE group_id = ? AND topic_id = ?
+        """,
+        (error[:500], alert.group_id, alert.topic_id),
+    )
+    conn.commit()
+
+
+def _ensure_vk_registration_participant(
+    conn: sqlite3.Connection,
+    name: str,
+    fee_intent: str,
+) -> int:
+    """Enroll a VK applicant using the registration topic as the fee record."""
+
+    confirmed_paid = {"paid_declared": 1, "free": 0}.get(fee_intent)
+    if confirmed_paid is not None:
+        return ensure_participant(conn, name, paid=confirmed_paid)
+
+    row = conn.execute("SELECT id FROM participants WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        return ensure_participant(conn, name, paid=0)
+
+    participant_id = int(row["id"])
+    season_row = conn.execute(
+        "SELECT paid FROM season_participants WHERE season_id = ? AND participant_id = ?",
+        (active_season_id(conn), participant_id),
+    ).fetchone()
+    if season_row is None:
+        ensure_season_participant(conn, participant_id, paid=0)
+    return participant_id
+
+
+def _is_vk_ui_noise_participant(name: str) -> bool:
+    return " ".join(name.casefold().split()) in VK_UI_NOISE_PARTICIPANTS
+
+
+def _purge_vk_ui_noise_entries(conn: sqlite3.Connection) -> None:
+    """Remove legacy rows that came from VK controls, never from a person."""
+
+    rows = conn.execute(
+        "SELECT rowid, participant_id, participant_name FROM vk_registration_entries"
+    ).fetchall()
+    noise_rows = [row for row in rows if _is_vk_ui_noise_participant(str(row["participant_name"]))]
+    if not noise_rows:
+        return
+
+    participant_ids = {int(row["participant_id"]) for row in noise_rows}
+    conn.executemany("DELETE FROM vk_registration_entries WHERE rowid = ?", [(int(row["rowid"]),) for row in noise_rows])
+    for participant_id in participant_ids:
+        prediction = conn.execute("SELECT 1 FROM predictions WHERE participant_id = ? LIMIT 1", (participant_id,)).fetchone()
+        registration = conn.execute(
+            "SELECT 1 FROM vk_registration_entries WHERE participant_id = ? LIMIT 1", (participant_id,)
+        ).fetchone()
+        if prediction is None and registration is None:
+            conn.execute("DELETE FROM participants WHERE id = ?", (participant_id,))
+
+
+def _dedupe_vk_registration_entries(conn: sqlite3.Connection) -> None:
+    """Keep one imported row when a parser revision changes a legacy source key."""
+
+    rows = conn.execute(
+        """
+        SELECT rowid, group_id, topic_id, participant_id, vk_author, submitted_at,
+               last_seen_at, notification_status, notified_at
+        FROM vk_registration_entries
+        ORDER BY last_seen_at DESC, rowid DESC
+        """
+    ).fetchall()
+    retained: dict[tuple[int, int, str, str], sqlite3.Row] = {}
+    obsolete_rows: list[sqlite3.Row] = []
+    notification_updates: list[tuple[str | None, int]] = []
+
+    for row in rows:
+        key = (int(row["group_id"]), int(row["topic_id"]), str(row["vk_author"]), str(row["submitted_at"]))
+        current = retained.get(key)
+        if current is None:
+            retained[key] = row
+            continue
+        if row["notification_status"] == "sent" and current["notification_status"] != "sent":
+            notification_updates.append((row["notified_at"], int(current["rowid"])))
+        obsolete_rows.append(row)
+
+    if not obsolete_rows:
+        return
+
+    conn.executemany("DELETE FROM vk_registration_entries WHERE rowid = ?", [(int(row["rowid"]),) for row in obsolete_rows])
+    conn.executemany(
+        "UPDATE vk_registration_entries SET notification_status = 'sent', notified_at = ?, notification_error = NULL WHERE rowid = ?",
+        notification_updates,
+    )
+    candidate_ids = {int(row["participant_id"]) for row in obsolete_rows}
+    for participant_id in candidate_ids:
+        prediction = conn.execute("SELECT 1 FROM predictions WHERE participant_id = ? LIMIT 1", (participant_id,)).fetchone()
+        registration = conn.execute(
+            "SELECT 1 FROM vk_registration_entries WHERE participant_id = ? LIMIT 1", (participant_id,)
+        ).fetchone()
+        if prediction is None and registration is None:
+            conn.execute("DELETE FROM participants WHERE id = ?", (participant_id,))
+
+
+def record_vk_registration_entries(
+    conn: sqlite3.Connection,
+    group_id: int,
+    topic_id: int,
+    entries: Iterable["VkRegistrationEntry"],
+    *,
+    seen_at: str,
+) -> list[VkRegistrationAlert]:
+    """Store registration declarations and return only undelivered Telegram notices.
+
+    The registration discussion is the contest's source of truth: a declared
+    fee immediately marks the participant as paid for this season.
+    """
+
+    _purge_vk_ui_noise_entries(conn)
+    _dedupe_vk_registration_entries(conn)
+    for entry in entries:
+        if _is_vk_ui_noise_participant(entry.participant):
+            continue
+        participant_id = _ensure_vk_registration_participant(conn, entry.participant, entry.fee_intent)
+        submitted_at = entry.submitted_at.isoformat()
+        existing = conn.execute(
+            """
+            SELECT source_key, vk_author, participant_name, submitted_at, fee_intent,
+                   fee_amount_rub, payment_status
+            FROM vk_registration_entries
+            WHERE group_id = ? AND topic_id = ?
+              AND (source_key = ? OR (vk_author = ? AND submitted_at = ?))
+            ORDER BY CASE WHEN source_key = ? THEN 0 ELSE 1 END
+            LIMIT 1
+            """,
+            (int(group_id), int(topic_id), entry.source_key, entry.vk_author, submitted_at, entry.source_key),
+        ).fetchone()
+        values = (
+            entry.vk_author,
+            entry.participant,
+            submitted_at,
+            entry.fee_intent,
+            entry.fee_amount_rub,
+            entry.payment_status,
+        )
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO vk_registration_entries(
+                    group_id, topic_id, source_key, participant_id, vk_author,
+                    participant_name, submitted_at, fee_intent, fee_amount_rub,
+                    payment_status, first_seen_at, last_seen_at, notification_status
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                """,
+                (int(group_id), int(topic_id), entry.source_key, participant_id, *values, seen_at, seen_at),
+            )
+            continue
+
+        existing_source_key = str(existing["source_key"])
+        previous = tuple(existing[column] for column in ("vk_author", "participant_name", "submitted_at", "fee_intent", "fee_amount_rub", "payment_status"))
+        if previous != values:
+            conn.execute(
+                """
+                UPDATE vk_registration_entries
+                SET source_key = ?, participant_id = ?, vk_author = ?, participant_name = ?, submitted_at = ?,
+                    fee_intent = ?, fee_amount_rub = ?, payment_status = ?,
+                    last_seen_at = ?, notification_status = 'pending',
+                    notified_at = NULL, notification_error = NULL
+                WHERE group_id = ? AND topic_id = ? AND source_key = ?
+                """,
+                (entry.source_key, participant_id, *values, seen_at, int(group_id), int(topic_id), existing_source_key),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE vk_registration_entries
+                SET source_key = ?, participant_id = ?, last_seen_at = ?
+                WHERE group_id = ? AND topic_id = ? AND source_key = ?
+                """,
+                (entry.source_key, participant_id, seen_at, int(group_id), int(topic_id), existing_source_key),
+            )
+
+    rows = conn.execute(
+        """
+        SELECT group_id, topic_id, source_key, participant_name, vk_author,
+               submitted_at, fee_intent, fee_amount_rub, payment_status
+        FROM vk_registration_entries
+        WHERE group_id = ? AND topic_id = ? AND notification_status = 'pending'
+        ORDER BY submitted_at, source_key
+        """,
+        (int(group_id), int(topic_id)),
+    ).fetchall()
+    conn.commit()
+    return [
+        VkRegistrationAlert(
+            group_id=int(row["group_id"]),
+            topic_id=int(row["topic_id"]),
+            source_key=row["source_key"],
+            participant_name=row["participant_name"],
+            vk_author=row["vk_author"],
+            submitted_at=row["submitted_at"],
+            fee_intent=row["fee_intent"],
+            fee_amount_rub=row["fee_amount_rub"],
+            payment_status=row["payment_status"],
+        )
+        for row in rows
+    ]
+
+
+def mark_vk_registration_alert_sent(
+    conn: sqlite3.Connection,
+    alert: VkRegistrationAlert,
+    *,
+    sent_at: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE vk_registration_entries
+        SET notification_status = 'sent', notified_at = ?, notification_error = NULL
+        WHERE group_id = ? AND topic_id = ? AND source_key = ?
+        """,
+        (sent_at, alert.group_id, alert.topic_id, alert.source_key),
+    )
+    conn.commit()
+
+
+def mark_vk_registration_alert_failed(
+    conn: sqlite3.Connection,
+    alert: VkRegistrationAlert,
+    error: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE vk_registration_entries
+        SET notification_status = 'pending', notification_error = ?
+        WHERE group_id = ? AND topic_id = ? AND source_key = ?
+        """,
+        (error[:500], alert.group_id, alert.topic_id, alert.source_key),
+    )
+    conn.commit()
 
 
 def ensure_competition(conn: sqlite3.Connection, code: str, name: str | None = None) -> int:
@@ -513,6 +1022,28 @@ def active_season(conn: sqlite3.Connection) -> sqlite3.Row:
 
 def active_season_id(conn: sqlite3.Connection) -> int:
     return int(active_season(conn)["id"])
+
+
+def active_participant_id(conn: sqlite3.Connection, name: str) -> int | None:
+    """Return an active participant in the current season without enrolling anyone."""
+
+    requested = name.strip().casefold()
+    if not requested:
+        return None
+    rows = conn.execute(
+        """
+        SELECT p.id, p.name, sp.alias
+        FROM participants p
+        JOIN season_participants sp ON sp.participant_id = p.id
+        WHERE sp.season_id = ? AND sp.active = 1
+        """,
+        (active_season_id(conn),),
+    ).fetchall()
+    for row in rows:
+        labels = (str(row["name"]), str(row["alias"] or ""))
+        if any(label.casefold() == requested for label in labels if label):
+            return int(row["id"])
+    return None
 
 
 def ensure_season_participant(
@@ -930,6 +1461,46 @@ def upsert_prediction(
             source = excluded.source
         """,
         (participant_id, int(match["id"]), score.strip(), submitted, source),
+    )
+    row = conn.execute(
+        "SELECT id FROM predictions WHERE participant_id = ? AND match_id = ?",
+        (participant_id, int(match["id"])),
+    ).fetchone()
+    return int(row["id"])
+
+
+def upsert_prediction_for_active_participant(
+    conn: sqlite3.Connection,
+    participant_id: int,
+    round_name: str,
+    position: int,
+    score: str,
+    submitted_at: str,
+    source: str | None,
+) -> int:
+    """Store a forecast without implicitly creating or reactivating a participant."""
+
+    match = conn.execute(
+        """
+        SELECT m.id
+        FROM matches m
+        JOIN rounds r ON r.id = m.round_id
+        WHERE r.season_id = ? AND r.name = ? AND m.position = ?
+        """,
+        (active_season_id(conn), round_name.strip(), position),
+    ).fetchone()
+    if match is None:
+        raise ValueError(f"Unknown match: round={round_name}, position={position}")
+    conn.execute(
+        """
+        INSERT INTO predictions(participant_id, match_id, score, submitted_at, source)
+        VALUES(?, ?, ?, ?, ?)
+        ON CONFLICT(participant_id, match_id) DO UPDATE SET
+            score = excluded.score,
+            submitted_at = excluded.submitted_at,
+            source = excluded.source
+        """,
+        (participant_id, int(match["id"]), score.strip(), submitted_at, source),
     )
     row = conn.execute(
         "SELECT id FROM predictions WHERE participant_id = ? AND match_id = ?",

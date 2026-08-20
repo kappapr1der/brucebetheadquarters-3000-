@@ -8,7 +8,7 @@ from brucebet.forecast_import import (
     parse_forecast_block,
     parse_participant_block,
 )
-from brucebet.storage import connect, reset_db, upsert_match
+from brucebet.storage import connect, ensure_participant, reset_db, upsert_match
 
 
 MATCHES = [
@@ -67,6 +67,7 @@ class ForecastImportTest(unittest.TestCase):
         reset_db(conn)
         upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2026-08-15T18:00:00+03:00", None)
         upsert_match(conn, "1", 2, "Liverpool", "Burnley", "2026-08-15T20:30:00+03:00", None)
+        ensure_participant(conn, "Igor", paid=1)
 
         report = import_forecast_block(
             conn,
@@ -87,6 +88,7 @@ class ForecastImportTest(unittest.TestCase):
         reset_db(conn)
         upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2026-08-15T18:00:00+03:00", None)
         upsert_match(conn, "1", 2, "Liverpool", "Burnley", "2026-08-15T20:30:00+03:00", None)
+        ensure_participant(conn, "Igor", paid=1)
         import_forecast_block(
             conn,
             participant="Igor",
@@ -109,6 +111,45 @@ class ForecastImportTest(unittest.TestCase):
         self.assertEqual(report.stored_count, 0)
         self.assertEqual(report.protected_positions, (1,))
         self.assertEqual([row["score"] for row in rows], ["2:1", "1:0"])
+
+    def test_unknown_or_invalid_forecasts_never_enroll_a_participant(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2026-08-15T18:00:00+03:00", None)
+
+        for text in ("2:1", "10:0", "нечитаемый блок"):
+            with self.assertRaisesRegex(ValueError, "не зарегистрирован"):
+                import_forecast_block(
+                    conn,
+                    participant="Ghost Applicant",
+                    round_name="1",
+                    text=text,
+                    submitted_at=datetime.fromisoformat("2026-08-15T14:00:00+03:00"),
+                    source="test",
+                )
+
+        self.assertEqual(conn.execute("SELECT COUNT(*) AS count FROM participants").fetchone()["count"], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) AS count FROM season_participants").fetchone()["count"], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) AS count FROM predictions").fetchone()["count"], 0)
+
+    def test_missing_or_naive_timestamp_does_not_write_a_forecast(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2026-08-15T18:00:00+03:00", None)
+        ensure_participant(conn, "Igor", paid=1)
+
+        for submitted_at in (None, "2026-08-15T14:00:00"):
+            with self.assertRaisesRegex(ValueError, "часовым поясом"):
+                import_forecast_block(
+                    conn,
+                    participant="Igor",
+                    round_name="1",
+                    text="2:1",
+                    submitted_at=submitted_at,
+                    source="test",
+                )
+
+        self.assertEqual(conn.execute("SELECT COUNT(*) AS count FROM predictions").fetchone()["count"], 0)
 
 
 if __name__ == "__main__":

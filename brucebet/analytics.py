@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import sqlite3
 
 from .scoring import Score, is_prediction_eligible, normalize_score, parse_datetime, parse_score, score_prediction
-from .storage import active_season, active_season_id
+from .storage import active_season, active_season_id, mark_premature_model_forecasts
 
 
 @dataclass
@@ -429,12 +429,14 @@ def next_calendar_match(
     conn: sqlite3.Connection,
     user_participant: str = "Bruce Wayne",
     lock_minutes: int = 90,
+    start_at: datetime | None = None,
 ) -> CalendarItem | None:
     matches = calendar_matches(
         conn,
         days=370,
         user_participant=user_participant,
         lock_minutes=lock_minutes,
+        start_at=start_at,
         limit=50,
     )
     return next((item for item in matches if not item.result), None)
@@ -988,7 +990,7 @@ def ready_summary(
         FROM model_forecasts f
         JOIN matches m ON m.id = f.match_id
         JOIN rounds r ON r.id = m.round_id
-        WHERE r.season_id = ? AND r.name = ?
+        WHERE r.season_id = ? AND r.name = ? AND f.legacy_premature = 0
         """,
         (active_season_id(conn), round_name),
     ).fetchone()
@@ -1162,52 +1164,153 @@ def capture_model_forecasts(
     conn: sqlite3.Connection,
     now: datetime | None = None,
     model_key: str = "brucebet",
+    lock_minutes: int = 90,
 ) -> int:
-    """Freeze the current model draft before kickoff for later honest calibration."""
+    """Freeze one complete round only after its contest deadline has passed."""
+
     now = now or datetime.now().astimezone()
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("Model forecast capture requires an aware timestamp")
+    now_utc = now.astimezone(timezone.utc)
     season_id = active_season_id(conn)
-    rows = conn.execute(
+    mark_premature_model_forecasts(conn)
+    round_rows = conn.execute(
         """
         SELECT
-            m.id AS match_id,
-            m.kickoff_at,
-            a.suggested_score,
-            a.confidence,
-            a.risk_level,
-            a.updated_at
-        FROM matches m
-        JOIN rounds r ON r.id = m.round_id
-        JOIN match_assessments a ON a.match_id = m.id
+            r.id,
+            r.name,
+            r.sort_order,
+            MIN(m.kickoff_at) AS first_kickoff_at
+        FROM rounds r
+        JOIN matches m ON m.round_id = r.id
         WHERE r.season_id = ?
-        ORDER BY r.sort_order, m.position
+        GROUP BY r.id
+        ORDER BY r.sort_order
         """,
         (season_id,),
-    )
+    ).fetchall()
+    existing_rows = conn.execute(
+        """
+        SELECT f.id, f.match_id, f.suggested_score, f.confidence, f.risk_level,
+               f.captured_at, f.assessment_updated_at, f.deadline_at, f.legacy_premature
+        FROM model_forecasts f
+        JOIN matches m ON m.id = f.match_id
+        JOIN rounds r ON r.id = m.round_id
+        WHERE r.season_id = ? AND f.model_key = ?
+        """,
+        (season_id, model_key),
+    ).fetchall()
+    existing_by_match = {int(row["match_id"]): row for row in existing_rows}
     captured = 0
-    for row in rows:
-        score = normalize_score(row["suggested_score"])
-        kickoff = parse_datetime(row["kickoff_at"])
-        if score is None or (kickoff is not None and kickoff <= now):
+    for round_row in round_rows:
+        first_kickoff = parse_datetime(round_row["first_kickoff_at"])
+        if first_kickoff is None or first_kickoff.tzinfo is None or first_kickoff.utcoffset() is None:
             continue
-        cursor = conn.execute(
+        first_kickoff_utc = first_kickoff.astimezone(timezone.utc)
+        deadline_at = first_kickoff_utc - timedelta(minutes=lock_minutes)
+        if now_utc < deadline_at or now_utc >= first_kickoff_utc:
+            continue
+
+        matches = conn.execute(
             """
-            INSERT INTO model_forecasts(
-                match_id, model_key, suggested_score, confidence, risk_level, captured_at, assessment_updated_at
-            )
-            VALUES(?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(match_id, model_key) DO NOTHING
+            SELECT m.id AS match_id, m.kickoff_at, a.suggested_score, a.confidence, a.risk_level, a.updated_at
+            FROM matches m
+            LEFT JOIN match_assessments a ON a.match_id = m.id
+            WHERE m.round_id = ?
+            ORDER BY m.position
             """,
-            (
-                int(row["match_id"]),
-                model_key,
-                score,
-                row["confidence"],
-                row["risk_level"],
-                now.isoformat(),
-                row["updated_at"],
-            ),
-        )
-        captured += int(cursor.rowcount)
+            (int(round_row["id"]),),
+        ).fetchall()
+        if not matches:
+            continue
+        prepared: list[tuple[sqlite3.Row, str]] = []
+        for row in matches:
+            kickoff = parse_datetime(row["kickoff_at"])
+            score = normalize_score(row["suggested_score"])
+            if (
+                score is None
+                or kickoff is None
+                or kickoff.tzinfo is None
+                or kickoff.utcoffset() is None
+                or kickoff.astimezone(timezone.utc) < first_kickoff_utc
+            ):
+                prepared = []
+                break
+            prepared.append((row, score))
+        if not prepared:
+            continue
+
+        current_rows = [existing_by_match.get(int(row["match_id"])) for row, _score in prepared]
+        valid_existing = [row for row in current_rows if row is not None and not int(row["legacy_premature"])]
+        if len(valid_existing) == len(prepared):
+            continue
+        if valid_existing:
+            continue
+
+        for row, score in prepared:
+            match_id = int(row["match_id"])
+            existing = existing_by_match.get(match_id)
+            if existing is not None:
+                conn.execute(
+                    """
+                    INSERT INTO model_forecast_legacy_audit(
+                        model_forecast_id, match_id, model_key, suggested_score, confidence,
+                        risk_level, captured_at, assessment_updated_at, deadline_at, archived_at, reason
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'replaced_after_premature_freeze')
+                    """,
+                    (
+                        int(existing["id"]),
+                        match_id,
+                        model_key,
+                        existing["suggested_score"],
+                        existing["confidence"],
+                        existing["risk_level"],
+                        existing["captured_at"],
+                        existing["assessment_updated_at"],
+                        existing["deadline_at"],
+                        now_utc.isoformat(),
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE model_forecasts
+                    SET suggested_score = ?, confidence = ?, risk_level = ?, captured_at = ?,
+                        assessment_updated_at = ?, deadline_at = ?, freeze_reason = 'round_deadline',
+                        legacy_premature = 0
+                    WHERE id = ?
+                    """,
+                    (
+                        score,
+                        row["confidence"],
+                        row["risk_level"],
+                        now_utc.isoformat(),
+                        row["updated_at"],
+                        deadline_at.isoformat(),
+                        int(existing["id"]),
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO model_forecasts(
+                        match_id, model_key, suggested_score, confidence, risk_level,
+                        captured_at, assessment_updated_at, deadline_at, freeze_reason, legacy_premature
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'round_deadline', 0)
+                    """,
+                    (
+                        match_id,
+                        model_key,
+                        score,
+                        row["confidence"],
+                        row["risk_level"],
+                        now_utc.isoformat(),
+                        row["updated_at"],
+                        deadline_at.isoformat(),
+                    ),
+                )
+            captured += 1
     conn.commit()
     return captured
 
@@ -1236,7 +1339,7 @@ def model_calibration_summary(
         FROM model_forecasts f
         JOIN matches m ON m.id = f.match_id
         JOIN rounds r ON r.id = m.round_id
-        WHERE r.season_id = ? AND f.model_key = ? {where_round}
+        WHERE r.season_id = ? AND f.model_key = ? AND f.legacy_premature = 0 {where_round}
         ORDER BY r.sort_order, m.position
         """,
         params,

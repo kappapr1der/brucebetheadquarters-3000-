@@ -87,7 +87,7 @@ class AutomationTest(unittest.TestCase):
             },
         )
 
-        captured = capture_model_forecasts(conn, now=datetime.fromisoformat("2026-08-14T18:00:00+03:00"))
+        captured = capture_model_forecasts(conn, now=datetime.fromisoformat("2026-08-15T16:31:00+03:00"))
         review = round_review(conn, "1")
         calibration = model_calibration_summary(conn)
 
@@ -113,7 +113,7 @@ class AutomationTest(unittest.TestCase):
                 "updated_at": "2026-08-14T10:00:00+03:00",
             },
         )
-        capture_model_forecasts(conn, now=datetime.fromisoformat("2026-08-14T18:00:00+03:00"))
+        capture_model_forecasts(conn, now=datetime.fromisoformat("2026-08-15T16:31:00+03:00"))
 
         item = ready_summary(
             conn,
@@ -125,6 +125,85 @@ class AutomationTest(unittest.TestCase):
         self.assertEqual(item["model_forecasts"], 1)
         self.assertEqual(item["status"], "attention")
         self.assertTrue(any("FPL" in row for row in item["warnings"]))
+
+    def test_model_forecasts_freeze_only_the_due_complete_round(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2026-08-15T18:00:00+03:00", None)
+        upsert_match(conn, "2", 1, "Liverpool", "Everton", "2026-08-22T18:00:00+03:00", None)
+        for round_name in ("1", "2"):
+            upsert_match_assessment(
+                conn,
+                {
+                    "round": round_name,
+                    "position": "1",
+                    "suggested_score": "2:1",
+                    "risk_level": "medium",
+                    "confidence": "0.60",
+                    "updated_at": "2026-08-15T10:00:00+03:00",
+                },
+            )
+
+        with self.assertRaisesRegex(ValueError, "aware timestamp"):
+            capture_model_forecasts(conn, now=datetime(2026, 8, 15, 16, 31))
+        self.assertEqual(capture_model_forecasts(conn, now=datetime.fromisoformat("2026-08-15T16:29:00+03:00")), 0)
+        self.assertEqual(capture_model_forecasts(conn, now=datetime.fromisoformat("2026-08-15T16:31:00+03:00")), 1)
+        self.assertEqual(capture_model_forecasts(conn, now=datetime.fromisoformat("2026-08-15T16:32:00+03:00")), 0)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) AS count FROM model_forecasts WHERE legacy_premature = 0").fetchone()["count"],
+            1,
+        )
+        self.assertEqual(capture_model_forecasts(conn, now=datetime.fromisoformat("2026-08-22T18:01:00+03:00")), 0)
+
+    def test_premature_legacy_model_forecast_is_archived_before_replacement(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        match_id = upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2026-08-15T18:00:00+03:00", None)
+        upsert_match_assessment(
+            conn,
+            {
+                "round": "1",
+                "position": "1",
+                "suggested_score": "2:1",
+                "risk_level": "medium",
+                "confidence": "0.60",
+                "updated_at": "2026-08-15T10:00:00+03:00",
+            },
+        )
+        conn.execute(
+            """
+            INSERT INTO model_forecasts(match_id, model_key, suggested_score, confidence, risk_level, captured_at)
+            VALUES(?, 'brucebet', '1:0', 0.40, 'low', '2026-08-14T10:00:00+03:00')
+            """,
+            (match_id,),
+        )
+        conn.commit()
+
+        self.assertEqual(capture_model_forecasts(conn, now=datetime.fromisoformat("2026-08-15T16:31:00+03:00")), 1)
+        current = conn.execute("SELECT suggested_score, legacy_premature FROM model_forecasts").fetchone()
+        archived = conn.execute("SELECT suggested_score, reason FROM model_forecast_legacy_audit").fetchone()
+
+        self.assertEqual((current["suggested_score"], current["legacy_premature"]), ("2:1", 0))
+        self.assertEqual((archived["suggested_score"], archived["reason"]), ("1:0", "replaced_after_premature_freeze"))
+
+    def test_model_forecast_freeze_skips_rounds_with_missing_kickoff(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        upsert_match(conn, "1", 1, "Arsenal", "Chelsea", None, None)
+        upsert_match_assessment(
+            conn,
+            {
+                "round": "1",
+                "position": "1",
+                "suggested_score": "2:1",
+                "risk_level": "medium",
+                "confidence": "0.60",
+                "updated_at": "2026-08-15T10:00:00+03:00",
+            },
+        )
+
+        self.assertEqual(capture_model_forecasts(conn, now=datetime.fromisoformat("2026-08-15T16:31:00+03:00")), 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) AS count FROM model_forecasts").fetchone()["count"], 0)
 
     def test_manual_result_override_keeps_audit_history(self) -> None:
         conn = connect(":memory:")

@@ -2,8 +2,43 @@ services:
   brucebet:
     build: .
     container_name: brucebet-3000
+    init: true
     restart: unless-stopped
     env_file:
       - .env
     volumes:
       - ./data:/app/data
+
+  vk-oauth:
+    build: .
+    command: ["python", "-m", "brucebet.vk_oauth"]
+    restart: unless-stopped
+    profiles: ["oauth"]
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "127.0.0.1:8090:8090"
+
+  caddy:
+    image: caddy:2.8
+    restart: unless-stopped
+    profiles: ["oauth"]
+    depends_on:
+      - vk-oauth
+    env_file:
+      - .env
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - /opt/jl105-clan-site:/srv:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -55,6 +55,14 @@ Recommended env:
 - `THE_ODDS_API_BOOKMAKER=market_avg`
 - `THE_ODDS_API_DAYS_AHEAD=30`
 - `THESPORTSDB_KEY=123`
+- `VK_TOPIC_DISCOVERY_ENABLED=1`
+- `VK_TOPIC_DISCOVERY_INTERVAL_MINUTES=30`
+- `VK_TOPIC_DISCOVERY_FIRST_DELAY_SECONDS=20`
+- `VK_GROUP_ID=217130885`
+- `VK_REGISTRATION_TOPIC_ID=<real EPL registration topic id>`
+- `VK_REGISTRATION_SYNC_ENABLED=1`
+- `VK_REGISTRATION_SYNC_INTERVAL_MINUTES=5`
+- `VK_REGISTRATION_BROWSER_WAIT_MS=30000`
 
 ## Smoke test
 
@@ -73,6 +81,7 @@ In Telegram:
 /variables
 /quota
 /sources
+/vk_topics
 /sync_fixtures
 /sync_results
 /sync_variables
@@ -98,6 +107,10 @@ In Telegram:
 ```
 
 `/schedule` subscribes the current chat to persistent deadline reminders. Delivery state is stored in SQLite, so a container restart does not lose the schedule or resend reminders already delivered.
+
+With `VK_TOPIC_DISCOVERY_ENABLED=1`, the bot scans the public Forecasters Club discussion list and alerts the Telegram whitelist once when a new EPL registration or prediction topic appears. Its first scan that finds at least one discussion is only a baseline, so it cannot mistake old discussions for a new launch. `/vk_topics` performs a manual read-only scan. Discovery never imports forecasts or writes to VK.
+
+With a real `VK_REGISTRATION_TOPIC_ID` plus `VK_REGISTRATION_SYNC_ENABLED=1`, the bot separately polls that registration topic every five minutes. New or changed applicants are stored in SQLite and announced once in Telegram with their declared fee amount or free status. A paid/free comment in this topic is the confirmed contest status.
 
 `/ready` is the operational preflight before a round. `/intel [тур]` adds a per-match variable coverage check and names the missing/stale inputs. `/absence Команда | Игрок | статус | impact | источник | заметка` records confirmed player news, recalculates factors and assessments, and accepts `fit`/`available` to clear an old entry. `/missing [тур]` adds the named follow-up list: people with a partial or missing block and the exact positions to chase. `/setresult <match> | <score> | <reason>` is restricted by the Telegram whitelist and writes every manual fallback into an audit log; use it only while the official result feed is delayed or being corrected.
 
