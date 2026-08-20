@@ -20,6 +20,18 @@ DEFAULT_SEASON_NAME = "2026/27"
 LEGACY_COMPETITION_CODE = "legacy"
 LEGACY_COMPETITION_NAME = "Legacy imported data"
 LEGACY_SEASON_NAME = "pre-season-model"
+VK_UI_NOISE_PARTICIPANTS = frozenset(
+    {
+        "show likes",
+        "show reactions",
+        "показать список оценивших",
+        "показать реакции",
+        "reply",
+        "share",
+        "ответить",
+        "поделиться",
+    }
+)
 
 
 SCHEMA = """
@@ -643,6 +655,36 @@ def _ensure_vk_registration_participant(
     return participant_id
 
 
+def _is_vk_ui_noise_participant(name: str) -> bool:
+    return " ".join(name.casefold().split()) in VK_UI_NOISE_PARTICIPANTS
+
+
+def _purge_vk_ui_noise_entries(conn: sqlite3.Connection) -> None:
+    """Remove legacy rows that came from VK controls, never from a person."""
+
+    placeholders = ", ".join("?" for _ in VK_UI_NOISE_PARTICIPANTS)
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT participant_id
+        FROM vk_registration_entries
+        WHERE lower(trim(participant_name)) IN ({placeholders})
+        """,
+        tuple(VK_UI_NOISE_PARTICIPANTS),
+    ).fetchall()
+    if not rows:
+        return
+
+    participant_ids = tuple(int(row["participant_id"]) for row in rows)
+    conn.execute(
+        f"DELETE FROM vk_registration_entries WHERE lower(trim(participant_name)) IN ({placeholders})",
+        tuple(VK_UI_NOISE_PARTICIPANTS),
+    )
+    for participant_id in participant_ids:
+        prediction = conn.execute("SELECT 1 FROM predictions WHERE participant_id = ? LIMIT 1", (participant_id,)).fetchone()
+        if prediction is None:
+            conn.execute("DELETE FROM participants WHERE id = ?", (participant_id,))
+
+
 def record_vk_registration_entries(
     conn: sqlite3.Connection,
     group_id: int,
@@ -657,7 +699,10 @@ def record_vk_registration_entries(
     fee immediately marks the participant as paid for this season.
     """
 
+    _purge_vk_ui_noise_entries(conn)
     for entry in entries:
+        if _is_vk_ui_noise_participant(entry.participant):
+            continue
         participant_id = _ensure_vk_registration_participant(conn, entry.participant, entry.fee_intent)
         submitted_at = entry.submitted_at.isoformat()
         existing = conn.execute(
@@ -1811,3 +1856,4 @@ def find_match(conn: sqlite3.Connection, query: str) -> sqlite3.Row:
     if row is None:
         raise ValueError(f"Match not found: {query}")
     return row
+
