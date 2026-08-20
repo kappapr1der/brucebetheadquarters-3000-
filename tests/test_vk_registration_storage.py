@@ -6,6 +6,7 @@ import unittest
 from brucebet.storage import (
     active_season_id,
     connect,
+    ensure_participant,
     init_db,
     mark_vk_registration_alert_sent,
     record_vk_registration_entries,
@@ -97,6 +98,7 @@ class VkRegistrationStorageTests(unittest.TestCase):
         self.assertIsNone(self.conn.execute("SELECT 1 FROM participants WHERE name = 'Show more posts'").fetchone())
         self.assertIsNone(self.conn.execute("SELECT 1 FROM participants WHERE name = 'Загружается'").fetchone())
 
+        ensure_participant(self.conn, "Загружается", True)
         self.conn.execute(
             """
             INSERT INTO vk_registration_entries(
@@ -118,11 +120,11 @@ class VkRegistrationStorageTests(unittest.TestCase):
                 participant_name, submitted_at, fee_intent, fee_amount_rub,
                 payment_status, first_seen_at, last_seen_at, notification_status
             )
-            SELECT 217130885, 67251857, 'vk:old-more', id, 'Sergey Kirillov',
-                   'Show more posts', '2026-08-15T23:05:00+03:00', 'paid_declared', 500,
+            SELECT 217130885, 67251857, 'vk:old-loader', id, 'Andrzej Wisniewski',
+                   'Загружается', '2026-08-15T23:05:00+03:00', 'paid_declared', 500,
                    'declared_paid', '2026-08-15T23:05:00+03:00',
                    '2026-08-15T23:05:00+03:00', 'sent'
-            FROM participants WHERE name = 'Сергей Кириллов'
+            FROM participants WHERE name = 'Загружается'
             """
         )
         self.conn.execute(
@@ -132,14 +134,16 @@ class VkRegistrationStorageTests(unittest.TestCase):
                 participant_name, submitted_at, fee_intent, fee_amount_rub,
                 payment_status, first_seen_at, last_seen_at, notification_status
             )
-            SELECT 217130885, 67251857, 'vk:old-loader', id, 'Andrzej Wisniewski',
-                   'Загружается', '2026-08-15T23:05:00+03:00', 'paid_declared', 500,
+            SELECT 217130885, 67251857, 'vk:old-more', id, 'Sergey Kirillov',
+                   'Show more posts', '2026-08-15T23:05:00+03:00', 'paid_declared', 500,
                    'declared_paid', '2026-08-15T23:05:00+03:00',
                    '2026-08-15T23:05:00+03:00', 'sent'
             FROM participants WHERE name = 'Сергей Кириллов'
             """
         )
         init_db(self.conn)
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM participants WHERE name = 'Загружается'").fetchone())
+        self.assertIsNotNone(self.conn.execute("SELECT 1 FROM participants WHERE name = 'Сергей Кириллов'").fetchone())
         record_vk_registration_entries(
             self.conn,
             217130885,
