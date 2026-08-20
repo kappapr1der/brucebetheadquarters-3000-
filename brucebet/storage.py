@@ -401,6 +401,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     migrate_db(conn)
     activate_profile(conn)
+    _purge_vk_ui_noise_entries(conn)
     conn.commit()
 
 
