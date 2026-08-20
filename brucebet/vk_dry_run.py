@@ -65,6 +65,7 @@ NOISE = {
     "поделиться",
     "show likes",
     "show reactions",
+    "show more posts",
     "reply",
     "share",
 }
