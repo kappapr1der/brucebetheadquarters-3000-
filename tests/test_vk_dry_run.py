@@ -115,6 +115,18 @@ Sign in
 """
 
 
+ABSOLUTE_ENGLISH_DATE_REGISTRATION_TEXT = """
+Forecasters Club
+Заявка на участие в прогнозах АПЛ 2026/2027
+Sergey Kirillov
+14 Aug 2026 at 3:35 pm
+Без взноса
+Andrzej Wisniewski
+20 Aug 2026 at 12:13 pm
+Взнос 500
+"""
+
+
 class VkDryRunTests(unittest.TestCase):
     def test_predictions_recognize_split_author_actual_participant_and_partial_blocks(self) -> None:
         report = parse_public_topic_result(topic_result(PREDICTIONS_TEXT), "predictions")
@@ -168,6 +180,17 @@ class VkDryRunTests(unittest.TestCase):
         self.assertNotIn("Show likes", [item.participant for item in report.registration_entries])
         self.assertNotIn("Show more posts", [item.participant for item in report.registration_entries])
         self.assertNotIn("Загружается", [item.participant for item in report.registration_entries])
+
+    def test_registration_recognizes_absolute_english_vk_dates(self) -> None:
+        report = parse_public_topic_result(topic_result(ABSOLUTE_ENGLISH_DATE_REGISTRATION_TEXT), "registration")
+
+        self.assertEqual(
+            [(item.vk_author, item.participant, item.fee_intent, item.fee_amount_rub) for item in report.registration_entries],
+            [
+                ("Sergey Kirillov", "Sergey Kirillov", "free", None),
+                ("Andrzej Wisniewski", "Andrzej Wisniewski", "paid_declared", 500),
+            ],
+        )
 
     def test_non_epl_topic_is_visible_but_never_future_ingestion_ready(self) -> None:
         report = parse_public_topic_result(topic_result("Прогнозы РПЛ\n"), "predictions")
