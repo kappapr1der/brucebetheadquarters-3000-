@@ -402,6 +402,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     migrate_db(conn)
     activate_profile(conn)
     _purge_vk_ui_noise_entries(conn)
+    _dedupe_vk_registration_entries(conn)
     conn.commit()
 
 
@@ -682,6 +683,50 @@ def _purge_vk_ui_noise_entries(conn: sqlite3.Connection) -> None:
         if prediction is None and registration is None:
             conn.execute("DELETE FROM participants WHERE id = ?", (participant_id,))
 
+
+def _dedupe_vk_registration_entries(conn: sqlite3.Connection) -> None:
+    """Keep one imported row when a parser revision changes a legacy source key."""
+
+    rows = conn.execute(
+        """
+        SELECT rowid, group_id, topic_id, participant_id, vk_author, submitted_at,
+               last_seen_at, notification_status, notified_at
+        FROM vk_registration_entries
+        ORDER BY last_seen_at DESC, rowid DESC
+        """
+    ).fetchall()
+    retained: dict[tuple[int, int, str, str], sqlite3.Row] = {}
+    obsolete_rows: list[sqlite3.Row] = []
+    notification_updates: list[tuple[str | None, int]] = []
+
+    for row in rows:
+        key = (int(row["group_id"]), int(row["topic_id"]), str(row["vk_author"]), str(row["submitted_at"]))
+        current = retained.get(key)
+        if current is None:
+            retained[key] = row
+            continue
+        if row["notification_status"] == "sent" and current["notification_status"] != "sent":
+            notification_updates.append((row["notified_at"], int(current["rowid"])))
+        obsolete_rows.append(row)
+
+    if not obsolete_rows:
+        return
+
+    conn.executemany("DELETE FROM vk_registration_entries WHERE rowid = ?", [(int(row["rowid"]),) for row in obsolete_rows])
+    conn.executemany(
+        "UPDATE vk_registration_entries SET notification_status = 'sent', notified_at = ?, notification_error = NULL WHERE rowid = ?",
+        notification_updates,
+    )
+    candidate_ids = {int(row["participant_id"]) for row in obsolete_rows}
+    for participant_id in candidate_ids:
+        prediction = conn.execute("SELECT 1 FROM predictions WHERE participant_id = ? LIMIT 1", (participant_id,)).fetchone()
+        registration = conn.execute(
+            "SELECT 1 FROM vk_registration_entries WHERE participant_id = ? LIMIT 1", (participant_id,)
+        ).fetchone()
+        if prediction is None and registration is None:
+            conn.execute("DELETE FROM participants WHERE id = ?", (participant_id,))
+
+
 def record_vk_registration_entries(
     conn: sqlite3.Connection,
     group_id: int,
@@ -697,6 +742,7 @@ def record_vk_registration_entries(
     """
 
     _purge_vk_ui_noise_entries(conn)
+    _dedupe_vk_registration_entries(conn)
     for entry in entries:
         if _is_vk_ui_noise_participant(entry.participant):
             continue
@@ -704,12 +750,15 @@ def record_vk_registration_entries(
         submitted_at = entry.submitted_at.isoformat()
         existing = conn.execute(
             """
-            SELECT vk_author, participant_name, submitted_at, fee_intent,
+            SELECT source_key, vk_author, participant_name, submitted_at, fee_intent,
                    fee_amount_rub, payment_status
             FROM vk_registration_entries
-            WHERE group_id = ? AND topic_id = ? AND source_key = ?
+            WHERE group_id = ? AND topic_id = ?
+              AND (source_key = ? OR (vk_author = ? AND submitted_at = ?))
+            ORDER BY CASE WHEN source_key = ? THEN 0 ELSE 1 END
+            LIMIT 1
             """,
-            (int(group_id), int(topic_id), entry.source_key),
+            (int(group_id), int(topic_id), entry.source_key, entry.vk_author, submitted_at, entry.source_key),
         ).fetchone()
         values = (
             entry.vk_author,
@@ -733,27 +782,28 @@ def record_vk_registration_entries(
             )
             continue
 
-        previous = tuple(existing[column] for column in existing.keys())
+        existing_source_key = str(existing["source_key"])
+        previous = tuple(existing[column] for column in ("vk_author", "participant_name", "submitted_at", "fee_intent", "fee_amount_rub", "payment_status"))
         if previous != values:
             conn.execute(
                 """
                 UPDATE vk_registration_entries
-                SET participant_id = ?, vk_author = ?, participant_name = ?, submitted_at = ?,
+                SET source_key = ?, participant_id = ?, vk_author = ?, participant_name = ?, submitted_at = ?,
                     fee_intent = ?, fee_amount_rub = ?, payment_status = ?,
                     last_seen_at = ?, notification_status = 'pending',
                     notified_at = NULL, notification_error = NULL
                 WHERE group_id = ? AND topic_id = ? AND source_key = ?
                 """,
-                (participant_id, *values, seen_at, int(group_id), int(topic_id), entry.source_key),
+                (entry.source_key, participant_id, *values, seen_at, int(group_id), int(topic_id), existing_source_key),
             )
         else:
             conn.execute(
                 """
                 UPDATE vk_registration_entries
-                SET participant_id = ?, last_seen_at = ?
+                SET source_key = ?, participant_id = ?, last_seen_at = ?
                 WHERE group_id = ? AND topic_id = ? AND source_key = ?
                 """,
-                (participant_id, seen_at, int(group_id), int(topic_id), entry.source_key),
+                (entry.source_key, participant_id, seen_at, int(group_id), int(topic_id), existing_source_key),
             )
 
     rows = conn.execute(
