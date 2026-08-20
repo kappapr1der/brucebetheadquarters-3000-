@@ -87,6 +87,22 @@ today at 7:21 pm
 """
 
 
+SHOW_LIKES_REGISTRATION_TEXT = """
+Forecasters Club
+Заявка на участие в прогнозах АПЛ 2026/2027
+Sergey Kirillov
+today at 6:59 pm
+Show likes
+Сергей Кириллов
+Без взноса
+Alexey Zakharov
+today at 7:21 pm
+Show likes
+Алексей Захаров
+Взнос 500 рублей
+"""
+
+
 class VkDryRunTests(unittest.TestCase):
     def test_predictions_recognize_split_author_actual_participant_and_partial_blocks(self) -> None:
         report = parse_public_topic_result(topic_result(PREDICTIONS_TEXT), "predictions")
@@ -126,6 +142,18 @@ class VkDryRunTests(unittest.TestCase):
             ],
         )
 
+    def test_registration_ignores_vk_show_likes_controls_before_resolving_participant(self) -> None:
+        report = parse_public_topic_result(topic_result(SHOW_LIKES_REGISTRATION_TEXT), "registration")
+
+        self.assertEqual(
+            [(item.participant, item.fee_intent, item.fee_amount_rub) for item in report.registration_entries],
+            [
+                ("Сергей Кириллов", "free", None),
+                ("Алексей Захаров", "paid_declared", 500),
+            ],
+        )
+        self.assertNotIn("Show likes", [item.participant for item in report.registration_entries])
+
     def test_non_epl_topic_is_visible_but_never_future_ingestion_ready(self) -> None:
         report = parse_public_topic_result(topic_result("Прогнозы РПЛ\n"), "predictions")
 
@@ -136,3 +164,4 @@ class VkDryRunTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
