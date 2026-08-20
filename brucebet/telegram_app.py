@@ -2119,6 +2119,7 @@ async def process_forecast_block(
     round_name: str,
     block: str,
 ) -> None:
+    settings = settings_from_context(context)
     conn = conn_from_context(context)
     submitted_at = update.effective_message.date if update.effective_message else datetime.now().astimezone()
     try:
@@ -2134,12 +2135,17 @@ async def process_forecast_block(
     except ValueError as exc:
         await send_text(update, str(exc))
         return
+    finally:
+        conn.close()
     await send_text(update, render_forecast_import(participant, round_name, report))
 
 
 async def process_participant_block(update: Update, context: ContextTypes.DEFAULT_TYPE, block: str) -> None:
     conn = conn_from_context(context)
-    report = import_participant_block(conn, block)
+    try:
+        report = import_participant_block(conn, block)
+    finally:
+        conn.close()
     if not report.entries:
         await send_text(update, "Не увидел имён. Пришли `Участники:` и каждое имя с новой строки.")
         return
@@ -2577,6 +2583,22 @@ def due_reminders_worker(settings: BotSettings):
         conn.close()
 
 
+def capture_due_model_forecasts_worker(settings: BotSettings) -> int:
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        activate_profile(
+            conn,
+            competition_code=settings.competition,
+            season_name=settings.season,
+            season_display_name=settings.season_display,
+            lock_minutes=settings.lock_minutes,
+        )
+        return capture_model_forecasts(conn, lock_minutes=settings.lock_minutes)
+    finally:
+        conn.close()
+
+
 def complete_reminder_delivery_worker(settings: BotSettings, delivery_id: int, error: str | None = None) -> None:
     conn = connect(settings.db_path)
     try:
@@ -2591,6 +2613,12 @@ def complete_reminder_delivery_worker(settings: BotSettings, delivery_id: int, e
 
 async def deadline_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = settings_from_context(context)
+    try:
+        captured = await asyncio.to_thread(capture_due_model_forecasts_worker, settings)
+        if captured:
+            LOGGER.info("Frozen %s model forecast(s) at a round deadline", captured)
+    except Exception:  # noqa: BLE001 - model capture must not block deadline reminders.
+        LOGGER.exception("Deadline-scoped model forecast capture failed")
     try:
         deliveries = await asyncio.to_thread(due_reminders_worker, settings)
     except Exception:  # noqa: BLE001 - one failing reminder pass must not kill polling.
