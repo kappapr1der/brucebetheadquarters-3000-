@@ -86,6 +86,7 @@ class VkRegistrationStorageTests(unittest.TestCase):
             [
                 entry("vk:control", "Show likes", "free", None),
                 entry("vk:more", "Show more posts", "paid_declared", 500),
+                entry("vk:loader", "Загружается", "paid_declared", 500),
                 entry("vk:real", "Сергей Кириллов", "free", None),
             ],
             seen_at="2026-08-15T23:05:00+03:00",
@@ -94,6 +95,7 @@ class VkRegistrationStorageTests(unittest.TestCase):
         self.assertEqual([alert.participant_name for alert in alerts], ["Сергей Кириллов"])
         self.assertIsNone(self.conn.execute("SELECT 1 FROM participants WHERE name = 'Show likes'").fetchone())
         self.assertIsNone(self.conn.execute("SELECT 1 FROM participants WHERE name = 'Show more posts'").fetchone())
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM participants WHERE name = 'Загружается'").fetchone())
 
         self.conn.execute(
             """
@@ -123,6 +125,20 @@ class VkRegistrationStorageTests(unittest.TestCase):
             FROM participants WHERE name = 'Сергей Кириллов'
             """
         )
+        self.conn.execute(
+            """
+            INSERT INTO vk_registration_entries(
+                group_id, topic_id, source_key, participant_id, vk_author,
+                participant_name, submitted_at, fee_intent, fee_amount_rub,
+                payment_status, first_seen_at, last_seen_at, notification_status
+            )
+            SELECT 217130885, 67251857, 'vk:old-loader', id, 'Andrzej Wisniewski',
+                   'Загружается', '2026-08-15T23:05:00+03:00', 'paid_declared', 500,
+                   'declared_paid', '2026-08-15T23:05:00+03:00',
+                   '2026-08-15T23:05:00+03:00', 'sent'
+            FROM participants WHERE name = 'Сергей Кириллов'
+            """
+        )
         record_vk_registration_entries(
             self.conn,
             217130885,
@@ -135,6 +151,9 @@ class VkRegistrationStorageTests(unittest.TestCase):
         )
         self.assertIsNone(
             self.conn.execute("SELECT 1 FROM vk_registration_entries WHERE participant_name = 'Show more posts'").fetchone()
+        )
+        self.assertIsNone(
+            self.conn.execute("SELECT 1 FROM vk_registration_entries WHERE participant_name = 'Загружается'").fetchone()
         )
 
 
