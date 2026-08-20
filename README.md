@@ -87,6 +87,7 @@ C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\
 
 ```powershell
 $env:TELEGRAM_BOT_TOKEN="..."
+$env:TELEGRAM_ALLOWED_CHAT_IDS="123456789"
 python -m brucebet.telegram_app
 ```
 
@@ -104,6 +105,7 @@ docker compose logs -f brucebet
 ```text
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_ALLOWED_CHAT_IDS=
+BRUCEBET_ALLOW_UNRESTRICTED_CHATS=0
 BRUCEBET_DB_PATH=data/forecasters.sqlite
 BRUCEBET_DATA_DIR=data
 BRUCEBET_USER_PARTICIPANT="Bruce Wayne"
@@ -342,7 +344,16 @@ Before the first stable-fixture migration in production, create a consistent SQL
 verify a restore copy. A successful fixture sync records created/updated/moved/unmatched counts,
 before/after fixture hashes, and stale-factor cleanup in `fixture_sync_runs`.
 
+Every forecast ingest also appends a row to `prediction_revisions`. The current `predictions` table
+is only the projection of the latest eligible revision. Replays with the same stable source item and
+content fingerprint are no-ops; invalid or timezone-naive external timestamps and late edits remain
+auditable but cannot change the current score. The calculated round deadline (first kickoff minus
+`BRUCEBET_LOCK_MINUTES`) is authoritative for edits; the stored round deadline is its fallback. A
+participant's first forecast for a later match may still use that match's own cutoff, preserving the
+existing partial-late rule.
+
 ## World Cup Legacy
 
 Старый ЧМ-сценарий не удалён из архитектуры: VK-парсер и `configs/world_cup_2026.json` оставлены как совместимый режим. Но активная разработка теперь идёт под EPL-longterm: сезонность, профили участников, риск-карта, стратегия и пост-туровый разбор.
+
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 from pathlib import Path
 import sqlite3
 from typing import Iterable, TYPE_CHECKING
@@ -38,6 +40,23 @@ VK_UI_NOISE_PARTICIPANTS = frozenset(
 
 class FixtureIdentityError(RuntimeError):
     """Raised when a stable external fixture identity would change meaning."""
+
+
+@dataclass(frozen=True)
+class PredictionIngestResult:
+    revision_id: int
+    prediction_id: int | None
+    decision: str
+    reason: str
+    created: bool
+
+    @property
+    def accepted(self) -> bool:
+        return self.decision in {"accepted", "accepted_partial_late", "manual_override"}
+
+    @property
+    def duplicate(self) -> bool:
+        return not self.created
 
 
 SCHEMA = """
@@ -132,6 +151,31 @@ CREATE TABLE IF NOT EXISTS predictions (
     source TEXT,
     UNIQUE(participant_id, match_id)
 );
+
+CREATE TABLE IF NOT EXISTS prediction_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+    match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+    prediction_id INTEGER REFERENCES predictions(id) ON DELETE SET NULL,
+    source_kind TEXT NOT NULL,
+    stable_source_item_id TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL,
+    raw_score TEXT,
+    normalized_score TEXT,
+    source_submitted_at TEXT,
+    observed_at TEXT NOT NULL,
+    actor TEXT,
+    parse_status TEXT NOT NULL,
+    deadline_at TEXT,
+    eligibility_decision TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    previous_revision_id INTEGER REFERENCES prediction_revisions(id),
+    projected INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(source_kind, stable_source_item_id, content_fingerprint)
+);
+
+CREATE INDEX IF NOT EXISTS prediction_revisions_match_participant_idx
+ON prediction_revisions(match_id, participant_id, id);
 
 CREATE TABLE IF NOT EXISTS team_form (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -484,6 +528,7 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS result_sync_runs;
         DROP TABLE IF EXISTS manual_result_overrides;
         DROP TABLE IF EXISTS manual_prediction_overrides;
+        DROP TABLE IF EXISTS prediction_revisions;
         DROP TABLE IF EXISTS team_match_factors;
         DROP TABLE IF EXISTS match_odds;
         DROP TABLE IF EXISTS match_contexts;
@@ -575,6 +620,79 @@ def rebuild_rounds_for_seasons(conn: sqlite3.Connection, fallback_season_id: int
     conn.execute("PRAGMA foreign_keys = ON")
 
 
+def _prediction_fingerprint(
+    participant_id: int,
+    match_id: int,
+    raw_score: str | None,
+    submitted_at: str | None,
+) -> str:
+    payload = json.dumps(
+        {
+            "participant_id": participant_id,
+            "match_id": match_id,
+            "raw_score": raw_score,
+            "submitted_at": submitted_at,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def backfill_prediction_revisions(conn: sqlite3.Connection) -> int:
+    """Give pre-migration current predictions an immutable provenance anchor."""
+    rows = list(
+        conn.execute(
+            """
+            SELECT id, participant_id, match_id, score, submitted_at, source
+            FROM predictions
+            WHERE NOT EXISTS (
+                SELECT 1 FROM prediction_revisions rev WHERE rev.prediction_id = predictions.id
+            )
+            ORDER BY id
+            """
+        )
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    for row in rows:
+        raw_score = str(row["score"])
+        submitted_at = row["submitted_at"]
+        source_kind = str(row["source"] or "legacy")
+        fingerprint = _prediction_fingerprint(
+            int(row["participant_id"]),
+            int(row["match_id"]),
+            raw_score,
+            submitted_at,
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO prediction_revisions(
+                participant_id, match_id, prediction_id, source_kind,
+                stable_source_item_id, content_fingerprint, raw_score,
+                normalized_score, source_submitted_at, observed_at, actor,
+                parse_status, deadline_at, eligibility_decision, reason,
+                previous_revision_id, projected
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'valid', NULL,
+                   'accepted', 'legacy_current_projection', NULL, 1)
+            """,
+            (
+                int(row["participant_id"]),
+                int(row["match_id"]),
+                int(row["id"]),
+                source_kind,
+                f"legacy-prediction:{int(row['id'])}",
+                fingerprint,
+                raw_score,
+                raw_score,
+                submitted_at,
+                now,
+            ),
+        )
+    return len(rows)
+
+
 def migrate_db(conn: sqlite3.Connection) -> None:
     rounds_columns = table_columns(conn, "rounds")
     unique_indexes = unique_index_columns(conn, "rounds")
@@ -604,6 +722,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         WHERE source IS NOT NULL AND source_fixture_id IS NOT NULL
         """
     )
+    backfill_prediction_revisions(conn)
 
 def _utc_comparable(value: datetime | None) -> datetime | None:
     if value is None or value.tzinfo is None or value.utcoffset() is None:
@@ -1497,11 +1616,6 @@ def prediction_update_is_locked(
     Only replacing an existing forecast is blocked here; a deliberate correction
     must go through ``set_manual_prediction_override`` and leaves an audit row.
     """
-    raw_timestamp = submitted_at.isoformat() if isinstance(submitted_at, datetime) else submitted_at
-    incoming = parse_datetime(raw_timestamp)
-    deadline = effective_round_deadline(conn, round_name, lock_minutes=lock_minutes)
-    if incoming is None or deadline is None or incoming <= deadline:
-        return False
     row = conn.execute(
         """
         SELECT pr.id
@@ -1516,7 +1630,15 @@ def prediction_update_is_locked(
         """,
         (active_season_id(conn), round_name.strip(), position, participant.strip()),
     ).fetchone()
-    return row is not None
+    if row is None:
+        return False
+    incoming, timestamp_error = _prediction_timestamp(submitted_at)
+    deadline, deadline_error = _aware_deadline(
+        effective_round_deadline(conn, round_name, lock_minutes=lock_minutes)
+    )
+    if timestamp_error is not None or deadline_error is not None:
+        return True
+    return incoming is not None and deadline is not None and incoming > deadline
 
 
 def set_manual_prediction_override(
@@ -1535,7 +1657,7 @@ def set_manual_prediction_override(
         raise ValueError("Forecast must be a one-digit score such as 2:1")
     row = conn.execute(
         """
-        SELECT pr.id, pr.score, pr.submitted_at, pr.source
+        SELECT pr.id, pr.participant_id, pr.match_id, pr.score, pr.submitted_at, pr.source
         FROM predictions pr
         JOIN participants p ON p.id = pr.participant_id
         WHERE pr.match_id = ? AND lower(p.name) = lower(?)
@@ -1576,6 +1698,47 @@ def set_manual_prediction_override(
             optional_text(reason) or "manual forecast correction",
         ),
     )
+    previous_revision = conn.execute(
+        """
+        SELECT id FROM prediction_revisions
+        WHERE participant_id = ? AND match_id = ?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (int(row["participant_id"]), int(row["match_id"])),
+    ).fetchone()
+    fingerprint = _prediction_fingerprint(
+        int(row["participant_id"]),
+        int(row["match_id"]),
+        normalized,
+        preserved_submission,
+    )
+    conn.execute(
+        """
+        INSERT INTO prediction_revisions(
+            participant_id, match_id, prediction_id, source_kind,
+            stable_source_item_id, content_fingerprint, raw_score,
+            normalized_score, source_submitted_at, observed_at, actor,
+            parse_status, deadline_at, eligibility_decision, reason,
+            previous_revision_id, projected
+        )
+        VALUES(?, ?, ?, 'manual-override', ?, ?, ?, ?, ?, ?, ?,
+               'valid', NULL, 'manual_override', ?, ?, 1)
+        """,
+        (
+            int(row["participant_id"]),
+            int(row["match_id"]),
+            int(row["id"]),
+            f"manual-override:{actor_chat_id if actor_chat_id is not None else 'system'}:{timestamp}:{int(row['id'])}",
+            fingerprint,
+            normalized,
+            normalized,
+            preserved_submission,
+            timestamp,
+            str(actor_chat_id) if actor_chat_id is not None else "system",
+            optional_text(reason) or "manual forecast correction",
+            int(previous_revision["id"]) if previous_revision is not None else None,
+        ),
+    )
     conn.commit()
     return str(row["score"]), normalized
 
@@ -1604,6 +1767,234 @@ def manual_prediction_history(conn: sqlite3.Connection, participant: str, match_
     )
 
 
+def prediction_revision_history(conn: sqlite3.Connection, participant: str, match_id: int) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            """
+            SELECT
+                rev.id,
+                rev.source_kind,
+                rev.raw_score,
+                rev.normalized_score,
+                rev.source_submitted_at,
+                rev.observed_at,
+                rev.actor,
+                rev.parse_status,
+                rev.deadline_at,
+                rev.eligibility_decision,
+                rev.reason,
+                rev.previous_revision_id,
+                rev.projected
+            FROM prediction_revisions rev
+            JOIN participants p ON p.id = rev.participant_id
+            WHERE rev.match_id = ? AND lower(p.name) = lower(?)
+            ORDER BY rev.id DESC
+            """,
+            (match_id, participant.strip()),
+        )
+    )
+
+
+def _prediction_timestamp(value: datetime | str | None) -> tuple[datetime | None, str | None]:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, "missing_submitted_at"
+    try:
+        parsed = value if isinstance(value, datetime) else parse_datetime(value)
+    except (TypeError, ValueError):
+        return None, "invalid_submitted_at"
+    if parsed is None:
+        return None, "invalid_submitted_at"
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None, "naive_submitted_at"
+    return parsed, None
+
+
+def _aware_deadline(value: datetime | None) -> tuple[datetime | None, str | None]:
+    if value is None:
+        return None, None
+    if value.tzinfo is None or value.utcoffset() is None:
+        return None, "naive_deadline"
+    return value, None
+
+
+def ingest_prediction_revision(
+    conn: sqlite3.Connection,
+    participant: str,
+    round_name: str,
+    position: int,
+    score: str,
+    submitted_at: datetime | str | None,
+    source: str | None,
+    *,
+    stable_source_item_id: str | None = None,
+    observed_at: datetime | str | None = None,
+    actor: str | None = None,
+    lock_minutes: int = 90,
+) -> PredictionIngestResult:
+    """Append an ingest decision and update the current projection only when eligible.
+
+    The round deadline (first kickoff minus ``lock_minutes``, with the stored
+    round deadline as fallback) is authoritative for edits. A first forecast
+    submitted after it may still use the individual match cutoff, preserving
+    the contest's existing partial-late rule without allowing a late edit to
+    overwrite an earlier score.
+    """
+    participant_id = ensure_participant(conn, participant, paid=None)
+    round_id = ensure_round(conn, round_name)
+    match = conn.execute(
+        "SELECT id, kickoff_at FROM matches WHERE round_id = ? AND position = ?",
+        (round_id, position),
+    ).fetchone()
+    if match is None:
+        raise ValueError(f"Unknown match: round={round_name}, position={position}")
+
+    match_id = int(match["id"])
+    raw_score = score.strip()
+    parsed_score = parse_score(raw_score)
+    normalized_score = parsed_score.label() if parsed_score is not None else None
+    submitted, timestamp_error = _prediction_timestamp(submitted_at)
+    submitted_iso = submitted.isoformat() if submitted is not None else (
+        submitted_at.strip() if isinstance(submitted_at, str) and submitted_at.strip() else None
+    )
+    observed, observed_error = _prediction_timestamp(observed_at or datetime.now(timezone.utc))
+    if observed_error is not None or observed is None:
+        raise ValueError(f"observed_at must be timezone-aware: {observed_error}")
+    observed_iso = observed.isoformat()
+    source_value = (source or "unknown").strip() or "unknown"
+    source_kind = source_value.split(":", 1)[0]
+    stable_id = (stable_source_item_id or "").strip()
+    if not stable_id:
+        stable_id = f"{source_kind}:{participant.strip().casefold()}:{round_name.strip()}:{position}:{submitted_iso or 'missing'}"
+    fingerprint = _prediction_fingerprint(participant_id, match_id, raw_score, submitted_iso)
+
+    duplicate = conn.execute(
+        """
+        SELECT id, prediction_id, eligibility_decision, reason
+        FROM prediction_revisions
+        WHERE source_kind = ? AND stable_source_item_id = ? AND content_fingerprint = ?
+        """,
+        (source_kind, stable_id, fingerprint),
+    ).fetchone()
+    if duplicate is not None:
+        return PredictionIngestResult(
+            revision_id=int(duplicate["id"]),
+            prediction_id=int(duplicate["prediction_id"]) if duplicate["prediction_id"] is not None else None,
+            decision=str(duplicate["eligibility_decision"]),
+            reason=str(duplicate["reason"]),
+            created=False,
+        )
+
+    current = conn.execute(
+        "SELECT id FROM predictions WHERE participant_id = ? AND match_id = ?",
+        (participant_id, match_id),
+    ).fetchone()
+    previous_revision = conn.execute(
+        """
+        SELECT id FROM prediction_revisions
+        WHERE participant_id = ? AND match_id = ?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (participant_id, match_id),
+    ).fetchone()
+    previous_revision_id = int(previous_revision["id"]) if previous_revision is not None else None
+
+    deadline: datetime | None = None
+    deadline_error: str | None = None
+    decision = "quarantined"
+    reason = "invalid_score"
+    parse_status = "invalid" if parsed_score is None else "valid"
+    if parsed_score is not None and timestamp_error is not None:
+        reason = timestamp_error
+    elif parsed_score is not None and submitted is not None:
+        deadline, deadline_error = _aware_deadline(
+            effective_round_deadline(conn, round_name, lock_minutes=lock_minutes)
+        )
+        kickoff, kickoff_error = _prediction_timestamp(match["kickoff_at"])
+        if match["kickoff_at"] is None:
+            kickoff = None
+            kickoff_error = None
+        if deadline_error is not None or kickoff_error in {"invalid_submitted_at", "naive_submitted_at"}:
+            reason = deadline_error or "invalid_kickoff_at"
+        elif deadline is None and kickoff is None:
+            reason = "missing_deadline"
+        elif deadline is not None and submitted <= deadline:
+            decision = "accepted"
+            reason = "before_round_deadline"
+        elif current is not None:
+            decision = "rejected"
+            reason = "late_edit"
+        else:
+            match_deadline = kickoff - timedelta(minutes=lock_minutes) if kickoff is not None else None
+            if match_deadline is not None:
+                deadline = match_deadline
+            if match_deadline is not None and submitted <= match_deadline:
+                decision = "accepted_partial_late"
+                reason = "before_match_deadline"
+            else:
+                decision = "rejected"
+                reason = "late_submission"
+
+    prediction_id: int | None = None
+    projected = 0
+    if decision in {"accepted", "accepted_partial_late"}:
+        conn.execute(
+            """
+            INSERT INTO predictions(participant_id, match_id, score, submitted_at, source)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(participant_id, match_id) DO UPDATE SET
+                score = excluded.score,
+                submitted_at = excluded.submitted_at,
+                source = excluded.source
+            """,
+            (participant_id, match_id, normalized_score, submitted_iso, source_value),
+        )
+        projection = conn.execute(
+            "SELECT id FROM predictions WHERE participant_id = ? AND match_id = ?",
+            (participant_id, match_id),
+        ).fetchone()
+        prediction_id = int(projection["id"])
+        projected = 1
+
+    cursor = conn.execute(
+        """
+        INSERT INTO prediction_revisions(
+            participant_id, match_id, prediction_id, source_kind,
+            stable_source_item_id, content_fingerprint, raw_score,
+            normalized_score, source_submitted_at, observed_at, actor,
+            parse_status, deadline_at, eligibility_decision, reason,
+            previous_revision_id, projected
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            participant_id,
+            match_id,
+            prediction_id,
+            source_kind,
+            stable_id,
+            fingerprint,
+            raw_score,
+            normalized_score,
+            submitted_iso,
+            observed_iso,
+            optional_text(actor),
+            parse_status,
+            deadline.isoformat() if deadline is not None else None,
+            decision,
+            reason,
+            previous_revision_id,
+            projected,
+        ),
+    )
+    return PredictionIngestResult(
+        revision_id=int(cursor.lastrowid),
+        prediction_id=prediction_id,
+        decision=decision,
+        reason=reason,
+        created=True,
+    )
+
+
 def upsert_prediction(
     conn: sqlite3.Connection,
     participant: str,
@@ -1612,32 +2003,26 @@ def upsert_prediction(
     score: str,
     submitted_at: str | None,
     source: str | None,
+    *,
+    stable_source_item_id: str | None = None,
+    observed_at: datetime | str | None = None,
+    actor: str | None = None,
+    lock_minutes: int = 90,
 ) -> int:
-    participant_id = ensure_participant(conn, participant, paid=None)
-    round_id = ensure_round(conn, round_name)
-    match = conn.execute(
-        "SELECT id FROM matches WHERE round_id = ? AND position = ?",
-        (round_id, position),
-    ).fetchone()
-    if match is None:
-        raise ValueError(f"Unknown match: round={round_name}, position={position}")
-    submitted = parse_datetime(submitted_at).isoformat() if submitted_at else None
-    conn.execute(
-        """
-        INSERT INTO predictions(participant_id, match_id, score, submitted_at, source)
-        VALUES(?, ?, ?, ?, ?)
-        ON CONFLICT(participant_id, match_id) DO UPDATE SET
-            score = excluded.score,
-            submitted_at = excluded.submitted_at,
-            source = excluded.source
-        """,
-        (participant_id, int(match["id"]), score.strip(), submitted, source),
+    result = ingest_prediction_revision(
+        conn,
+        participant,
+        round_name,
+        position,
+        score,
+        submitted_at,
+        source,
+        stable_source_item_id=stable_source_item_id,
+        observed_at=observed_at,
+        actor=actor,
+        lock_minutes=lock_minutes,
     )
-    row = conn.execute(
-        "SELECT id FROM predictions WHERE participant_id = ? AND match_id = ?",
-        (participant_id, int(match["id"])),
-    ).fetchone()
-    return int(row["id"])
+    return result.prediction_id or 0
 
 
 def upsert_prediction_for_active_participant(
@@ -2098,6 +2483,9 @@ def import_predictions(conn: sqlite3.Connection, path: str | Path) -> int:
                 row["score"],
                 row.get("submitted_at"),
                 row.get("source"),
+                stable_source_item_id=row.get("source_item_id")
+                or f"csv:{Path(path).name}:{row['participant'].casefold()}:{row['round']}:{row['position']}",
+                actor="csv-import",
             )
             count += 1
     conn.commit()
@@ -2212,4 +2600,5 @@ def find_match(conn: sqlite3.Connection, query: str) -> sqlite3.Row:
     if row is None:
         raise ValueError(f"Match not found: {query}")
     return row
+
 

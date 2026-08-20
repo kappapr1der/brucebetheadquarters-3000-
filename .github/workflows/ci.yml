@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install runtime dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile
+        run: python -m compileall -q brucebet tests
+      - name: Unit and regression tests
+        env:
+          PYTHONWARNINGS: error::ResourceWarning
+        run: python -m unittest discover -s tests -v
+      - name: Rehearsal
+        run: python -m brucebet.cli --db "${{ runner.temp }}/rehearsal.sqlite" rehearse
+      - name: Telegram startup smoke
+        env:
+          TELEGRAM_BOT_TOKEN: "123456:abcdefghijklmnopqrstuvwxyzABCDE12345"
+          TELEGRAM_ALLOWED_CHAT_IDS: "1"
+          BRUCEBET_DB_PATH: "${{ runner.temp }}/telegram-smoke.sqlite"
+          BRUCEBET_DATA_DIR: "${{ runner.temp }}/brucebet-data"
+          BRUCEBET_AUTO_SYNC: "0"
+          VK_TOPIC_DISCOVERY_ENABLED: "0"
+          VK_REGISTRATION_SYNC_ENABLED: "0"
+          VK_PREDICTIONS_SNAPSHOT_ENABLED: "0"
+          VK_OAUTH_ENABLED: "0"
+        run: python -m brucebet.telegram_app --smoke-test

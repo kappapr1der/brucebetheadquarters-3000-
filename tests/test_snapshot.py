@@ -54,7 +54,8 @@ class SnapshotTest(unittest.TestCase):
             self.assertEqual(manifest["scope"], "active_season")
             self.assertEqual(manifest["competition_code"], "epl")
             self.assertEqual(manifest["tables"]["matches.csv"], 4)
-            self.assertEqual(result.tables["predictions.csv"], 20)
+            self.assertEqual(result.tables["predictions.csv"], 18)
+            self.assertEqual(result.tables["prediction_revisions.csv"], 20)
 
             with (out_dir / "predictions.csv").open("r", encoding="utf-8", newline="") as handle:
                 rows = list(csv.DictReader(handle))
@@ -74,6 +75,7 @@ class SnapshotTest(unittest.TestCase):
             self.assertIn("round_reviews.csv", filenames)
             self.assertIn("manual_result_overrides.csv", filenames)
             self.assertIn("manual_prediction_overrides.csv", filenames)
+            self.assertIn("prediction_revisions.csv", filenames)
             self.assertFalse(any(path.suffix == ".sqlite" for path in out_dir.iterdir()))
 
 

@@ -717,6 +717,10 @@ def print_forecast_import_report(participant: str, round_name: str, report: Fore
             print(f"- {item}")
     if report.protected_positions:
         print("Deadline-protected positions: " + ", ".join(str(item) for item in report.protected_positions))
+    if report.rejected_positions:
+        print("Rejected positions: " + ", ".join(str(item) for item in report.rejected_positions))
+    if report.quarantined_positions:
+        print("Quarantined positions: " + ", ".join(str(item) for item in report.quarantined_positions))
 
 
 def cmd_import_forecast(args: argparse.Namespace) -> int:
