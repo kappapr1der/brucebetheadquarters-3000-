@@ -192,6 +192,30 @@ class VkDryRunTests(unittest.TestCase):
             ],
         )
 
+    def test_comment_key_does_not_change_when_earlier_comments_are_added(self) -> None:
+        complete = """
+Forecasters Club
+Регистрация АПЛ
+First Person
+10 Aug 2026 at 6:00 pm
+Без взноса
+Sergey Kirillov
+14 Aug 2026 at 3:35 pm
+Без взноса
+"""
+        later_only = """
+Forecasters Club
+Регистрация АПЛ
+Sergey Kirillov
+14 Aug 2026 at 3:35 pm
+Без взноса
+"""
+
+        complete_report = parse_public_topic_result(topic_result(complete), "registration")
+        later_report = parse_public_topic_result(topic_result(later_only), "registration")
+
+        self.assertEqual(complete_report.registration_entries[-1].source_key, later_report.registration_entries[-1].source_key)
+
     def test_non_epl_topic_is_visible_but_never_future_ingestion_ready(self) -> None:
         report = parse_public_topic_result(topic_result("Прогнозы РПЛ\n"), "predictions")
 
