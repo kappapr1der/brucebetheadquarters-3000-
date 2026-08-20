@@ -11,6 +11,7 @@ from brucebet.vk_dry_run import parse_public_topic_result
 from brucebet.vk_parser import MSK
 from brucebet.vk_prediction_import import VkPredictionImportError, import_vk_prediction_report
 from brucebet.vk_prediction_notifications import (
+    mark_vk_prediction_notification_delivery_sent,
     pending_vk_prediction_notification_deliveries,
     render_vk_prediction_notification,
 )
@@ -216,6 +217,28 @@ class VkPredictionImportTests(unittest.TestCase):
         text = render_vk_prediction_notification(deliveries[0])
         self.assertIn("🎯 Новый прогноз — Тур 1", text)
         self.assertIn("Принято: 10/10", text)
+
+    def test_import_delivery_replay_rehearsal_never_duplicates_a_sent_event(self) -> None:
+        ensure_participant(self.conn, "Сергей", paid=1)
+        report = make_report()
+
+        imported = self.import_report(report, notification_chat_ids=(42,))
+        deliveries = pending_vk_prediction_notification_deliveries(self.conn, (42,))
+        self.assertEqual((imported.revisions_created, len(deliveries)), (10, 1))
+        mark_vk_prediction_notification_delivery_sent(
+            self.conn,
+            deliveries[0],
+            sent_at="2030-08-10T13:01:00+03:00",
+        )
+
+        replayed = self.import_report(report, notification_chat_ids=(42,))
+
+        self.assertEqual((replayed.revisions_created, replayed.notification_events_created), (0, 0))
+        self.assertEqual(pending_vk_prediction_notification_deliveries(self.conn, (42,)), [])
+        sent = self.conn.execute(
+            "SELECT status, sent_at FROM vk_prediction_notification_deliveries"
+        ).fetchone()
+        self.assertEqual((sent["status"], sent["sent_at"]), ("sent", "2030-08-10T13:01:00+03:00"))
 
     def test_one_and_many_match_edits_each_enqueue_one_grouped_event(self) -> None:
         ensure_participant(self.conn, "Сергей", paid=1)
