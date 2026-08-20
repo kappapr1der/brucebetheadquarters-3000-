@@ -202,7 +202,11 @@ Calendar commands:
 - `brucebet next` - next scheduled match.
 - `brucebet round <matchweek>` - one round calendar.
 - `brucebet variables [team]` - latest player status/form snapshots.
-- `brucebet sync-fixtures` - fetch official Premier League fixtures into `matches`.
+- `brucebet sync-fixtures` - fetch official Premier League fixtures into `matches` using the stable
+  `fixture.id` from the public PL API. `position` is presentation order only: kickoff rescheduling may
+  move it without changing `match_id` or any attached forecasts. The first migration of an existing
+  season requires a complete one-to-one `season + home + away` match and rolls back on missing or
+  ambiguous fixtures.
 - `brucebet sync-variables` - fetch FPL, ClubElo, context/weather, factors, and draft assessments.
 - `brucebet sync-results` - write only completed official results and save completed round reviews.
 - `brucebet ready` - preflight the active round: deadline, coverage, model, and data freshness.
@@ -334,6 +338,11 @@ python -m brucebet.cli --db brucebet.sqlite snapshot --out-dir data/snapshots/cu
 
 On the server, `scripts/autocommit-snapshot.sh` commits those exports in a separate git repository at `/opt/brucebet-3000/data/snapshots`. Keep automatic push pointed at a private remote only.
 
+Before the first stable-fixture migration in production, create a consistent SQLite online backup and
+verify a restore copy. A successful fixture sync records created/updated/moved/unmatched counts,
+before/after fixture hashes, and stale-factor cleanup in `fixture_sync_runs`.
+
 ## World Cup Legacy
 
 Старый ЧМ-сценарий не удалён из архитектуры: VK-парсер и `configs/world_cup_2026.json` оставлены как совместимый режим. Но активная разработка теперь идёт под EPL-longterm: сезонность, профили участников, риск-карта, стратегия и пост-туровый разбор.
+

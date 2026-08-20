@@ -114,6 +114,12 @@ With a real `VK_REGISTRATION_TOPIC_ID` plus `VK_REGISTRATION_SYNC_ENABLED=1`, th
 
 `/ready` is the operational preflight before a round. `/intel [тур]` adds a per-match variable coverage check and names the missing/stale inputs. `/absence Команда | Игрок | статус | impact | источник | заметка` records confirmed player news, recalculates factors and assessments, and accepts `fit`/`available` to clear an old entry. `/missing [тур]` adds the named follow-up list: people with a partial or missing block and the exact positions to chase. `/setresult <match> | <score> | <reason>` is restricted by the Telegram whitelist and writes every manual fallback into an audit log; use it only while the official result feed is delayed or being corrected.
 
+`/sync_fixtures` identifies PL matches by the official source fixture ID, not by their current order in
+the round. On the first migration it requires complete one-to-one coverage of the active season and
+fails atomically on missing or ambiguous team pairs. Take and restore-check an SQLite online backup
+before enabling that migration in production; inspect `fixture_sync_runs` and run `/sync_variables`
+afterward to refresh the retained 760 current team-match factors.
+
 ## Updating data
 
 Send the VK pasted text as a message or `.txt` file. The bot will parse it, update `data/vk_matches.csv`, `data/vk_predictions.csv`, and import into SQLite.

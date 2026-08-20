@@ -100,6 +100,8 @@ def active_season_snapshot_tables(season_id: int) -> Iterable[SnapshotTable]:
             m.position,
             m.home,
             m.away,
+            m.source,
+            m.source_fixture_id,
             m.kickoff_at,
             r.deadline_at AS round_deadline_at,
             m.result
@@ -455,3 +457,4 @@ def export_snapshot(conn: sqlite3.Connection, out_dir: str | Path, label: str | 
         season=str(season["display_name"] or season["name"]),
         tables=table_counts,
     )
+
