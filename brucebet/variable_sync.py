@@ -59,6 +59,7 @@ TEAM_ALIASES = {
     "arsenal": "Arsenal",
     "aston villa": "Aston Villa",
     "brentford": "Brentford",
+    "burnley": "Burnley",
     "brighton": "Brighton and Hove Albion",
     "brighton and hove albion": "Brighton and Hove Albion",
     "brighton hove albion": "Brighton and Hove Albion",
@@ -90,6 +91,11 @@ TEAM_ALIASES = {
     "tottenham": "Tottenham Hotspur",
     "tottenham hotspur": "Tottenham Hotspur",
     "spurs": "Tottenham Hotspur",
+    "west ham": "West Ham United",
+    "west ham united": "West Ham United",
+    "wolverhampton": "Wolverhampton Wanderers",
+    "wolverhampton wanderers": "Wolverhampton Wanderers",
+    "wolves": "Wolverhampton Wanderers",
 }
 
 CLUBELO_ALIASES = {

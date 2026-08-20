@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS prediction_revisions (
     raw_score TEXT,
     normalized_score TEXT,
     source_submitted_at TEXT,
+    eligibility_at TEXT,
     observed_at TEXT NOT NULL,
     actor TEXT,
     parse_status TEXT NOT NULL,
@@ -466,6 +467,23 @@ CREATE TABLE IF NOT EXISTS vk_registration_entries (
     notification_error TEXT,
     PRIMARY KEY(group_id, topic_id, source_key)
 );
+
+CREATE TABLE IF NOT EXISTS vk_prediction_quarantine (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id INTEGER NOT NULL,
+    topic_id INTEGER NOT NULL,
+    source_key TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL,
+    participant_name TEXT,
+    vk_author TEXT,
+    round_name TEXT,
+    source_submitted_at TEXT,
+    observed_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    resolved_at TEXT,
+    UNIQUE(group_id, topic_id, source_key, content_fingerprint, reason)
+);
 """
 
 
@@ -520,6 +538,7 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS vk_topic_alerts;
         DROP TABLE IF EXISTS vk_topic_discovery_state;
         DROP TABLE IF EXISTS vk_registration_entries;
+        DROP TABLE IF EXISTS vk_prediction_quarantine;
         DROP TABLE IF EXISTS model_forecast_legacy_audit;
         DROP TABLE IF EXISTS model_forecasts;
         DROP TABLE IF EXISTS round_reviews;
@@ -670,11 +689,11 @@ def backfill_prediction_revisions(conn: sqlite3.Connection) -> int:
             INSERT OR IGNORE INTO prediction_revisions(
                 participant_id, match_id, prediction_id, source_kind,
                 stable_source_item_id, content_fingerprint, raw_score,
-                normalized_score, source_submitted_at, observed_at, actor,
+                normalized_score, source_submitted_at, eligibility_at, observed_at, actor,
                 parse_status, deadline_at, eligibility_decision, reason,
                 previous_revision_id, projected
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'valid', NULL,
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'valid', NULL,
                    'accepted', 'legacy_current_projection', NULL, 1)
             """,
             (
@@ -686,6 +705,7 @@ def backfill_prediction_revisions(conn: sqlite3.Connection) -> int:
                 fingerprint,
                 raw_score,
                 raw_score,
+                submitted_at,
                 submitted_at,
                 now,
             ),
@@ -714,6 +734,13 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE matches ADD COLUMN source TEXT")
     if "source_fixture_id" not in match_columns:
         conn.execute("ALTER TABLE matches ADD COLUMN source_fixture_id TEXT")
+
+    revision_columns = table_columns(conn, "prediction_revisions")
+    if "eligibility_at" not in revision_columns:
+        conn.execute("ALTER TABLE prediction_revisions ADD COLUMN eligibility_at TEXT")
+        conn.execute(
+            "UPDATE prediction_revisions SET eligibility_at = source_submitted_at WHERE eligibility_at IS NULL"
+        )
 
     conn.execute(
         """
@@ -1717,11 +1744,11 @@ def set_manual_prediction_override(
         INSERT INTO prediction_revisions(
             participant_id, match_id, prediction_id, source_kind,
             stable_source_item_id, content_fingerprint, raw_score,
-            normalized_score, source_submitted_at, observed_at, actor,
+            normalized_score, source_submitted_at, eligibility_at, observed_at, actor,
             parse_status, deadline_at, eligibility_decision, reason,
             previous_revision_id, projected
         )
-        VALUES(?, ?, ?, 'manual-override', ?, ?, ?, ?, ?, ?, ?,
+        VALUES(?, ?, ?, 'manual-override', ?, ?, ?, ?, ?, ?, ?, ?,
                'valid', NULL, 'manual_override', ?, ?, 1)
         """,
         (
@@ -1732,6 +1759,7 @@ def set_manual_prediction_override(
             fingerprint,
             normalized,
             normalized,
+            preserved_submission,
             preserved_submission,
             timestamp,
             str(actor_chat_id) if actor_chat_id is not None else "system",
@@ -1777,6 +1805,7 @@ def prediction_revision_history(conn: sqlite3.Connection, participant: str, matc
                 rev.raw_score,
                 rev.normalized_score,
                 rev.source_submitted_at,
+                rev.eligibility_at,
                 rev.observed_at,
                 rev.actor,
                 rev.parse_status,
@@ -1828,6 +1857,7 @@ def ingest_prediction_revision(
     *,
     stable_source_item_id: str | None = None,
     observed_at: datetime | str | None = None,
+    eligibility_at: datetime | str | None = None,
     actor: str | None = None,
     lock_minutes: int = 90,
 ) -> PredictionIngestResult:
@@ -1837,7 +1867,9 @@ def ingest_prediction_revision(
     round deadline as fallback) is authoritative for edits. A first forecast
     submitted after it may still use the individual match cutoff, preserving
     the contest's existing partial-late rule without allowing a late edit to
-    overwrite an earlier score.
+    overwrite an earlier score. ``eligibility_at`` may be later than the source
+    timestamp when an external system exposes an edit without a trustworthy
+    edited-at value; both timestamps remain in the audit row.
     """
     participant_id = ensure_participant(conn, participant, paid=None)
     round_id = ensure_round(conn, round_name)
@@ -1856,6 +1888,22 @@ def ingest_prediction_revision(
     submitted_iso = submitted.isoformat() if submitted is not None else (
         submitted_at.strip() if isinstance(submitted_at, str) and submitted_at.strip() else None
     )
+    if eligibility_at is None:
+        eligibility = submitted
+        eligibility_error = timestamp_error
+        eligibility_iso = submitted_iso
+    else:
+        eligibility, raw_eligibility_error = _prediction_timestamp(eligibility_at)
+        eligibility_error = (
+            raw_eligibility_error.replace("submitted_at", "eligibility_at")
+            if raw_eligibility_error is not None
+            else None
+        )
+        eligibility_iso = eligibility.isoformat() if eligibility is not None else (
+            eligibility_at.strip()
+            if isinstance(eligibility_at, str) and eligibility_at.strip()
+            else None
+        )
     observed, observed_error = _prediction_timestamp(observed_at or datetime.now(timezone.utc))
     if observed_error is not None or observed is None:
         raise ValueError(f"observed_at must be timezone-aware: {observed_error}")
@@ -1905,7 +1953,9 @@ def ingest_prediction_revision(
     parse_status = "invalid" if parsed_score is None else "valid"
     if parsed_score is not None and timestamp_error is not None:
         reason = timestamp_error
-    elif parsed_score is not None and submitted is not None:
+    elif parsed_score is not None and eligibility_error is not None:
+        reason = eligibility_error
+    elif parsed_score is not None and submitted is not None and eligibility is not None:
         deadline, deadline_error = _aware_deadline(
             effective_round_deadline(conn, round_name, lock_minutes=lock_minutes)
         )
@@ -1917,7 +1967,7 @@ def ingest_prediction_revision(
             reason = deadline_error or "invalid_kickoff_at"
         elif deadline is None and kickoff is None:
             reason = "missing_deadline"
-        elif deadline is not None and submitted <= deadline:
+        elif deadline is not None and eligibility <= deadline:
             decision = "accepted"
             reason = "before_round_deadline"
         elif current is not None:
@@ -1927,7 +1977,7 @@ def ingest_prediction_revision(
             match_deadline = kickoff - timedelta(minutes=lock_minutes) if kickoff is not None else None
             if match_deadline is not None:
                 deadline = match_deadline
-            if match_deadline is not None and submitted <= match_deadline:
+            if match_deadline is not None and eligibility <= match_deadline:
                 decision = "accepted_partial_late"
                 reason = "before_match_deadline"
             else:
@@ -1960,11 +2010,11 @@ def ingest_prediction_revision(
         INSERT INTO prediction_revisions(
             participant_id, match_id, prediction_id, source_kind,
             stable_source_item_id, content_fingerprint, raw_score,
-            normalized_score, source_submitted_at, observed_at, actor,
+            normalized_score, source_submitted_at, eligibility_at, observed_at, actor,
             parse_status, deadline_at, eligibility_decision, reason,
             previous_revision_id, projected
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             participant_id,
@@ -1976,6 +2026,7 @@ def ingest_prediction_revision(
             raw_score,
             normalized_score,
             submitted_iso,
+            eligibility_iso,
             observed_iso,
             optional_text(actor),
             parse_status,
@@ -2600,5 +2651,6 @@ def find_match(conn: sqlite3.Connection, query: str) -> sqlite3.Row:
     if row is None:
         raise ValueError(f"Match not found: {query}")
     return row
+
 
 

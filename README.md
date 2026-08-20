@@ -322,7 +322,9 @@ python -m brucebet.cli vk-discover
 
 Set `VK_TOPIC_DISCOVERY_ENABLED=1` to poll the public Forecasters Club discussion list. The first pass with at least one discovered topic is a quiet baseline; later newly discovered EPL registration or prediction topics produce one Telegram alert. `/vk_topics` runs the same public, read-only check manually. RPL is ignored by the alert queue and no VK discovery result imports contest data.
 
-`/vk_snapshot` reads the configured EPL registration and prediction topics, keeps a local archive of changed public fields in `data/vk_snapshots/`, and reports the recognized entry/block counts. Set `VK_PREDICTIONS_SNAPSHOT_ENABLED=1` to run the same read-only archive job every 20 minutes. No forecast from this route is written to SQLite.
+`/vk_snapshot` reads the configured EPL registration and prediction topics, keeps a local archive of changed public fields in `data/vk_snapshots/`, and reports the recognized entry/block counts. Set `VK_PREDICTIONS_SNAPSHOT_ENABLED=1` to run the same read-only archive job every 20 minutes. VK is always read-only. SQLite projection is a separate explicit gate: `VK_PREDICTIONS_IMPORT_ENABLED=1` imports only the configured EPL topic, only registered participants, and maps fixtures by stable home/away identity rather than VK list position.
+
+VK forecast imports append immutable `prediction_revisions`. Repeating the same capture is a no-op, a changed comment becomes one revision, and an edit first observed after the deadline is rejected without changing the current projection. Ambiguous comment identities, unknown participants, and incomplete fixture mappings go to `vk_prediction_quarantine` rather than being guessed.
 
 Для прогнозов выводятся шаблон, дедлайн, автор комментария, фактический участник, нормализованные счета и статус `FULL`/`PARTIAL`. Для регистрации отдельно сохраняется заявленный выбор взноса и статус проверки оплаты: перевод считается только заявленным, пока организатор его не подтвердил. Тестовая тема РПЛ допускается лишь для проверки формата: dry-run пометит её как `non_epl`, а будущий импорт останется заблокированным.
 
@@ -355,5 +357,6 @@ existing partial-late rule.
 ## World Cup Legacy
 
 Старый ЧМ-сценарий не удалён из архитектуры: VK-парсер и `configs/world_cup_2026.json` оставлены как совместимый режим. Но активная разработка теперь идёт под EPL-longterm: сезонность, профили участников, риск-карта, стратегия и пост-туровый разбор.
+
 
 

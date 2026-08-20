@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime
 import os
 from pathlib import Path
@@ -7,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 try:
-    from brucebet.telegram_app import forecast_cmd, load_settings, text_handler
+    from brucebet.telegram_app import forecast_cmd, load_settings, text_handler, vk_predictions_snapshot_job
 
     TELEGRAM_AVAILABLE = True
 except ModuleNotFoundError as exc:
@@ -128,6 +129,37 @@ class TelegramForecastHandlerTests(unittest.IsolatedAsyncioTestCase):
         conn.close()
         self.assertEqual(score, "2:1")
         self.assertEqual(decisions, [("accepted", "before_round_deadline"), ("rejected", "late_edit")])
+
+    async def test_vk_prediction_job_writes_only_behind_explicit_import_gate(self) -> None:
+        report = SimpleNamespace(topic_id=67251746, forecast_submissions=(object(),))
+        archive = SimpleNamespace(created=False)
+        imported = SimpleNamespace(
+            topic_id=67251746,
+            submissions_seen=1,
+            forecasts_seen=10,
+            revisions_created=10,
+            duplicates=0,
+            accepted=10,
+            rejected=0,
+            quarantined=0,
+            issues=(),
+        )
+        disabled_context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"settings": self.settings}),
+        )
+        enabled_context = SimpleNamespace(
+            application=SimpleNamespace(
+                bot_data={"settings": replace(self.settings, vk_predictions_import_enabled=True)}
+            ),
+        )
+        with (
+            patch("brucebet.telegram_app.read_vk_predictions_worker", return_value=(report, archive)),
+            patch("brucebet.telegram_app.record_vk_predictions_worker", return_value=imported) as record,
+        ):
+            await vk_predictions_snapshot_job(disabled_context)
+            record.assert_not_called()
+            await vk_predictions_snapshot_job(enabled_context)
+            record.assert_called_once_with(enabled_context.application.bot_data["settings"], report)
 
 
 @unittest.skipUnless(TELEGRAM_AVAILABLE, "python-telegram-bot is installed in Docker and CI")

@@ -118,6 +118,7 @@ from .vk_oauth import (
     create_authorization_url,
 )
 from .vk_parser import parse_file as parse_vk_file
+from .vk_prediction_import import VkPredictionImportReport, import_vk_prediction_report
 from .vk_snapshot_archive import VkSnapshotArchiveResult, archive_public_topic_capture
 
 
@@ -171,6 +172,7 @@ class BotSettings:
     vk_registration_sync_first_delay_seconds: int
     vk_registration_browser_wait_ms: int
     vk_predictions_snapshot_enabled: bool
+    vk_predictions_import_enabled: bool
     vk_predictions_snapshot_interval_minutes: int
     vk_public_snapshot_dir: Path
     vk_challenge_alert_cooldown_minutes: int
@@ -263,6 +265,7 @@ def load_settings() -> BotSettings:
             os.getenv("VK_PREDICTIONS_SNAPSHOT_ENABLED"),
             default=bool(os.getenv("VK_PREDICTIONS_TOPIC_ID", "").strip()),
         ),
+        vk_predictions_import_enabled=parse_bool(os.getenv("VK_PREDICTIONS_IMPORT_ENABLED"), default=False),
         vk_predictions_snapshot_interval_minutes=int(os.getenv("VK_PREDICTIONS_SNAPSHOT_INTERVAL_MINUTES", "20")),
         vk_public_snapshot_dir=Path(
             os.getenv("VK_PUBLIC_SNAPSHOT_DIR", str(Path(os.getenv("BRUCEBET_DATA_DIR", "data")) / "vk_snapshots"))
@@ -2440,6 +2443,28 @@ def read_vk_predictions_worker(settings: BotSettings):
     return report, archive
 
 
+def record_vk_predictions_worker(settings: BotSettings, report: object) -> VkPredictionImportReport:
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        activate_profile(
+            conn,
+            competition_code=settings.competition,
+            season_name=settings.season,
+            season_display_name=settings.season_display,
+            lock_minutes=settings.lock_minutes,
+        )
+        return import_vk_prediction_report(
+            conn,
+            report,
+            expected_group_id=settings.vk_group_id,
+            expected_topic_id=settings.vk_predictions_topic_id,
+            lock_minutes=settings.lock_minutes,
+        )
+    finally:
+        conn.close()
+
+
 def render_vk_snapshot_status(label: str, report: object, archive: VkSnapshotArchiveResult | None) -> str:
     stored = "новый снимок сохранён" if archive is not None and archive.created else "без изменений в поле"
     if archive is None:
@@ -2566,11 +2591,7 @@ async def vk_registration_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def vk_predictions_snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Keep an auditable, read-only copy of the prediction field.
-
-    Forecast blocks stay out of SQLite until an explicit future import flow is
-    approved; this job only records a changed public page in the local archive.
-    """
+    """Archive the read-only VK capture and optionally project it into SQLite."""
 
     settings = settings_from_context(context)
     try:
@@ -2587,6 +2608,26 @@ async def vk_predictions_snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> Non
         report.topic_id,
         getattr(archive, "created", False),
         len(report.forecast_submissions),
+    )
+    if not settings.vk_predictions_import_enabled:
+        return
+    try:
+        imported = await asyncio.to_thread(record_vk_predictions_worker, settings, report)
+    except Exception:  # noqa: BLE001 - an unsafe capture must not stop Telegram polling.
+        LOGGER.exception("VK predictions import failed")
+        return
+    LOGGER.info(
+        "VK predictions import topic=%s submissions=%s forecasts=%s revisions=%s duplicates=%s "
+        "accepted=%s rejected=%s quarantined=%s issues=%s",
+        imported.topic_id,
+        imported.submissions_seen,
+        imported.forecasts_seen,
+        imported.revisions_created,
+        imported.duplicates,
+        imported.accepted,
+        imported.rejected,
+        imported.quarantined,
+        len(imported.issues),
     )
 
 
@@ -2785,6 +2826,8 @@ def configure_vk_predictions_snapshot(application: Application, settings: BotSet
         name="brucebet-vk-predictions-snapshot",
     )
     LOGGER.info("VK predictions snapshots scheduled every %s minutes", interval)
+    if settings.vk_predictions_import_enabled:
+        LOGGER.info("VK predictions SQLite import is enabled behind EPL and identity gates")
 
 
 def configure_vk_oauth_worker_poll(application: Application, settings: BotSettings) -> None:
@@ -2891,5 +2934,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 

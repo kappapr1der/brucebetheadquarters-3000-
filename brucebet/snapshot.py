@@ -149,6 +149,7 @@ def active_season_snapshot_tables(season_id: int) -> Iterable[SnapshotTable]:
             rev.raw_score,
             rev.normalized_score,
             rev.source_submitted_at,
+            rev.eligibility_at,
             rev.observed_at,
             rev.actor,
             rev.parse_status,
@@ -165,6 +166,27 @@ def active_season_snapshot_tables(season_id: int) -> Iterable[SnapshotTable]:
         ORDER BY r.sort_order, m.position, p.name, rev.id
         """,
         (season_id,),
+    )
+    yield SnapshotTable(
+        "vk_prediction_quarantine.csv",
+        """
+        SELECT
+            id,
+            group_id,
+            topic_id,
+            source_key,
+            content_fingerprint,
+            participant_name,
+            vk_author,
+            round_name,
+            source_submitted_at,
+            observed_at,
+            reason,
+            payload_json,
+            resolved_at
+        FROM vk_prediction_quarantine
+        ORDER BY id
+        """,
     )
     yield SnapshotTable(
         "teams.csv",
@@ -490,5 +512,6 @@ def export_snapshot(conn: sqlite3.Connection, out_dir: str | Path, label: str | 
         season=str(season["display_name"] or season["name"]),
         tables=table_counts,
     )
+
 
 
