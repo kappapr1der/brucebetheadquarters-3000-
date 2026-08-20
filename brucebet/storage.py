@@ -24,6 +24,7 @@ VK_UI_NOISE_PARTICIPANTS = frozenset(
     {
         "show likes",
         "show reactions",
+        "show more posts",
         "показать список оценивших",
         "показать реакции",
         "reply",
