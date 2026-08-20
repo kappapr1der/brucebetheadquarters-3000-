@@ -57,7 +57,17 @@ OPEN_RE = re.compile(r"\b(?:регистрац\w*|для\s+участия|зап
 FINAL_ROSTER_RE = re.compile(r"\b(?:финальн\w*\s+(?:состав|список)|итогов\w*\s+состав)\b", re.IGNORECASE)
 NON_EPL_RE = re.compile(r"\b(?:рпл|российск\w*\s+премьер)\b", re.IGNORECASE)
 EPL_RE = re.compile(r"\b(?:апл|английск\w*\s+премьер|premier\s+league)\b", re.IGNORECASE)
-NOISE = {"", "показать список оценивших", "ответить", "поделиться"}
+NOISE = {
+    "",
+    "показать список оценивших",
+    "показать реакции",
+    "ответить",
+    "поделиться",
+    "show likes",
+    "show reactions",
+    "reply",
+    "share",
+}
 
 
 @dataclass(frozen=True)
@@ -143,7 +153,11 @@ class VkPublicTopicCapture:
 
 
 def _clean_lines(text: str) -> list[str]:
-    return [line.strip() for line in text.splitlines() if line.strip()]
+    return [line.strip() for line in text.splitlines() if line.strip() and not _is_noise_line(line)]
+
+
+def _is_noise_line(value: str) -> bool:
+    return " ".join(value.casefold().split()) in NOISE
 
 
 def _date_only(line: str) -> datetime | None:
@@ -191,7 +205,7 @@ def parse_comment_blocks(text: str, *, group_id: int, topic_id: int) -> list[VkC
         if submitted_at is None or index == 0:
             continue
         author = lines[index - 1].strip()
-        if not author or author.casefold() in NOISE or parse_author(author) is not None:
+        if not author or _is_noise_line(author) or parse_author(author) is not None:
             continue
         headers.append((author, submitted_at, index - 1, index + 1))
 
@@ -229,7 +243,7 @@ def _score_for_match_line(line: str, match: MatchTemplate) -> str | None:
 
 def _looks_like_identity(line: str) -> bool:
     compact = " ".join(line.strip().split())
-    if compact.casefold() in NOISE or not IDENTITY_RE.fullmatch(compact):
+    if _is_noise_line(compact) or not IDENTITY_RE.fullmatch(compact):
         return False
     lowered = compact.casefold()
     return not any(word in lowered for word in ("взнос", "руб", "оплат", "отправ", "прогноз", "регистрац"))
@@ -594,3 +608,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
