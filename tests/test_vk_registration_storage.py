@@ -78,6 +78,47 @@ class VkRegistrationStorageTests(unittest.TestCase):
         )
         self.assertEqual(repeated, [])
 
+    def test_discards_and_purges_vk_engagement_control_as_legacy_participant(self) -> None:
+        alerts = record_vk_registration_entries(
+            self.conn,
+            217130885,
+            67251857,
+            [
+                entry("vk:control", "Show likes", "free", None),
+                entry("vk:real", "Сергей Кириллов", "free", None),
+            ],
+            seen_at="2026-08-15T23:05:00+03:00",
+        )
+
+        self.assertEqual([alert.participant_name for alert in alerts], ["Сергей Кириллов"])
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM participants WHERE name = 'Show likes'").fetchone())
+
+        self.conn.execute(
+            """
+            INSERT INTO vk_registration_entries(
+                group_id, topic_id, source_key, participant_id, vk_author,
+                participant_name, submitted_at, fee_intent, fee_amount_rub,
+                payment_status, first_seen_at, last_seen_at, notification_status
+            )
+            SELECT 217130885, 67251857, 'vk:old-control', id, 'Sergey Kirillov',
+                   'Show likes', '2026-08-15T23:05:00+03:00', 'free', NULL,
+                   'not_applicable', '2026-08-15T23:05:00+03:00',
+                   '2026-08-15T23:05:00+03:00', 'sent'
+            FROM participants WHERE name = 'Сергей Кириллов'
+            """
+        )
+        record_vk_registration_entries(
+            self.conn,
+            217130885,
+            67251857,
+            [entry("vk:real", "Сергей Кириллов", "free", None)],
+            seen_at="2026-08-15T23:10:00+03:00",
+        )
+        self.assertIsNone(
+            self.conn.execute("SELECT 1 FROM vk_registration_entries WHERE participant_name = 'Show likes'").fetchone()
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
+
