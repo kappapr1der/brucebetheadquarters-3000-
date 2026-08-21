@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import patch
@@ -282,6 +283,12 @@ class ContestRecommendationTests(unittest.TestCase):
         self.assertNotIn("Arsenal", template)
         self.assertIn("Брайтон - Ньюкасл", template)
         self.assertIn("Тоттенхэм - Манчестер Юнайтед", template)
+        self.assertIn("1 участник ещё не прислал", draft)
+
+        five_missing = render_contest_recommendations(
+            replace(batch, field_complete_count=8, field_expected_count=13)
+        )
+        self.assertIn("5 участников ещё не прислал", five_missing)
 
 
 if __name__ == "__main__":

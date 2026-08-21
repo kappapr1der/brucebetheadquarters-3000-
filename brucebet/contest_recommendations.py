@@ -808,10 +808,22 @@ def mark_contest_recommendation_delivery_failed(
     conn.commit()
 
 
+def _participant_word(count: int) -> str:
+    remainder = count % 100
+    if 11 <= remainder <= 14:
+        return "участников"
+    remainder = count % 10
+    if remainder == 1:
+        return "участник"
+    if 2 <= remainder <= 4:
+        return "участника"
+    return "участников"
+
+
 def _field_line(batch: ContestRecommendationBatch) -> str:
     missing = max(0, batch.field_expected_count - batch.field_complete_count)
     if missing:
-        suffix = f"; {missing} участник ещё не прислал"
+        suffix = f"; {missing} {_participant_word(missing)} ещё не прислал"
     else:
         suffix = ""
     return f"Поле: {batch.field_complete_count}/{batch.field_expected_count} прогнозов{suffix}."
