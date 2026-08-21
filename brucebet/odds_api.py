@@ -158,6 +158,12 @@ def parse_iso_utc(raw: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _odds_api_timestamp(value: datetime) -> str:
+    """Render the exact UTC format required by The Odds API query parameters."""
+
+    return value.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _mean(values: list[float]) -> float | None:
     if not values:
         return None
@@ -389,8 +395,8 @@ def sync_odds_to_db(
         sport=sport,
         regions=regions,
         markets=markets,
-        commence_time_from=now.isoformat().replace("+00:00", "Z"),
-        commence_time_to=(now + timedelta(days=days_ahead)).isoformat().replace("+00:00", "Z"),
+        commence_time_from=_odds_api_timestamp(now),
+        commence_time_to=_odds_api_timestamp(now + timedelta(days=days_ahead)),
     )
     index = load_match_index(conn)
     unmatched: list[str] = []
