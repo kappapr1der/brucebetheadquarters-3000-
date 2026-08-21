@@ -112,7 +112,8 @@ BRUCEBET_USER_PARTICIPANT="Bruce Wayne"
 BRUCEBET_COMPETITION=epl
 BRUCEBET_SEASON=2026/27
 BRUCEBET_SEASON_DISPLAY="EPL 2026/27"
-BRUCEBET_LOCK_MINUTES=90
+# EPL Forecasters Club: submissions close at the first match's kickoff.
+BRUCEBET_LOCK_MINUTES=0
 BRUCEBET_TIMEZONE=Europe/Moscow
 PREMIER_LEAGUE_COMPSEASON_ID=841
 PREMIER_LEAGUE_SEASON_LABEL=2026/2027
@@ -362,7 +363,8 @@ Every forecast ingest also appends a row to `prediction_revisions`. The current 
 is only the projection of the latest eligible revision. Replays with the same stable source item and
 content fingerprint are no-ops; invalid or timezone-naive external timestamps and late edits remain
 auditable but cannot change the current score. The calculated round deadline (first kickoff minus
-`BRUCEBET_LOCK_MINUTES`) is authoritative for edits; the stored round deadline is its fallback. A
+`BRUCEBET_LOCK_MINUTES`) is authoritative for edits; the active EPL profile uses `0`, so it closes
+at the first kickoff. The stored round deadline is its fallback. A
 participant's first forecast for a later match may still use that match's own cutoff, preserving the
 existing partial-late rule.
 

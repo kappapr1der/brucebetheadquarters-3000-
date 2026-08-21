@@ -855,13 +855,14 @@ def _utc_comparable(value: datetime | None) -> datetime | None:
 
 
 def mark_premature_model_forecasts(conn: sqlite3.Connection) -> int:
-    """Quarantine pre-deadline legacy freezes without deleting their evidence."""
+    """Quarantine unaudited pre-deadline legacy freezes without deleting evidence."""
 
     rows = conn.execute(
         """
         SELECT
             f.id,
             f.captured_at,
+            f.freeze_reason,
             (
                 SELECT MIN(m2.kickoff_at)
                 FROM matches m2
@@ -880,6 +881,8 @@ def mark_premature_model_forecasts(conn: sqlite3.Connection) -> int:
         captured_at = _utc_comparable(parse_datetime(row["captured_at"]))
         first_kickoff_at = _utc_comparable(parse_datetime(row["first_kickoff_at"]))
         if captured_at is None or first_kickoff_at is None:
+            continue
+        if row["freeze_reason"] == "pre_deadline_final":
             continue
         deadline_at = first_kickoff_at - timedelta(minutes=int(active_season(conn)["deadline_lock_minutes"]))
         if captured_at >= deadline_at:

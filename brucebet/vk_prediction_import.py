@@ -7,7 +7,7 @@ import json
 import re
 import sqlite3
 
-from .storage import active_season_id, ingest_prediction_revision
+from .storage import active_season_id, ensure_participant, ensure_season_participant, ingest_prediction_revision
 from .variable_sync import resolve_existing_team
 from .vk_dry_run import VkForecastSubmission, VkTopicDryRunReport
 from .vk_parser import MatchTemplate, RoundTemplate
@@ -225,6 +225,48 @@ def _registered_participant(conn: sqlite3.Connection, value: str) -> str | None:
     return str(rows[0]["name"]) if len(rows) == 1 else None
 
 
+def _resolve_or_enroll_participant(conn: sqlite3.Connection, value: str) -> str | None:
+    """Resolve a registered name or enroll a verified VK forecast author.
+
+    A complete forecast block in the configured public EPL topic is itself a
+    valid contest entry. Registration can arrive in a separate VK topic later,
+    so absence from the local roster must not discard the forecast. New entries
+    start as unpaid until the registration import confirms their payment.
+    """
+
+    submitted_name = " ".join(value.split())
+    if not submitted_name:
+        return None
+
+    registered = _registered_participant(conn, submitted_name)
+    if registered is not None:
+        return registered
+
+    # Prefer an exact existing participant record over a newly created
+    # lookalike. Do not change a recorded payment status here: a forecast post
+    # proves participation, not payment.
+    rows = list(
+        conn.execute(
+            "SELECT id, name FROM participants WHERE lower(name) = lower(?) ORDER BY id",
+            (submitted_name,),
+        )
+    )
+    if len(rows) == 1:
+        participant_id = int(rows[0]["id"])
+        season_row = conn.execute(
+            "SELECT paid FROM season_participants WHERE season_id = ? AND participant_id = ?",
+            (active_season_id(conn), participant_id),
+        ).fetchone()
+        paid = int(season_row["paid"]) if season_row is not None else 0
+        ensure_season_participant(conn, participant_id, paid=paid, active=1)
+        return str(rows[0]["name"])
+    if len(rows) > 1:
+        return None
+
+    ensure_participant(conn, submitted_name, paid=0)
+    return submitted_name
+
+
 def _template_by_round(report: VkTopicDryRunReport) -> dict[str, RoundTemplate]:
     templates: dict[str, RoundTemplate] = {}
     for template in report.templates:
@@ -303,9 +345,10 @@ def import_vk_prediction_report(
     """Project one read-only VK capture into SQLite through immutable revisions.
 
     Nothing is written to VK. Business projections are written only after the
-    configured topic, EPL gate, registered participant and pair-based fixture
-    mapping all pass. Unsafe submissions are retained in an idempotent local
-    quarantine instead of creating participants or guessing a match position.
+    configured topic, EPL gate and pair-based fixture mapping all pass. A full
+    forecast post enrolls its participant when needed, while unsafe submissions
+    are retained in an idempotent local quarantine instead of guessing a match
+    position.
     """
 
     if report.topic_kind != "predictions":
@@ -438,9 +481,9 @@ def import_vk_prediction_report(
                 issues.append(VkPredictionImportIssue(submission.source_key, submission.participant, round_name, reason))
                 continue
 
-            participant = _registered_participant(conn, submission.participant)
+            participant = _resolve_or_enroll_participant(conn, submission.participant)
             if participant is None:
-                reason = "participant is not uniquely registered for the active season"
+                reason = "forecast participant name is empty or ambiguous"
                 if _quarantine(conn, report, submission, stable_comment_key=stable_comment, reason=reason):
                     quarantined += 1
                     if _queue_notification(

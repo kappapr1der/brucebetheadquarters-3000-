@@ -1710,7 +1710,11 @@ def sync_variables_worker(settings: BotSettings) -> tuple[VariableSyncResult, in
             weather_days=settings.weather_days_ahead,
             timezone_name=settings.timezone,
         )
-        return result, capture_model_forecasts(conn)
+        return result, capture_model_forecasts(
+            conn,
+            lock_minutes=settings.lock_minutes,
+            capture_lead_minutes=settings.final_pick_lead_minutes,
+        )
     finally:
         conn.close()
 
@@ -2905,7 +2909,11 @@ def capture_due_model_forecasts_worker(settings: BotSettings) -> int:
             season_display_name=settings.season_display,
             lock_minutes=settings.lock_minutes,
         )
-        return capture_model_forecasts(conn, lock_minutes=settings.lock_minutes)
+        return capture_model_forecasts(
+            conn,
+            lock_minutes=settings.lock_minutes,
+            capture_lead_minutes=settings.final_pick_lead_minutes,
+        )
     finally:
         conn.close()
 

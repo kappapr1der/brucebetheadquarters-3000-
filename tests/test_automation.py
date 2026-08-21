@@ -7,6 +7,7 @@ from brucebet.rehearsal import run_rehearsal
 from brucebet.reminders import due_reminders, mark_delivery_sent, subscribe_chat
 from brucebet.storage import (
     connect,
+    mark_premature_model_forecasts,
     manual_result_history,
     manual_prediction_history,
     reset_db,
@@ -154,6 +155,44 @@ class AutomationTest(unittest.TestCase):
             1,
         )
         self.assertEqual(capture_model_forecasts(conn, now=datetime.fromisoformat("2026-08-22T18:01:00+03:00")), 0)
+
+    def test_zero_lock_uses_final_pick_lead_for_model_snapshot(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2026-08-15T18:00:00+03:00", None)
+        upsert_match_assessment(
+            conn,
+            {
+                "round": "1",
+                "position": "1",
+                "suggested_score": "2:1",
+                "risk_level": "medium",
+                "confidence": "0.60",
+                "updated_at": "2026-08-15T10:00:00+03:00",
+            },
+        )
+
+        self.assertEqual(
+            capture_model_forecasts(
+                conn,
+                now=datetime.fromisoformat("2026-08-15T17:49:00+03:00"),
+                lock_minutes=0,
+                capture_lead_minutes=10,
+            ),
+            0,
+        )
+        self.assertEqual(
+            capture_model_forecasts(
+                conn,
+                now=datetime.fromisoformat("2026-08-15T17:50:00+03:00"),
+                lock_minutes=0,
+                capture_lead_minutes=10,
+            ),
+            1,
+        )
+        row = conn.execute("SELECT freeze_reason, legacy_premature FROM model_forecasts").fetchone()
+        self.assertEqual((row["freeze_reason"], row["legacy_premature"]), ("pre_deadline_final", 0))
+        self.assertEqual(mark_premature_model_forecasts(conn), 0)
 
     def test_premature_legacy_model_forecast_is_archived_before_replacement(self) -> None:
         conn = connect(":memory:")

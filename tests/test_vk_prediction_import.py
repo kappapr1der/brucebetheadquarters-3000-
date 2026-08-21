@@ -186,20 +186,26 @@ class VkPredictionImportTests(unittest.TestCase):
         self.assertEqual((result.revisions_created, result.duplicates), (0, 10))
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM prediction_revisions").fetchone()[0], 10)
 
-    def test_unknown_participant_is_idempotently_quarantined_without_enrollment(self) -> None:
+    def test_valid_forecast_enrolls_unknown_participant_as_unpaid_and_is_idempotent(self) -> None:
         report = make_report(participant="Незнакомец")
 
         first = self.import_report(report)
         repeated = self.import_report(report)
 
-        self.assertEqual((first.quarantined, len(first.issues)), (1, 1))
-        self.assertEqual((repeated.quarantined, len(repeated.issues)), (0, 1))
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0], 0)
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM prediction_revisions").fetchone()[0], 0)
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM vk_prediction_quarantine").fetchone()[0], 1)
-        self.assertIsNone(
-            self.conn.execute("SELECT id FROM participants WHERE name = 'Незнакомец'").fetchone()
-        )
+        self.assertEqual((first.revisions_created, first.accepted, first.quarantined), (10, 10, 0))
+        self.assertEqual((repeated.revisions_created, repeated.duplicates, repeated.quarantined), (0, 10, 0))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0], 10)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM prediction_revisions").fetchone()[0], 10)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM vk_prediction_quarantine").fetchone()[0], 0)
+        participant = self.conn.execute(
+            """
+            SELECT p.name, p.paid, sp.paid AS season_paid, sp.active
+            FROM participants p
+            JOIN season_participants sp ON sp.participant_id = p.id
+            WHERE p.name = 'Незнакомец'
+            """
+        ).fetchone()
+        self.assertEqual(tuple(participant), ("Незнакомец", 0, 0, 1))
 
     def test_first_forecast_enqueues_one_grouped_notification_and_replay_is_silent(self) -> None:
         ensure_participant(self.conn, "Сергей", paid=1)
@@ -300,20 +306,20 @@ class VkPredictionImportTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(score, "1:1")
 
-    def test_quarantine_is_visible_and_unknown_participant_is_not_created(self) -> None:
+    def test_auto_enrollment_uses_a_normal_forecast_notification(self) -> None:
         report = make_report(participant="Незнакомец")
 
         first = self.import_report(report, notification_chat_ids=(42,))
         repeated = self.import_report(report, notification_chat_ids=(42,))
 
-        self.assertEqual((first.quarantined, first.notification_events_created), (1, 1))
-        self.assertEqual((repeated.quarantined, repeated.notification_events_created), (0, 0))
+        self.assertEqual((first.accepted, first.quarantined, first.notification_events_created), (10, 0, 1))
+        self.assertEqual((repeated.duplicates, repeated.notification_events_created), (10, 0))
         event = self.notification_rows()[0]
-        self.assertEqual(event["kind"], "quarantine")
+        self.assertEqual(event["kind"], "new")
         rendered = render_vk_prediction_notification(pending_vk_prediction_notification_deliveries(self.conn, (42,))[0])
-        self.assertIn("⚠️ Прогноз отправлен на проверку", rendered)
-        self.assertIn("Участник: Незнакомец", rendered)
-        self.assertIsNone(self.conn.execute("SELECT 1 FROM participants WHERE name = 'Незнакомец'").fetchone())
+        self.assertIn("🎯 Новый прогноз — Тур 1", rendered)
+        self.assertIn("Незнакомец", rendered)
+        self.assertIsNotNone(self.conn.execute("SELECT 1 FROM participants WHERE name = 'Незнакомец'").fetchone())
 
     def test_fixture_mismatch_quarantines_the_whole_submission(self) -> None:
         ensure_participant(self.conn, "Сергей", paid=1)

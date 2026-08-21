@@ -1165,8 +1165,13 @@ def capture_model_forecasts(
     now: datetime | None = None,
     model_key: str = "brucebet",
     lock_minutes: int = 90,
+    capture_lead_minutes: int = 0,
 ) -> int:
-    """Freeze one complete round only after its contest deadline has passed."""
+    """Freeze one complete round in its permitted final pre-kickoff window.
+
+    A zero-minute contest lock closes at kickoff, so an independently audited
+    final-pick lead keeps the model snapshot observable before play begins.
+    """
 
     now = now or datetime.now().astimezone()
     if now.tzinfo is None or now.utcoffset() is None:
@@ -1208,8 +1213,10 @@ def capture_model_forecasts(
             continue
         first_kickoff_utc = first_kickoff.astimezone(timezone.utc)
         deadline_at = first_kickoff_utc - timedelta(minutes=lock_minutes)
-        if now_utc < deadline_at or now_utc >= first_kickoff_utc:
+        capture_at = deadline_at - timedelta(minutes=max(0, capture_lead_minutes))
+        if now_utc < capture_at or now_utc >= first_kickoff_utc:
             continue
+        freeze_reason = "pre_deadline_final" if capture_lead_minutes > 0 else "round_deadline"
 
         matches = conn.execute(
             """
@@ -1276,7 +1283,7 @@ def capture_model_forecasts(
                     """
                     UPDATE model_forecasts
                     SET suggested_score = ?, confidence = ?, risk_level = ?, captured_at = ?,
-                        assessment_updated_at = ?, deadline_at = ?, freeze_reason = 'round_deadline',
+                        assessment_updated_at = ?, deadline_at = ?, freeze_reason = ?,
                         legacy_premature = 0
                     WHERE id = ?
                     """,
@@ -1287,6 +1294,7 @@ def capture_model_forecasts(
                         now_utc.isoformat(),
                         row["updated_at"],
                         deadline_at.isoformat(),
+                        freeze_reason,
                         int(existing["id"]),
                     ),
                 )
@@ -1297,7 +1305,7 @@ def capture_model_forecasts(
                         match_id, model_key, suggested_score, confidence, risk_level,
                         captured_at, assessment_updated_at, deadline_at, freeze_reason, legacy_premature
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'round_deadline', 0)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                     """,
                     (
                         match_id,
@@ -1308,6 +1316,7 @@ def capture_model_forecasts(
                         now_utc.isoformat(),
                         row["updated_at"],
                         deadline_at.isoformat(),
+                        freeze_reason,
                     ),
                 )
             captured += 1
