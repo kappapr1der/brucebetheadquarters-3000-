@@ -11,6 +11,7 @@ from typing import Iterable, Mapping
 from .analytics import intelligence_readiness, match_rows_for_round, round_deadlines, strategy_summary
 from .scoring import normalize_score, parse_datetime, parse_score
 from .storage import active_season_id
+from .team_display import russian_match_label
 
 
 ALGORITHM_VERSION = "contest-v1"
@@ -845,7 +846,10 @@ def render_contest_recommendations(batch: ContestRecommendationBatch, *, final: 
         if item.risk_level:
             marker_parts.append(f"риск {item.risk_level}")
         marker = f" ({', '.join(marker_parts)})" if marker_parts else ""
-        lines.append(f"{item.position}. {item.home} — {item.away} — {item.recommended_score or 'нет оценки'}{marker}")
+        lines.append(
+            f"{item.position}. {russian_match_label(item.home, item.away, separator=' — ')} "
+            f"— {item.recommended_score or 'нет оценки'}{marker}"
+        )
     lines.extend(
         [
             _field_line(batch),
@@ -862,7 +866,10 @@ def render_contest_recommendation_update(batch: ContestRecommendationBatch) -> s
     lines = [f"🧠 Brucebet пересчитал Тур {batch.round_name}"]
     for previous, current in batch.changed:
         old = previous.recommended_score if previous else "новый"
-        lines.append(f"{current.home} — {current.away}: {old} → {current.recommended_score or 'нет оценки'}")
+        lines.append(
+            f"{russian_match_label(current.home, current.away, separator=' — ')}: "
+            f"{old} → {current.recommended_score or 'нет оценки'}"
+        )
     lines.extend(
         [
             _field_line(batch),
@@ -872,6 +879,15 @@ def render_contest_recommendation_update(batch: ContestRecommendationBatch) -> s
         ]
     )
     return "\n".join(lines)[:MAX_TELEGRAM_TEXT]
+
+
+def render_contest_prediction_template(batch: ContestRecommendationBatch) -> str:
+    """Render a copy-ready VK block without headings or analytics metadata."""
+
+    return "\n".join(
+        f"{russian_match_label(item.home, item.away)} {item.recommended_score}".rstrip()
+        for item in batch.recommendations
+    )[:MAX_TELEGRAM_TEXT]
 
 
 def due_final_contest_rounds(

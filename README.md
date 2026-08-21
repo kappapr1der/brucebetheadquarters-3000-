@@ -156,6 +156,7 @@ THESPORTSDB_KEY=123
 - `/field <матч>`
 - `/recommend <матч>`
 - `/picks [тур]`
+- `/template [тур]` - чистый русскоязычный блок для вставки в VK
 - `/edge [тур]`
 - `/odds <матч>`
 - `/quota`
@@ -333,7 +334,7 @@ When the explicit import gate is enabled, every new meaningful VK forecast event
 
 ## Contest Pick Ledger
 
-`match_assessments` remains an independent football assessment. It never reads participant forecasts and remains suitable for post-season calibration. Bruce's actual contest recommendation is a separate append-only `contest_recommendations` ledger, exposed through `/picks [тур]`; it never inserts or changes Bruce's row in `predictions`.
+`match_assessments` remains an independent football assessment. It never reads participant forecasts and remains suitable for post-season calibration. Bruce's actual contest recommendation is a separate append-only `contest_recommendations` ledger, exposed through `/picks [тур]`; it never inserts or changes Bruce's row in `predictions`. `/template [тур]` renders the same ledger as a Russian copy-ready VK block, while fixture identities remain canonical English names internally.
 
 For each match the deterministic synthesis combines available sources at 55% independent model, 25% market implied probability, and 20% eligible competitor field, normalized when a source is absent. Bruce is excluded from the field. The current standings strategy only applies a bounded adjustment, while the exact score normally stays with the assessment unless a strong field consensus or high volatility triggers the documented fallback. Every input fingerprint, source snapshot, strategy, readiness warning and predecessor record is retained.
 

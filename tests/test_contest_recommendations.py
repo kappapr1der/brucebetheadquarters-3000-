@@ -11,6 +11,7 @@ from brucebet.contest_recommendations import (
     mark_contest_recommendation_delivery_sent,
     pending_contest_recommendation_deliveries,
     recompute_contest_recommendations,
+    render_contest_prediction_template,
     render_contest_recommendation_update,
     render_contest_recommendations,
 )
@@ -266,6 +267,21 @@ class ContestRecommendationTests(unittest.TestCase):
         self.recompute(enqueue_update=True, notification_chat_ids=(42,))
 
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM contest_recommendation_notifications").fetchone()[0], 1)
+
+    def test_21_draft_and_copy_ready_template_use_russian_team_names(self) -> None:
+        batch = self.recompute()
+
+        draft = render_contest_recommendations(batch)
+        template = render_contest_prediction_template(batch)
+
+        self.assertIn("Арсенал — Челси", draft)
+        self.assertNotIn("Arsenal", draft)
+        self.assertIn("Брайтон — Ньюкасл", draft)
+        self.assertIn("Тоттенхэм — Манчестер Юнайтед", draft)
+        self.assertTrue(template.splitlines()[0].startswith("Арсенал - Челси "))
+        self.assertNotIn("Arsenal", template)
+        self.assertIn("Брайтон - Ньюкасл", template)
+        self.assertIn("Тоттенхэм - Манчестер Юнайтед", template)
 
 
 if __name__ == "__main__":

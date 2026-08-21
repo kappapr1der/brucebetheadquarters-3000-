@@ -131,6 +131,7 @@ from .contest_recommendations import (
     mark_contest_recommendation_delivery_sent,
     pending_contest_recommendation_deliveries,
     recompute_contest_recommendations,
+    render_contest_prediction_template,
     render_contest_recommendations,
 )
 from .vk_snapshot_archive import VkSnapshotArchiveResult, archive_public_topic_capture
@@ -951,6 +952,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/field <матч> - поле прогнозов",
                 "/recommend <матч> - рекомендация по матчу",
                 "/picks [тур] - конкурсный прогноз Brucebet: модель, поле, рынок и риск",
+                "/template [тур] - чистый русскоязычный шаблон прогноза для VK",
                 "/odds <матч> - последние сохранённые кэфы",
                 "/quota - остаток кредитов The Odds API",
                 "/sources - проверить все источники данных",
@@ -1406,6 +1408,25 @@ async def picks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await send_text(update, f"Не могу собрать конкурсный прогноз: {exc}")
         return
     await send_text(update, render_contest_recommendations(batch, final=batch.frozen_final))
+
+
+@require_access
+async def template_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send only the copy-ready prediction lines required by the VK contest."""
+
+    settings = settings_from_context(context)
+    conn = conn_from_context(context)
+    try:
+        batch = recompute_contest_recommendations(
+            conn,
+            round_name=query_text(context) or None,
+            user_participant=settings.user_participant,
+            lock_minutes=settings.lock_minutes,
+        )
+    except ValueError as exc:
+        await send_text(update, f"Не могу собрать шаблон прогноза: {exc}")
+        return
+    await send_text(update, render_contest_prediction_template(batch))
 
 
 @require_access
@@ -3124,6 +3145,7 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("field", field_cmd))
     application.add_handler(CommandHandler("recommend", recommend_cmd))
     application.add_handler(CommandHandler("picks", picks_cmd))
+    application.add_handler(CommandHandler("template", template_cmd))
     application.add_handler(CommandHandler("odds", odds_cmd))
     application.add_handler(CommandHandler("quota", quota_cmd))
     application.add_handler(CommandHandler("sources", sources_cmd))
