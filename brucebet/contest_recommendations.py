@@ -820,10 +820,14 @@ def _participant_word(count: int) -> str:
     return "участников"
 
 
+def _participant_verb(count: int) -> str:
+    return "не прислал" if count % 10 == 1 and count % 100 != 11 else "не прислали"
+
+
 def _field_line(batch: ContestRecommendationBatch) -> str:
     missing = max(0, batch.field_expected_count - batch.field_complete_count)
     if missing:
-        suffix = f"; {missing} {_participant_word(missing)} ещё не прислал"
+        suffix = f"; {missing} {_participant_word(missing)} ещё {_participant_verb(missing)}"
     else:
         suffix = ""
     return f"Поле: {batch.field_complete_count}/{batch.field_expected_count} прогнозов{suffix}."

@@ -288,7 +288,7 @@ class ContestRecommendationTests(unittest.TestCase):
         five_missing = render_contest_recommendations(
             replace(batch, field_complete_count=8, field_expected_count=13)
         )
-        self.assertIn("5 участников ещё не прислал", five_missing)
+        self.assertIn("5 участников ещё не прислали", five_missing)
 
 
 if __name__ == "__main__":
