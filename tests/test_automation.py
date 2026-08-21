@@ -6,7 +6,10 @@ from brucebet.pl_fixtures import import_pl_fixtures, import_pl_results
 from brucebet.rehearsal import run_rehearsal
 from brucebet.reminders import due_reminders, mark_delivery_sent, subscribe_chat
 from brucebet.storage import (
+    activate_profile,
+    active_season,
     connect,
+    init_db,
     mark_premature_model_forecasts,
     manual_result_history,
     manual_prediction_history,
@@ -31,6 +34,21 @@ def completed_fixture(home: str, away: str, home_score: int, away_score: int) ->
 
 
 class AutomationTest(unittest.TestCase):
+    def test_init_db_does_not_reset_the_active_profile_deadline(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        activate_profile(
+            conn,
+            competition_code="epl",
+            season_name="2026/27",
+            season_display_name="EPL 2026/27",
+            lock_minutes=0,
+        )
+
+        init_db(conn)
+
+        self.assertEqual(active_season(conn)["deadline_lock_minutes"], 0)
+
     def test_fixture_import_does_not_score_an_in_progress_match(self) -> None:
         conn = connect(":memory:")
         reset_db(conn)

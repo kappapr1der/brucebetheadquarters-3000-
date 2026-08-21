@@ -613,7 +613,12 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     migrate_db(conn)
-    activate_profile(conn)
+    # Runtime workers call this before reading the database. Bootstrap the
+    # default only once; reactivating it here would overwrite the configured
+    # season's deadline and payment settings on every read-only operation.
+    has_active_profile = conn.execute("SELECT 1 FROM seasons WHERE active = 1 LIMIT 1").fetchone()
+    if has_active_profile is None:
+        activate_profile(conn)
     mark_premature_model_forecasts(conn)
     _purge_vk_ui_noise_entries(conn)
     _dedupe_vk_registration_entries(conn)
