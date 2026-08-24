@@ -74,6 +74,20 @@ class AutomationTest(unittest.TestCase):
         self.assertEqual(result.updated, 1)
         self.assertEqual(stored["result"], "0:1")
 
+    def test_result_sync_accepts_team_embedded_scores_when_top_level_score_is_absent(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2026-08-15T18:00:00+03:00", None)
+        fixture = completed_fixture("Arsenal", "Chelsea", 3, 0)
+        fixture["score"] = None
+        fixture["teams"][0]["score"] = 3
+        fixture["teams"][1]["score"] = 0
+
+        result = import_pl_results(conn, [fixture])
+
+        self.assertEqual(result.updated, 1)
+        self.assertEqual(conn.execute("SELECT result FROM matches").fetchone()["result"], "3:0")
+
     def test_deadline_deliveries_are_persisted_and_not_duplicated(self) -> None:
         conn = connect(":memory:")
         reset_db(conn)
