@@ -128,6 +128,12 @@ timestamps are quarantined and late edits are rejected without changing the curr
 Include `prediction_revisions.csv` in every operational snapshot and retain the SQLite backup for
 full restore.
 
+Keep `VK_PREDICTIONS_IMPORT_ENABLED=0` through migration rehearsal and the first post-deploy
+snapshot checks. Enable it only after `VK_PREDICTIONS_TOPIC_ID` passes the EPL gate, every VK
+template maps one-to-one to stable PL fixtures, and the participant roster has been reconciled.
+The reader never writes to VK. Local SQLite imports are idempotent; unsafe blocks are retained in
+`vk_prediction_quarantine` and exported with operational snapshots.
+
 ## Updating data
 
 Send the VK pasted text as a message or `.txt` file. The bot will parse it, update `data/vk_matches.csv`, `data/vk_predictions.csv`, and import into SQLite.

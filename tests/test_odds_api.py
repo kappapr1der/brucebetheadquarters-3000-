@@ -95,12 +95,14 @@ class OddsApiTest(unittest.TestCase):
 
     def test_sync_odds_to_db_matches_aliases_and_imports_snapshot(self) -> None:
         conn = load_match_sample()
+        requested: dict[str, object] = {}
 
         class FakeClient:
             def __init__(self, api_key):
                 self.api_key = api_key
 
             def odds(self, **kwargs):
+                requested.update(kwargs)
                 return (
                     [
                         OddsEvent(
@@ -122,6 +124,8 @@ class OddsApiTest(unittest.TestCase):
         self.assertEqual(result.events_seen, 1)
         self.assertEqual(result.matched, 1)
         self.assertEqual(result.inserted, 1)
+        self.assertRegex(str(requested["commence_time_from"]), r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertRegex(str(requested["commence_time_to"]), r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
         row = conn.execute(
             """
             SELECT mo.*, m.home, m.away

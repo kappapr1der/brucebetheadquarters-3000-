@@ -35,6 +35,7 @@ VK_REGISTRATION_SYNC_INTERVAL_MINUTES=5
 VK_REGISTRATION_SYNC_FIRST_DELAY_SECONDS=20
 VK_REGISTRATION_BROWSER_WAIT_MS=12000
 VK_PREDICTIONS_SNAPSHOT_ENABLED=0
+VK_PREDICTIONS_IMPORT_ENABLED=0
 VK_PREDICTIONS_SNAPSHOT_INTERVAL_MINUTES=20
 VK_PUBLIC_SNAPSHOT_DIR=data/vk_snapshots
 VK_TOPIC_DISCOVERY_ENABLED=1
@@ -122,7 +123,7 @@ The dry-run shows `league gate: epl`, `non_epl`, or `unknown`. Non-EPL topics, i
 - Public read-only browser rendering only at this stage.
 - No form submissions, likes, comments or other VK writes.
 - Registration entries are written only when the configured topic passes the EPL gate.
-- No predictions are written to SQLite yet.
+- Predictions remain read-only until `VK_PREDICTIONS_IMPORT_ENABLED=1` is explicitly set for the configured EPL topic. When enabled, new valid submissions, edits, rejected late edits, and quarantines enter a durable Telegram outbox; delivery is retried per Telegram whitelist chat without reimporting forecasts. Only accepted projections then refresh the separate Bruce contest-pick ledger for the affected round. Duplicates, rejected late edits and quarantines never update the field or trigger a contest-pick notification.
 - No RPL/other-league data is added to the EPL season.
 - The future EPL topic will be configured through `VK_PREDICTIONS_TOPIC_ID` or supplied by URL.
 
@@ -138,6 +139,7 @@ After the EPL topic appears:
 
 1. Point `VK_PREDICTIONS_TOPIC_ID` at that EPL topic.
 2. Keep the registration and prediction topic monitors separate. The registration monitor polls the configured discussion every five minutes by default and emits one notice per new/changed applicant.
-3. Set `VK_PREDICTIONS_SNAPSHOT_ENABLED=1` to archive changed prediction fields every 20 minutes by default, then use `/vk_snapshot` immediately before `/recommend` to capture the final field snapshot.
+3. Set `VK_PREDICTIONS_SNAPSHOT_ENABLED=1` to archive changed prediction fields every 20 minutes by default. `/picks [тур]` renders the separate auditable Bruce contest recommendation; it does not add a prediction for Bruce.
+4. The final pick dispatcher checks once per minute and freezes a pre-deadline snapshot 10 minutes before the effective deadline by default (`BRUCEBET_FINAL_PICK_LEAD_MINUTES`). If field completeness or intelligence is missing, it is marked provisional instead of final.
 4. Extract durable VK comment IDs from the rendered DOM, then add idempotent persistence and edit detection.
 5. Only after validation, enable scheduled sync into the active EPL season.

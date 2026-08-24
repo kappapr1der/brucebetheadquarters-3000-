@@ -12,7 +12,7 @@
 - season: `2026/27`
 - display: `EPL 2026/27`
 - пользователь: `Bruce Wayne`
-- дедлайн: за 90 минут до первого матча тура
+- дедлайн: в старт первого матча тура
 - очки: точный счет 3, разница 2, исход 1
 
 Профиль лежит в `configs/epl_2026_27.json`, будущие сезоны можно делать копией `configs/epl_template.json`.
@@ -112,15 +112,18 @@ BRUCEBET_USER_PARTICIPANT="Bruce Wayne"
 BRUCEBET_COMPETITION=epl
 BRUCEBET_SEASON=2026/27
 BRUCEBET_SEASON_DISPLAY="EPL 2026/27"
-BRUCEBET_LOCK_MINUTES=90
+# EPL Forecasters Club: submissions close at the first match's kickoff.
+BRUCEBET_LOCK_MINUTES=0
 BRUCEBET_TIMEZONE=Europe/Moscow
 PREMIER_LEAGUE_COMPSEASON_ID=841
 PREMIER_LEAGUE_SEASON_LABEL=2026/2027
 BRUCEBET_AUTO_SYNC=1
 BRUCEBET_AUTO_SYNC_INTERVAL_HOURS=12
 BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES=5
+BRUCEBET_RESULT_SYNC_INTERVAL_MINUTES=15
 BRUCEBET_REMINDER_INTERVAL_MINUTES=5
 BRUCEBET_REMINDER_GRACE_MINUTES=35
+BRUCEBET_FINAL_PICK_LEAD_MINUTES=10
 BRUCEBET_VARIABLE_DAYS_AHEAD=365
 BRUCEBET_WEATHER_DAYS_AHEAD=16
 BRUCEBET_SNAPSHOT_LABEL=server-auto
@@ -153,6 +156,8 @@ THESPORTSDB_KEY=123
 - `/table`
 - `/field <матч>`
 - `/recommend <матч>`
+- `/picks [тур]`
+- `/template [тур]` - чистый русскоязычный блок для вставки в VK
 - `/edge [тур]`
 - `/odds <матч>`
 - `/quota`
@@ -258,7 +263,7 @@ python -m brucebet.cli --db brucebet.sqlite import --reset `
 - Team match factors: lineup confidence, absences impact, fatigue, baseline motivation.
 - Draft `match_assessments` based on Elo and latest stored odds when available.
 
-Telegram has `/sync_variables`, `/sync_results`, and `/dossier <match>`. The bot also runs a quiet background sync every `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS` when `BRUCEBET_AUTO_SYNC=1`, after `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES` on startup. Model drafts are frozen only once the relevant tour deadline has arrived; the deadline dispatcher checks this every `BRUCEBET_REMINDER_INTERVAL_MINUTES`. Finished official results are checked without spending Odds API credits.
+Telegram has `/sync_variables`, `/sync_results`, and `/dossier <match>`. The bot also runs a quiet background sync every `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS` when `BRUCEBET_AUTO_SYNC=1`, after `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES` on startup. A separate official-result check runs every `BRUCEBET_RESULT_SYNC_INTERVAL_MINUTES`, closes a fully finished tour, and posts one durable overall table to subscribed chats. Model drafts are frozen only once the relevant tour deadline has arrived; the deadline dispatcher checks this every `BRUCEBET_REMINDER_INTERVAL_MINUTES`. Finished official results are checked without spending Odds API credits.
 
 The background sync does not call The Odds API, so it does not spend odds credits. Use `/sync_odds` manually closer to deadline. `/schedule` subscribes the current chat to persistent reminders; the dispatcher checks due deliveries every `BRUCEBET_REMINDER_INTERVAL_MINUTES` and retries failed sends inside the configured grace window.
 
@@ -322,7 +327,19 @@ python -m brucebet.cli vk-discover
 
 Set `VK_TOPIC_DISCOVERY_ENABLED=1` to poll the public Forecasters Club discussion list. The first pass with at least one discovered topic is a quiet baseline; later newly discovered EPL registration or prediction topics produce one Telegram alert. `/vk_topics` runs the same public, read-only check manually. RPL is ignored by the alert queue and no VK discovery result imports contest data.
 
-`/vk_snapshot` reads the configured EPL registration and prediction topics, keeps a local archive of changed public fields in `data/vk_snapshots/`, and reports the recognized entry/block counts. Set `VK_PREDICTIONS_SNAPSHOT_ENABLED=1` to run the same read-only archive job every 20 minutes. No forecast from this route is written to SQLite.
+`/vk_snapshot` reads the configured EPL registration and prediction topics, keeps a local archive of changed public fields in `data/vk_snapshots/`, and reports the recognized entry/block counts. Set `VK_PREDICTIONS_SNAPSHOT_ENABLED=1` to run the same read-only archive job every 20 minutes. VK is always read-only. SQLite projection is a separate explicit gate: `VK_PREDICTIONS_IMPORT_ENABLED=1` imports only the configured EPL topic, only registered participants, and maps fixtures by stable home/away identity rather than VK list position.
+
+VK forecast imports append immutable `prediction_revisions`. Repeating the same capture is a no-op, a changed comment becomes one revision, and an edit first observed after the deadline is rejected without changing the current projection. Ambiguous comment identities, unknown participants, and incomplete fixture mappings go to `vk_prediction_quarantine` rather than being guessed.
+
+When the explicit import gate is enabled, every new meaningful VK forecast event also enters a durable SQLite outbox. Telegram delivery is tracked per whitelisted chat ID: a failed chat stays pending for the next poll, while successful chats are never sent the same event twice. The sanitized operational snapshot includes the event and delivery ledgers, but never Telegram tokens.
+
+## Contest Pick Ledger
+
+`match_assessments` remains an independent football assessment. It never reads participant forecasts and remains suitable for post-season calibration. Bruce's actual contest recommendation is a separate append-only `contest_recommendations` ledger, exposed through `/picks [тур]`; it never inserts or changes Bruce's row in `predictions`. `/template [тур]` renders the same ledger as a Russian copy-ready VK block, while fixture identities remain canonical English names internally.
+
+For each match the deterministic synthesis combines available sources at 55% independent model, 25% market implied probability, and 20% eligible competitor field, normalized when a source is absent. Bruce is excluded from the field. The current standings strategy only applies a bounded adjustment, while the exact score normally stays with the assessment unless a strong field consensus or high volatility triggers the documented fallback. Every input fingerprint, source snapshot, strategy, readiness warning and predecessor record is retained.
+
+Only accepted VK projections for a specific round trigger a field recomputation. Repeated snapshots, quarantined blocks and rejected late edits do not change the contest pick. A durable Telegram delta is queued only when a displayed score/status changes. The final dispatcher checks every minute and freezes a pre-deadline snapshot at `BRUCEBET_FINAL_PICK_LEAD_MINUTES` before the effective deadline (10 minutes by default). A snapshot with incomplete field or intelligence remains explicitly provisional rather than being labelled final.
 
 Для прогнозов выводятся шаблон, дедлайн, автор комментария, фактический участник, нормализованные счета и статус `FULL`/`PARTIAL`. Для регистрации отдельно сохраняется заявленный выбор взноса и статус проверки оплаты: перевод считается только заявленным, пока организатор его не подтвердил. Тестовая тема РПЛ допускается лишь для проверки формата: dry-run пометит её как `non_epl`, а будущий импорт останется заблокированным.
 
@@ -348,12 +365,14 @@ Every forecast ingest also appends a row to `prediction_revisions`. The current 
 is only the projection of the latest eligible revision. Replays with the same stable source item and
 content fingerprint are no-ops; invalid or timezone-naive external timestamps and late edits remain
 auditable but cannot change the current score. The calculated round deadline (first kickoff minus
-`BRUCEBET_LOCK_MINUTES`) is authoritative for edits; the stored round deadline is its fallback. A
-participant's first forecast for a later match may still use that match's own cutoff, preserving the
-existing partial-late rule.
+`BRUCEBET_LOCK_MINUTES`) is authoritative for edits; the active EPL profile uses `0`, so it closes
+at the first kickoff. The stored round deadline is its fallback. A
+participant's first forecast for a later match may still be accepted until that match kicks off;
+matches already in progress are excluded.
 
 ## World Cup Legacy
 
 Старый ЧМ-сценарий не удалён из архитектуры: VK-парсер и `configs/world_cup_2026.json` оставлены как совместимый режим. Но активная разработка теперь идёт под EPL-longterm: сезонность, профили участников, риск-карта, стратегия и пост-туровый разбор.
+
 
 

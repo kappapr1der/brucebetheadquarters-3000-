@@ -6,7 +6,11 @@ from brucebet.pl_fixtures import import_pl_fixtures, import_pl_results
 from brucebet.rehearsal import run_rehearsal
 from brucebet.reminders import due_reminders, mark_delivery_sent, subscribe_chat
 from brucebet.storage import (
+    activate_profile,
+    active_season,
     connect,
+    init_db,
+    mark_premature_model_forecasts,
     manual_result_history,
     manual_prediction_history,
     reset_db,
@@ -30,6 +34,21 @@ def completed_fixture(home: str, away: str, home_score: int, away_score: int) ->
 
 
 class AutomationTest(unittest.TestCase):
+    def test_init_db_does_not_reset_the_active_profile_deadline(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        activate_profile(
+            conn,
+            competition_code="epl",
+            season_name="2026/27",
+            season_display_name="EPL 2026/27",
+            lock_minutes=0,
+        )
+
+        init_db(conn)
+
+        self.assertEqual(active_season(conn)["deadline_lock_minutes"], 0)
+
     def test_fixture_import_does_not_score_an_in_progress_match(self) -> None:
         conn = connect(":memory:")
         reset_db(conn)
@@ -54,6 +73,20 @@ class AutomationTest(unittest.TestCase):
         self.assertEqual(result.finished_seen, 1)
         self.assertEqual(result.updated, 1)
         self.assertEqual(stored["result"], "0:1")
+
+    def test_result_sync_accepts_team_embedded_scores_when_top_level_score_is_absent(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2026-08-15T18:00:00+03:00", None)
+        fixture = completed_fixture("Arsenal", "Chelsea", 3, 0)
+        fixture["score"] = None
+        fixture["teams"][0]["score"] = 3
+        fixture["teams"][1]["score"] = 0
+
+        result = import_pl_results(conn, [fixture])
+
+        self.assertEqual(result.updated, 1)
+        self.assertEqual(conn.execute("SELECT result FROM matches").fetchone()["result"], "3:0")
 
     def test_deadline_deliveries_are_persisted_and_not_duplicated(self) -> None:
         conn = connect(":memory:")
@@ -154,6 +187,44 @@ class AutomationTest(unittest.TestCase):
             1,
         )
         self.assertEqual(capture_model_forecasts(conn, now=datetime.fromisoformat("2026-08-22T18:01:00+03:00")), 0)
+
+    def test_zero_lock_uses_final_pick_lead_for_model_snapshot(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        upsert_match(conn, "1", 1, "Arsenal", "Chelsea", "2026-08-15T18:00:00+03:00", None)
+        upsert_match_assessment(
+            conn,
+            {
+                "round": "1",
+                "position": "1",
+                "suggested_score": "2:1",
+                "risk_level": "medium",
+                "confidence": "0.60",
+                "updated_at": "2026-08-15T10:00:00+03:00",
+            },
+        )
+
+        self.assertEqual(
+            capture_model_forecasts(
+                conn,
+                now=datetime.fromisoformat("2026-08-15T17:49:00+03:00"),
+                lock_minutes=0,
+                capture_lead_minutes=10,
+            ),
+            0,
+        )
+        self.assertEqual(
+            capture_model_forecasts(
+                conn,
+                now=datetime.fromisoformat("2026-08-15T17:50:00+03:00"),
+                lock_minutes=0,
+                capture_lead_minutes=10,
+            ),
+            1,
+        )
+        row = conn.execute("SELECT freeze_reason, legacy_premature FROM model_forecasts").fetchone()
+        self.assertEqual((row["freeze_reason"], row["legacy_premature"]), ("pre_deadline_final", 0))
+        self.assertEqual(mark_premature_model_forecasts(conn), 0)
 
     def test_premature_legacy_model_forecast_is_archived_before_replacement(self) -> None:
         conn = connect(":memory:")

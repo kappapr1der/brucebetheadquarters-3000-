@@ -113,6 +113,58 @@ def active_season_snapshot_tables(season_id: int) -> Iterable[SnapshotTable]:
         (season_id,),
     )
     yield SnapshotTable(
+        "fixture_identity_events.csv",
+        """
+        SELECT
+            event.id,
+            event.event_type,
+            event.source,
+            event.source_fixture_id,
+            r.name AS round,
+            m.position,
+            m.home AS current_home,
+            m.away AS current_away,
+            event.old_home,
+            event.old_away,
+            event.new_home,
+            event.new_away,
+            event.old_round_id,
+            event.new_round_id,
+            event.old_position,
+            event.new_position,
+            event.created_at,
+            event.details
+        FROM fixture_identity_events event
+        JOIN matches m ON m.id = event.match_id
+        JOIN rounds r ON r.id = m.round_id
+        WHERE r.season_id = ?
+        ORDER BY event.id
+        """,
+        (season_id,),
+    )
+    yield SnapshotTable(
+        "fixture_sync_runs.csv",
+        """
+        SELECT
+            id,
+            source,
+            started_at,
+            finished_at,
+            source_item_count,
+            created,
+            updated,
+            moved,
+            unmatched,
+            stale_factors_removed,
+            before_hash,
+            after_hash,
+            status,
+            notes
+        FROM fixture_sync_runs
+        ORDER BY id
+        """,
+    )
+    yield SnapshotTable(
         "predictions.csv",
         """
         SELECT
@@ -149,6 +201,7 @@ def active_season_snapshot_tables(season_id: int) -> Iterable[SnapshotTable]:
             rev.raw_score,
             rev.normalized_score,
             rev.source_submitted_at,
+            rev.eligibility_at,
             rev.observed_at,
             rev.actor,
             rev.parse_status,
@@ -165,6 +218,66 @@ def active_season_snapshot_tables(season_id: int) -> Iterable[SnapshotTable]:
         ORDER BY r.sort_order, m.position, p.name, rev.id
         """,
         (season_id,),
+    )
+    yield SnapshotTable(
+        "vk_prediction_quarantine.csv",
+        """
+        SELECT
+            id,
+            group_id,
+            topic_id,
+            source_key,
+            content_fingerprint,
+            participant_name,
+            vk_author,
+            round_name,
+            source_submitted_at,
+            observed_at,
+            reason,
+            payload_json,
+            resolved_at
+        FROM vk_prediction_quarantine
+        ORDER BY id
+        """,
+    )
+    yield SnapshotTable(
+        "vk_prediction_notifications.csv",
+        """
+        SELECT
+            event_key,
+            group_id,
+            topic_id,
+            kind,
+            source_key,
+            content_fingerprint,
+            participant_name,
+            vk_author,
+            round_name,
+            payload_json,
+            created_at
+        FROM vk_prediction_notifications
+        ORDER BY created_at, event_key
+        """,
+    )
+    yield SnapshotTable(
+        "vk_prediction_notification_deliveries.csv",
+        """
+        SELECT
+            delivery.event_key,
+            event.kind,
+            event.participant_name,
+            event.round_name,
+            delivery.chat_id,
+            delivery.status,
+            delivery.attempts,
+            delivery.created_at,
+            delivery.last_attempt_at,
+            delivery.sent_at,
+            delivery.error
+        FROM vk_prediction_notification_deliveries delivery
+        JOIN vk_prediction_notifications event ON event.event_key = delivery.event_key
+        ORDER BY event.created_at, delivery.event_key, delivery.chat_id
+        """,
     )
     yield SnapshotTable(
         "teams.csv",
@@ -372,6 +485,80 @@ def active_season_snapshot_tables(season_id: int) -> Iterable[SnapshotTable]:
         (season_id,),
     )
     yield SnapshotTable(
+        "contest_recommendations.csv",
+        """
+        SELECT
+            r.name AS round,
+            cr.position,
+            cr.home,
+            cr.away,
+            cr.recommended_score,
+            cr.recommended_outcome,
+            cr.status,
+            cr.confidence,
+            cr.risk_level,
+            cr.model_suggested_score,
+            cr.model_probabilities_json,
+            cr.model_assessment_updated_at,
+            cr.field_prediction_count,
+            cr.field_expected_count,
+            cr.field_scores_json,
+            cr.field_outcomes_json,
+            cr.field_top_outcome,
+            cr.field_top_share,
+            cr.field_top_scores_json,
+            cr.market_present,
+            cr.market_captured_at,
+            cr.market_probabilities_json,
+            cr.market_top_outcome,
+            cr.market_top_share,
+            cr.strategy_mode,
+            cr.volatility,
+            cr.readiness_status,
+            cr.readiness_warnings_json,
+            cr.input_fingerprint,
+            cr.generated_at,
+            cr.frozen_final,
+            cr.freeze_reason,
+            cr.previous_recommendation_id
+        FROM contest_recommendations cr
+        JOIN rounds r ON r.id = cr.round_id
+        WHERE cr.season_id = ?
+        ORDER BY r.sort_order, cr.position, cr.id
+        """,
+        (season_id,),
+    )
+    yield SnapshotTable(
+        "contest_recommendation_notifications.csv",
+        """
+        SELECT event_key, season_id, round_id, kind, batch_fingerprint, text, created_at
+        FROM contest_recommendation_notifications
+        WHERE season_id = ?
+        ORDER BY created_at, event_key
+        """,
+        (season_id,),
+    )
+    yield SnapshotTable(
+        "contest_recommendation_notification_deliveries.csv",
+        """
+        SELECT
+            delivery.event_key,
+            event.kind,
+            delivery.chat_id,
+            delivery.status,
+            delivery.attempts,
+            delivery.created_at,
+            delivery.last_attempt_at,
+            delivery.sent_at,
+            delivery.error
+        FROM contest_recommendation_notification_deliveries delivery
+        JOIN contest_recommendation_notifications event ON event.event_key = delivery.event_key
+        WHERE event.season_id = ?
+        ORDER BY event.created_at, delivery.event_key, delivery.chat_id
+        """,
+        (season_id,),
+    )
+    yield SnapshotTable(
         "model_forecasts.csv",
         """
         SELECT
@@ -490,5 +677,6 @@ def export_snapshot(conn: sqlite3.Connection, out_dir: str | Path, label: str | 
         season=str(season["display_name"] or season["name"]),
         tables=table_counts,
     )
+
 
 

@@ -163,10 +163,17 @@ def matchday(fixture: dict[str, object]) -> int:
 
 def result_score(fixture: dict[str, object]) -> str | None:
     score = fixture.get("score") or {}
-    if not isinstance(score, dict):
-        return None
-    home = score.get("homeScore") if score.get("homeScore") is not None else score.get("home")
-    away = score.get("awayScore") if score.get("awayScore") is not None else score.get("away")
+    home = score.get("homeScore") if isinstance(score, dict) and score.get("homeScore") is not None else (
+        score.get("home") if isinstance(score, dict) else None
+    )
+    away = score.get("awayScore") if isinstance(score, dict) and score.get("awayScore") is not None else (
+        score.get("away") if isinstance(score, dict) else None
+    )
+    if home is None or away is None:
+        teams = fixture.get("teams") or []
+        if isinstance(teams, list) and len(teams) >= 2:
+            home = teams[0].get("score") if isinstance(teams[0], dict) else None
+            away = teams[1].get("score") if isinstance(teams[1], dict) else None
     try:
         return f"{int(home)}:{int(away)}" if home is not None and away is not None else None
     except (TypeError, ValueError):

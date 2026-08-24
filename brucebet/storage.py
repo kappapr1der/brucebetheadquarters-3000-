@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS prediction_revisions (
     raw_score TEXT,
     normalized_score TEXT,
     source_submitted_at TEXT,
+    eligibility_at TEXT,
     observed_at TEXT NOT NULL,
     actor TEXT,
     parse_status TEXT NOT NULL,
@@ -378,6 +379,27 @@ CREATE TABLE IF NOT EXISTS round_reviews (
     payload_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS round_summary_notifications (
+    event_key TEXT PRIMARY KEY,
+    season_id INTEGER NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+    round_id INTEGER NOT NULL REFERENCES rounds(id) ON DELETE CASCADE,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(season_id, round_id)
+);
+
+CREATE TABLE IF NOT EXISTS round_summary_notification_deliveries (
+    event_key TEXT NOT NULL REFERENCES round_summary_notifications(event_key) ON DELETE CASCADE,
+    chat_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    last_attempt_at TEXT,
+    sent_at TEXT,
+    error TEXT,
+    PRIMARY KEY(event_key, chat_id)
+);
+
 CREATE TABLE IF NOT EXISTS model_forecasts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
@@ -466,6 +488,115 @@ CREATE TABLE IF NOT EXISTS vk_registration_entries (
     notification_error TEXT,
     PRIMARY KEY(group_id, topic_id, source_key)
 );
+
+CREATE TABLE IF NOT EXISTS vk_prediction_quarantine (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id INTEGER NOT NULL,
+    topic_id INTEGER NOT NULL,
+    source_key TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL,
+    participant_name TEXT,
+    vk_author TEXT,
+    round_name TEXT,
+    source_submitted_at TEXT,
+    observed_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    resolved_at TEXT,
+    UNIQUE(group_id, topic_id, source_key, content_fingerprint, reason)
+);
+
+CREATE TABLE IF NOT EXISTS vk_prediction_notifications (
+    event_key TEXT PRIMARY KEY,
+    group_id INTEGER NOT NULL,
+    topic_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL,
+    participant_name TEXT NOT NULL,
+    vk_author TEXT NOT NULL,
+    round_name TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vk_prediction_notification_deliveries (
+    event_key TEXT NOT NULL REFERENCES vk_prediction_notifications(event_key) ON DELETE CASCADE,
+    chat_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    last_attempt_at TEXT,
+    sent_at TEXT,
+    error TEXT,
+    PRIMARY KEY(event_key, chat_id)
+);
+
+CREATE TABLE IF NOT EXISTS contest_recommendations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    season_id INTEGER NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+    round_id INTEGER NOT NULL REFERENCES rounds(id) ON DELETE CASCADE,
+    match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+    round_name TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    home TEXT NOT NULL,
+    away TEXT NOT NULL,
+    recommended_score TEXT NOT NULL,
+    recommended_outcome TEXT NOT NULL,
+    status TEXT NOT NULL,
+    confidence REAL,
+    risk_level TEXT,
+    model_suggested_score TEXT,
+    model_probabilities_json TEXT NOT NULL,
+    model_assessment_updated_at TEXT,
+    field_prediction_count INTEGER NOT NULL,
+    field_expected_count INTEGER NOT NULL,
+    field_scores_json TEXT NOT NULL,
+    field_outcomes_json TEXT NOT NULL,
+    field_top_outcome TEXT,
+    field_top_share REAL,
+    field_top_scores_json TEXT NOT NULL,
+    market_present INTEGER NOT NULL DEFAULT 0,
+    market_captured_at TEXT,
+    market_probabilities_json TEXT NOT NULL,
+    market_top_outcome TEXT,
+    market_top_share REAL,
+    strategy_mode TEXT NOT NULL,
+    volatility REAL,
+    readiness_status TEXT NOT NULL,
+    readiness_warnings_json TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    frozen_final INTEGER NOT NULL DEFAULT 0,
+    freeze_reason TEXT NOT NULL,
+    previous_recommendation_id INTEGER REFERENCES contest_recommendations(id),
+    UNIQUE(match_id, input_fingerprint, frozen_final)
+);
+
+CREATE INDEX IF NOT EXISTS contest_recommendations_round_latest_idx
+ON contest_recommendations(round_id, match_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS contest_recommendation_notifications (
+    event_key TEXT PRIMARY KEY,
+    season_id INTEGER NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+    round_id INTEGER NOT NULL REFERENCES rounds(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    batch_fingerprint TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS contest_recommendation_notification_deliveries (
+    event_key TEXT NOT NULL REFERENCES contest_recommendation_notifications(event_key) ON DELETE CASCADE,
+    chat_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    last_attempt_at TEXT,
+    sent_at TEXT,
+    error TEXT,
+    PRIMARY KEY(event_key, chat_id)
+);
 """
 
 
@@ -503,7 +634,12 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     migrate_db(conn)
-    activate_profile(conn)
+    # Runtime workers call this before reading the database. Bootstrap the
+    # default only once; reactivating it here would overwrite the configured
+    # season's deadline and payment settings on every read-only operation.
+    has_active_profile = conn.execute("SELECT 1 FROM seasons WHERE active = 1 LIMIT 1").fetchone()
+    if has_active_profile is None:
+        activate_profile(conn)
     mark_premature_model_forecasts(conn)
     _purge_vk_ui_noise_entries(conn)
     _dedupe_vk_registration_entries(conn)
@@ -520,8 +656,16 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS vk_topic_alerts;
         DROP TABLE IF EXISTS vk_topic_discovery_state;
         DROP TABLE IF EXISTS vk_registration_entries;
+        DROP TABLE IF EXISTS contest_recommendation_notification_deliveries;
+        DROP TABLE IF EXISTS contest_recommendation_notifications;
+        DROP TABLE IF EXISTS contest_recommendations;
+        DROP TABLE IF EXISTS vk_prediction_notification_deliveries;
+        DROP TABLE IF EXISTS vk_prediction_notifications;
+        DROP TABLE IF EXISTS vk_prediction_quarantine;
         DROP TABLE IF EXISTS model_forecast_legacy_audit;
         DROP TABLE IF EXISTS model_forecasts;
+        DROP TABLE IF EXISTS round_summary_notification_deliveries;
+        DROP TABLE IF EXISTS round_summary_notifications;
         DROP TABLE IF EXISTS round_reviews;
         DROP TABLE IF EXISTS fixture_identity_events;
         DROP TABLE IF EXISTS fixture_sync_runs;
@@ -670,11 +814,11 @@ def backfill_prediction_revisions(conn: sqlite3.Connection) -> int:
             INSERT OR IGNORE INTO prediction_revisions(
                 participant_id, match_id, prediction_id, source_kind,
                 stable_source_item_id, content_fingerprint, raw_score,
-                normalized_score, source_submitted_at, observed_at, actor,
+                normalized_score, source_submitted_at, eligibility_at, observed_at, actor,
                 parse_status, deadline_at, eligibility_decision, reason,
                 previous_revision_id, projected
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'valid', NULL,
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'valid', NULL,
                    'accepted', 'legacy_current_projection', NULL, 1)
             """,
             (
@@ -686,6 +830,7 @@ def backfill_prediction_revisions(conn: sqlite3.Connection) -> int:
                 fingerprint,
                 raw_score,
                 raw_score,
+                submitted_at,
                 submitted_at,
                 now,
             ),
@@ -715,6 +860,13 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     if "source_fixture_id" not in match_columns:
         conn.execute("ALTER TABLE matches ADD COLUMN source_fixture_id TEXT")
 
+    revision_columns = table_columns(conn, "prediction_revisions")
+    if "eligibility_at" not in revision_columns:
+        conn.execute("ALTER TABLE prediction_revisions ADD COLUMN eligibility_at TEXT")
+        conn.execute(
+            "UPDATE prediction_revisions SET eligibility_at = source_submitted_at WHERE eligibility_at IS NULL"
+        )
+
     conn.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS matches_source_fixture_unique
@@ -731,13 +883,14 @@ def _utc_comparable(value: datetime | None) -> datetime | None:
 
 
 def mark_premature_model_forecasts(conn: sqlite3.Connection) -> int:
-    """Quarantine pre-deadline legacy freezes without deleting their evidence."""
+    """Quarantine unaudited pre-deadline legacy freezes without deleting evidence."""
 
     rows = conn.execute(
         """
         SELECT
             f.id,
             f.captured_at,
+            f.freeze_reason,
             (
                 SELECT MIN(m2.kickoff_at)
                 FROM matches m2
@@ -756,6 +909,8 @@ def mark_premature_model_forecasts(conn: sqlite3.Connection) -> int:
         captured_at = _utc_comparable(parse_datetime(row["captured_at"]))
         first_kickoff_at = _utc_comparable(parse_datetime(row["first_kickoff_at"]))
         if captured_at is None or first_kickoff_at is None:
+            continue
+        if row["freeze_reason"] == "pre_deadline_final":
             continue
         deadline_at = first_kickoff_at - timedelta(minutes=int(active_season(conn)["deadline_lock_minutes"]))
         if captured_at >= deadline_at:
@@ -1299,6 +1454,89 @@ def ensure_participant(conn: sqlite3.Connection, name: str, paid: int | None = 1
     return participant_id
 
 
+def merge_participants(conn: sqlite3.Connection, canonical_name: str, duplicate_name: str) -> int:
+    """Merge a known duplicate into its canonical contestant without dropping audit history."""
+
+    canonical = canonical_name.strip()
+    duplicate = duplicate_name.strip()
+    if not canonical or not duplicate:
+        raise ValueError("Participant names must not be empty")
+    if canonical.casefold() == duplicate.casefold():
+        row = conn.execute("SELECT id FROM participants WHERE name = ?", (canonical,)).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown participant: {canonical}")
+        return int(row["id"])
+
+    target = conn.execute("SELECT id, paid FROM participants WHERE name = ?", (canonical,)).fetchone()
+    source = conn.execute("SELECT id, paid FROM participants WHERE name = ?", (duplicate,)).fetchone()
+    if target is None or source is None:
+        missing = canonical if target is None else duplicate
+        raise ValueError(f"Unknown participant: {missing}")
+    target_id = int(target["id"])
+    source_id = int(source["id"])
+
+    conflict = conn.execute(
+        """
+        SELECT 1
+        FROM predictions source_prediction
+        JOIN predictions target_prediction ON target_prediction.match_id = source_prediction.match_id
+        WHERE source_prediction.participant_id = ? AND target_prediction.participant_id = ?
+        LIMIT 1
+        """,
+        (source_id, target_id),
+    ).fetchone()
+    if conflict is not None:
+        raise ValueError(f"Cannot merge {duplicate}: both records have a prediction for the same match")
+
+    source_seasons = conn.execute(
+        "SELECT season_id, paid, active, alias, notes FROM season_participants WHERE participant_id = ?",
+        (source_id,),
+    ).fetchall()
+    for source_season in source_seasons:
+        season_id = int(source_season["season_id"])
+        target_season = conn.execute(
+            "SELECT paid, active, alias, notes FROM season_participants WHERE season_id = ? AND participant_id = ?",
+            (season_id, target_id),
+        ).fetchone()
+        if target_season is None:
+            conn.execute(
+                "UPDATE season_participants SET participant_id = ? WHERE season_id = ? AND participant_id = ?",
+                (target_id, season_id, source_id),
+            )
+            continue
+        alias = target_season["alias"] or source_season["alias"] or duplicate
+        notes = target_season["notes"] or source_season["notes"]
+        conn.execute(
+            """
+            UPDATE season_participants
+            SET paid = ?, active = ?, alias = ?, notes = ?
+            WHERE season_id = ? AND participant_id = ?
+            """,
+            (
+                max(int(target_season["paid"]), int(source_season["paid"])),
+                max(int(target_season["active"]), int(source_season["active"])),
+                alias,
+                notes,
+                season_id,
+                target_id,
+            ),
+        )
+        conn.execute(
+            "DELETE FROM season_participants WHERE season_id = ? AND participant_id = ?",
+            (season_id, source_id),
+        )
+
+    conn.execute("UPDATE predictions SET participant_id = ? WHERE participant_id = ?", (target_id, source_id))
+    conn.execute("UPDATE prediction_revisions SET participant_id = ? WHERE participant_id = ?", (target_id, source_id))
+    conn.execute("UPDATE vk_registration_entries SET participant_id = ? WHERE participant_id = ?", (target_id, source_id))
+    conn.execute(
+        "UPDATE participants SET paid = ? WHERE id = ?",
+        (max(int(target["paid"]), int(source["paid"])), target_id),
+    )
+    conn.execute("DELETE FROM participants WHERE id = ?", (source_id,))
+    return target_id
+
+
 def ensure_team(conn: sqlite3.Connection, name: str, **fields: object) -> int:
     name = name.strip()
     if not fields:
@@ -1717,11 +1955,11 @@ def set_manual_prediction_override(
         INSERT INTO prediction_revisions(
             participant_id, match_id, prediction_id, source_kind,
             stable_source_item_id, content_fingerprint, raw_score,
-            normalized_score, source_submitted_at, observed_at, actor,
+            normalized_score, source_submitted_at, eligibility_at, observed_at, actor,
             parse_status, deadline_at, eligibility_decision, reason,
             previous_revision_id, projected
         )
-        VALUES(?, ?, ?, 'manual-override', ?, ?, ?, ?, ?, ?, ?,
+        VALUES(?, ?, ?, 'manual-override', ?, ?, ?, ?, ?, ?, ?, ?,
                'valid', NULL, 'manual_override', ?, ?, 1)
         """,
         (
@@ -1732,6 +1970,7 @@ def set_manual_prediction_override(
             fingerprint,
             normalized,
             normalized,
+            preserved_submission,
             preserved_submission,
             timestamp,
             str(actor_chat_id) if actor_chat_id is not None else "system",
@@ -1777,6 +2016,7 @@ def prediction_revision_history(conn: sqlite3.Connection, participant: str, matc
                 rev.raw_score,
                 rev.normalized_score,
                 rev.source_submitted_at,
+                rev.eligibility_at,
                 rev.observed_at,
                 rev.actor,
                 rev.parse_status,
@@ -1828,6 +2068,7 @@ def ingest_prediction_revision(
     *,
     stable_source_item_id: str | None = None,
     observed_at: datetime | str | None = None,
+    eligibility_at: datetime | str | None = None,
     actor: str | None = None,
     lock_minutes: int = 90,
 ) -> PredictionIngestResult:
@@ -1835,9 +2076,11 @@ def ingest_prediction_revision(
 
     The round deadline (first kickoff minus ``lock_minutes``, with the stored
     round deadline as fallback) is authoritative for edits. A first forecast
-    submitted after it may still use the individual match cutoff, preserving
-    the contest's existing partial-late rule without allowing a late edit to
-    overwrite an earlier score.
+    submitted after it remains eligible for each match that has not kicked off,
+    without allowing a late edit to overwrite an earlier score.
+    ``eligibility_at`` may be later than the source timestamp when an external
+    system exposes an edit without a trustworthy edited-at value; both
+    timestamps remain in the audit row.
     """
     participant_id = ensure_participant(conn, participant, paid=None)
     round_id = ensure_round(conn, round_name)
@@ -1856,6 +2099,22 @@ def ingest_prediction_revision(
     submitted_iso = submitted.isoformat() if submitted is not None else (
         submitted_at.strip() if isinstance(submitted_at, str) and submitted_at.strip() else None
     )
+    if eligibility_at is None:
+        eligibility = submitted
+        eligibility_error = timestamp_error
+        eligibility_iso = submitted_iso
+    else:
+        eligibility, raw_eligibility_error = _prediction_timestamp(eligibility_at)
+        eligibility_error = (
+            raw_eligibility_error.replace("submitted_at", "eligibility_at")
+            if raw_eligibility_error is not None
+            else None
+        )
+        eligibility_iso = eligibility.isoformat() if eligibility is not None else (
+            eligibility_at.strip()
+            if isinstance(eligibility_at, str) and eligibility_at.strip()
+            else None
+        )
     observed, observed_error = _prediction_timestamp(observed_at or datetime.now(timezone.utc))
     if observed_error is not None or observed is None:
         raise ValueError(f"observed_at must be timezone-aware: {observed_error}")
@@ -1905,7 +2164,9 @@ def ingest_prediction_revision(
     parse_status = "invalid" if parsed_score is None else "valid"
     if parsed_score is not None and timestamp_error is not None:
         reason = timestamp_error
-    elif parsed_score is not None and submitted is not None:
+    elif parsed_score is not None and eligibility_error is not None:
+        reason = eligibility_error
+    elif parsed_score is not None and submitted is not None and eligibility is not None:
         deadline, deadline_error = _aware_deadline(
             effective_round_deadline(conn, round_name, lock_minutes=lock_minutes)
         )
@@ -1917,19 +2178,19 @@ def ingest_prediction_revision(
             reason = deadline_error or "invalid_kickoff_at"
         elif deadline is None and kickoff is None:
             reason = "missing_deadline"
-        elif deadline is not None and submitted <= deadline:
+        elif deadline is not None and eligibility <= deadline:
             decision = "accepted"
             reason = "before_round_deadline"
         elif current is not None:
             decision = "rejected"
             reason = "late_edit"
         else:
-            match_deadline = kickoff - timedelta(minutes=lock_minutes) if kickoff is not None else None
+            match_deadline = kickoff
             if match_deadline is not None:
                 deadline = match_deadline
-            if match_deadline is not None and submitted <= match_deadline:
+            if match_deadline is not None and eligibility < match_deadline:
                 decision = "accepted_partial_late"
-                reason = "before_match_deadline"
+                reason = "before_match_kickoff"
             else:
                 decision = "rejected"
                 reason = "late_submission"
@@ -1960,11 +2221,11 @@ def ingest_prediction_revision(
         INSERT INTO prediction_revisions(
             participant_id, match_id, prediction_id, source_kind,
             stable_source_item_id, content_fingerprint, raw_score,
-            normalized_score, source_submitted_at, observed_at, actor,
+            normalized_score, source_submitted_at, eligibility_at, observed_at, actor,
             parse_status, deadline_at, eligibility_decision, reason,
             previous_revision_id, projected
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             participant_id,
@@ -1976,6 +2237,7 @@ def ingest_prediction_revision(
             raw_score,
             normalized_score,
             submitted_iso,
+            eligibility_iso,
             observed_iso,
             optional_text(actor),
             parse_status,
@@ -2600,5 +2862,6 @@ def find_match(conn: sqlite3.Connection, query: str) -> sqlite3.Row:
     if row is None:
         raise ValueError(f"Match not found: {query}")
     return row
+
 
 

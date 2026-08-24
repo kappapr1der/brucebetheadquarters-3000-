@@ -201,7 +201,7 @@ class ForecastImportTest(unittest.TestCase):
             ["missing_submitted_at", "naive_submitted_at"],
         )
 
-    def test_first_partial_late_forecast_uses_match_cutoff(self) -> None:
+    def test_first_partial_late_forecast_uses_match_kickoff(self) -> None:
         conn = connect(":memory:")
         reset_db(conn)
         ensure_participant(conn, "Igor", paid=1)
@@ -213,7 +213,7 @@ class ForecastImportTest(unittest.TestCase):
             participant="Igor",
             round_name="1",
             text="Liverpool - Burnley 1:0",
-            submitted_at="2026-08-15T18:30:00+03:00",
+        submitted_at="2026-08-15T19:45:00+03:00",
             source="telegram-forecast",
             source_item_id="telegram:42:101",
         )
@@ -223,8 +223,8 @@ class ForecastImportTest(unittest.TestCase):
 
         self.assertEqual(report.stored_positions, (2,))
         self.assertEqual(revision["eligibility_decision"], "accepted_partial_late")
-        self.assertEqual(revision["reason"], "before_match_deadline")
-        self.assertEqual(revision["deadline_at"], "2026-08-15T19:00:00+03:00")
+        self.assertEqual(revision["reason"], "before_match_kickoff")
+        self.assertEqual(revision["deadline_at"], "2026-08-15T20:30:00+03:00")
 
 
     def test_unknown_or_invalid_forecasts_never_enroll_a_participant(self) -> None:

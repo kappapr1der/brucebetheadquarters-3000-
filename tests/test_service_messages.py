@@ -83,7 +83,7 @@ class ServiceMessagesTest(unittest.TestCase):
         text = deadline_after_message(deadline).text
 
         self.assertIn("Дедлайн прошёл", text)
-        self.assertIn("kickoff - 90 минут", text)
+        self.assertIn("которые ещё не начались", text)
 
 
 if __name__ == "__main__":
