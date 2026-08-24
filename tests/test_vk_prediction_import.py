@@ -330,7 +330,7 @@ class VkPredictionImportTests(unittest.TestCase):
         self.assertEqual((result.revisions_created, result.quarantined, len(result.issues)), (0, 1, 1))
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0], 0)
 
-    def test_partial_forecast_block_is_quarantined_without_partial_writes(self) -> None:
+    def test_partial_forecast_block_imports_only_its_mapped_matches(self) -> None:
         ensure_participant(self.conn, "Сергей", paid=1)
         report = make_report()
         submission = report.forecast_submissions[0]
@@ -338,11 +338,38 @@ class VkPredictionImportTests(unittest.TestCase):
 
         result = self.import_report(replace(report, forecast_submissions=(partial,)))
 
-        self.assertEqual((result.revisions_created, result.quarantined, len(result.issues)), (0, 1, 1))
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0], 0)
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM prediction_revisions").fetchone()[0], 0)
-        reason = self.conn.execute("SELECT reason FROM vk_prediction_quarantine").fetchone()[0]
-        self.assertIn("incomplete", reason)
+        self.assertEqual((result.revisions_created, result.accepted, result.quarantined), (9, 9, 0))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0], 9)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM prediction_revisions").fetchone()[0], 9)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM vk_prediction_quarantine").fetchone()[0], 0)
+
+    def test_partial_late_forecast_notifies_only_eligible_matches(self) -> None:
+        ensure_participant(self.conn, "Сергей", paid=1)
+        self.conn.execute(
+            "UPDATE matches SET kickoff_at = ? WHERE home = ?",
+            ("2030-08-21T20:00:00+03:00", "Arsenal"),
+        )
+        report = make_report(captured_at=datetime(2030, 8, 21, 20, 15, tzinfo=MSK))
+        submission = report.forecast_submissions[0]
+        partial = replace(
+            submission,
+            forecasts=submission.forecasts[:2],
+            status="partial",
+            submitted_at=datetime(2030, 8, 21, 20, 15, tzinfo=MSK),
+            source_key="vk:217130885:67251746:2030-08-21T20:15:00+03:00:sergey",
+        )
+
+        result = self.import_report(
+            replace(report, forecast_submissions=(partial,)),
+            notification_chat_ids=(42,),
+        )
+
+        self.assertEqual((result.revisions_created, result.accepted, result.rejected), (2, 1, 1))
+        event = self.notification_rows()[0]
+        self.assertEqual(event["kind"], "late_partial")
+        rendered = render_vk_prediction_notification(pending_vk_prediction_notification_deliveries(self.conn, (42,))[0])
+        self.assertIn("Поздний прогноз принят частично", rendered)
+        self.assertIn("Зачтено: 1/10", rendered)
 
     def test_non_epl_or_wrong_topic_is_rejected_before_any_write(self) -> None:
         ensure_participant(self.conn, "Сергей", paid=1)

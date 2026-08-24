@@ -235,11 +235,21 @@ def render_vk_prediction_notification(delivery: VkPredictionNotificationDelivery
         accepted = int(payload.get("accepted", 0))
         expected = int(payload.get("expected", accepted))
         lines = [
-            f"🎯 Новый прогноз — {round_label}",
+            f"🎯 {'Частичный' if accepted < expected else 'Новый'} прогноз — {round_label}",
             participant,
             f"Принято: {accepted}/{expected}",
             "Источник: VK",
             f"Дедлайн: {_deadline_label(payload.get('deadline_at'))} ✅",
+        ]
+    elif delivery.kind == "late_partial":
+        accepted = int(payload.get("accepted", 0))
+        expected = int(payload.get("expected", accepted))
+        lines = [
+            f"⏱️ Поздний прогноз принят частично — {round_label}",
+            participant,
+            f"Зачтено: {accepted}/{expected}",
+            "Матчи, которые уже начались, не включены.",
+            "Источник: VK",
         ]
     elif delivery.kind == "edit":
         lines = [f"✏️ Изменён прогноз — {round_label}", participant, *_change_lines(payload)]

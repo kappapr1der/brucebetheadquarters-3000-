@@ -12,6 +12,7 @@ try:
         deliver_pending_vk_prediction_notifications,
         forecast_cmd,
         load_settings,
+        notify_vk_access_challenge,
         text_handler,
         vk_predictions_snapshot_job,
     )
@@ -118,6 +119,17 @@ class TelegramForecastHandlerTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         conn.close()
         self.assertEqual((row["name"], row["score"]), ("Anna", "1:0"))
+
+    async def test_vk_access_challenge_stays_out_of_telegram(self) -> None:
+        bot = FakeBot()
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"settings": self.settings}),
+            bot=bot,
+        )
+
+        await notify_vk_access_challenge(context, self.settings)
+
+        self.assertEqual(bot.messages, [])
 
     async def test_invalid_forecast_is_quarantined_without_projection(self) -> None:
         update = fake_update("/forecast Igor | 1\n10:0", "2030-08-21T17:00:00+01:00", message_id=102)

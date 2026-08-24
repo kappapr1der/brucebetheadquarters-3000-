@@ -345,10 +345,10 @@ def import_vk_prediction_report(
     """Project one read-only VK capture into SQLite through immutable revisions.
 
     Nothing is written to VK. Business projections are written only after the
-    configured topic, EPL gate and pair-based fixture mapping all pass. A full
-    forecast post enrolls its participant when needed, while unsafe submissions
-    are retained in an idempotent local quarantine instead of guessing a match
-    position.
+    configured topic, EPL gate and pair-based fixture mapping all pass. A
+    complete or safely mapped partial forecast post enrolls its participant
+    when needed, while unsafe submissions are retained in an idempotent local
+    quarantine instead of guessing a match position.
     """
 
     if report.topic_kind != "predictions":
@@ -453,18 +453,17 @@ def import_vk_prediction_report(
                 continue
 
             forecasts_by_position = {forecast.position: forecast for forecast in submission.forecasts}
-            complete = (
-                submission.status == "full"
-                and len(submission.forecasts) == submission.expected_matches
+            safely_mapped = (
+                bool(forecasts_by_position)
                 and len(forecasts_by_position) == len(submission.forecasts)
-                and set(forecasts_by_position) == set(mapping)
+                and set(forecasts_by_position).issubset(mapping)
                 and all(
                     _label_key(forecast.match_label) == _label_key(mapping[position].template.label)
                     for position, forecast in forecasts_by_position.items()
                 )
             )
-            if not complete:
-                reason = "forecast block is incomplete or does not match the VK round template"
+            if not safely_mapped:
+                reason = "forecast block does not match the VK round template"
                 if _quarantine(conn, report, submission, stable_comment_key=stable_comment, reason=reason):
                     quarantined += 1
                     if _queue_notification(
@@ -562,6 +561,16 @@ def import_vk_prediction_report(
                 if is_edit:
                     kind = "edit"
                     payload: dict[str, object] = {"changes": _notification_changes(accepted_details)}
+                elif any(
+                    str(item["eligibility_decision"]) == "accepted_partial_late"
+                    for item in accepted_details
+                ):
+                    kind = "late_partial"
+                    payload = {
+                        "accepted": len(accepted_details),
+                        "expected": len(mapping),
+                        "deadline_at": accepted_details[0]["deadline_at"],
+                    }
                 else:
                     kind = "new"
                     payload = {
@@ -580,7 +589,10 @@ def import_vk_prediction_report(
                     chat_ids=notification_recipients,
                 ):
                     notification_events_created += 1
-            if rejected_details:
+            if rejected_details and not any(
+                str(item["eligibility_decision"]) == "accepted_partial_late"
+                for item in accepted_details
+            ):
                 has_late_edit = any(str(item["reason"]) == "late_edit" for item in rejected_details)
                 kind = "late_edit" if has_late_edit else "late_submission"
                 if _queue_notification(

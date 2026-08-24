@@ -54,7 +54,7 @@ class SnapshotTest(unittest.TestCase):
             self.assertEqual(manifest["scope"], "active_season")
             self.assertEqual(manifest["competition_code"], "epl")
             self.assertEqual(manifest["tables"]["matches.csv"], 4)
-            self.assertEqual(result.tables["predictions.csv"], 18)
+            self.assertEqual(result.tables["predictions.csv"], 19)
             self.assertEqual(result.tables["prediction_revisions.csv"], 20)
 
             with (out_dir / "predictions.csv").open("r", encoding="utf-8", newline="") as handle:

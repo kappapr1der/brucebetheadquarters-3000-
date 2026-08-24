@@ -1970,11 +1970,11 @@ def ingest_prediction_revision(
 
     The round deadline (first kickoff minus ``lock_minutes``, with the stored
     round deadline as fallback) is authoritative for edits. A first forecast
-    submitted after it may still use the individual match cutoff, preserving
-    the contest's existing partial-late rule without allowing a late edit to
-    overwrite an earlier score. ``eligibility_at`` may be later than the source
-    timestamp when an external system exposes an edit without a trustworthy
-    edited-at value; both timestamps remain in the audit row.
+    submitted after it remains eligible for each match that has not kicked off,
+    without allowing a late edit to overwrite an earlier score.
+    ``eligibility_at`` may be later than the source timestamp when an external
+    system exposes an edit without a trustworthy edited-at value; both
+    timestamps remain in the audit row.
     """
     participant_id = ensure_participant(conn, participant, paid=None)
     round_id = ensure_round(conn, round_name)
@@ -2079,12 +2079,12 @@ def ingest_prediction_revision(
             decision = "rejected"
             reason = "late_edit"
         else:
-            match_deadline = kickoff - timedelta(minutes=lock_minutes) if kickoff is not None else None
+            match_deadline = kickoff
             if match_deadline is not None:
                 deadline = match_deadline
-            if match_deadline is not None and eligibility <= match_deadline:
+            if match_deadline is not None and eligibility < match_deadline:
                 decision = "accepted_partial_late"
-                reason = "before_match_deadline"
+                reason = "before_match_kickoff"
             else:
                 decision = "rejected"
                 reason = "late_submission"

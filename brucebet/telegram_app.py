@@ -2364,28 +2364,10 @@ def complete_vk_topic_alert_worker(settings: BotSettings, alert: object, error: 
 
 
 async def notify_vk_access_challenge(context: ContextTypes.DEFAULT_TYPE, settings: BotSettings) -> None:
-    """Warn once per cooldown instead of silently treating a captcha as no topics."""
+    """Keep VK challenges observable in logs without spamming Telegram."""
 
-    now = datetime.now(timezone.utc)
-    last_alert_at = context.application.bot_data.get("vk_access_challenge_last_alert_at")
-    cooldown = timedelta(minutes=max(5, settings.vk_challenge_alert_cooldown_minutes))
-    if isinstance(last_alert_at, datetime) and now - last_alert_at < cooldown:
-        return
-
-    text = (
-        "BruceBet: VK показал антибот-проверку вместо публичных обсуждений.\n"
-        "Автопоиск новых тем временно слеп; новые темы могут не попасть в уведомления.\n"
-        "Пришли прямую ссылку на тему в этот чат, и я подключу её отдельно."
-    )
-    delivered = False
-    for chat_id in settings.allowed_chat_ids:
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=text)
-            delivered = True
-        except Exception as exc:  # noqa: BLE001 - one unreadable chat must not stop the bot.
-            LOGGER.warning("VK challenge alert failed chat=%s: %s", chat_id, exc)
-    if delivered:
-        context.application.bot_data["vk_access_challenge_last_alert_at"] = now
+    del context, settings
+    LOGGER.info("VK access challenge retained in service logs; Telegram alert suppressed")
 
 
 async def vk_topic_discovery_job(context: ContextTypes.DEFAULT_TYPE) -> None:

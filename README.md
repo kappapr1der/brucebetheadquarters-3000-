@@ -12,7 +12,7 @@
 - season: `2026/27`
 - display: `EPL 2026/27`
 - пользователь: `Bruce Wayne`
-- дедлайн: за 90 минут до первого матча тура
+- дедлайн: в старт первого матча тура
 - очки: точный счет 3, разница 2, исход 1
 
 Профиль лежит в `configs/epl_2026_27.json`, будущие сезоны можно делать копией `configs/epl_template.json`.
@@ -366,8 +366,8 @@ content fingerprint are no-ops; invalid or timezone-naive external timestamps an
 auditable but cannot change the current score. The calculated round deadline (first kickoff minus
 `BRUCEBET_LOCK_MINUTES`) is authoritative for edits; the active EPL profile uses `0`, so it closes
 at the first kickoff. The stored round deadline is its fallback. A
-participant's first forecast for a later match may still use that match's own cutoff, preserving the
-existing partial-late rule.
+participant's first forecast for a later match may still be accepted until that match kicks off;
+matches already in progress are excluded.
 
 ## World Cup Legacy
 
