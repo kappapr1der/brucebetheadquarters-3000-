@@ -379,6 +379,27 @@ CREATE TABLE IF NOT EXISTS round_reviews (
     payload_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS round_summary_notifications (
+    event_key TEXT PRIMARY KEY,
+    season_id INTEGER NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+    round_id INTEGER NOT NULL REFERENCES rounds(id) ON DELETE CASCADE,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(season_id, round_id)
+);
+
+CREATE TABLE IF NOT EXISTS round_summary_notification_deliveries (
+    event_key TEXT NOT NULL REFERENCES round_summary_notifications(event_key) ON DELETE CASCADE,
+    chat_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    last_attempt_at TEXT,
+    sent_at TEXT,
+    error TEXT,
+    PRIMARY KEY(event_key, chat_id)
+);
+
 CREATE TABLE IF NOT EXISTS model_forecasts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
@@ -643,6 +664,8 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS vk_prediction_quarantine;
         DROP TABLE IF EXISTS model_forecast_legacy_audit;
         DROP TABLE IF EXISTS model_forecasts;
+        DROP TABLE IF EXISTS round_summary_notification_deliveries;
+        DROP TABLE IF EXISTS round_summary_notifications;
         DROP TABLE IF EXISTS round_reviews;
         DROP TABLE IF EXISTS fixture_identity_events;
         DROP TABLE IF EXISTS fixture_sync_runs;
@@ -1429,6 +1452,89 @@ def ensure_participant(conn: sqlite3.Connection, name: str, paid: int | None = 1
     participant_id = int(row["id"])
     ensure_season_participant(conn, participant_id, paid)
     return participant_id
+
+
+def merge_participants(conn: sqlite3.Connection, canonical_name: str, duplicate_name: str) -> int:
+    """Merge a known duplicate into its canonical contestant without dropping audit history."""
+
+    canonical = canonical_name.strip()
+    duplicate = duplicate_name.strip()
+    if not canonical or not duplicate:
+        raise ValueError("Participant names must not be empty")
+    if canonical.casefold() == duplicate.casefold():
+        row = conn.execute("SELECT id FROM participants WHERE name = ?", (canonical,)).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown participant: {canonical}")
+        return int(row["id"])
+
+    target = conn.execute("SELECT id, paid FROM participants WHERE name = ?", (canonical,)).fetchone()
+    source = conn.execute("SELECT id, paid FROM participants WHERE name = ?", (duplicate,)).fetchone()
+    if target is None or source is None:
+        missing = canonical if target is None else duplicate
+        raise ValueError(f"Unknown participant: {missing}")
+    target_id = int(target["id"])
+    source_id = int(source["id"])
+
+    conflict = conn.execute(
+        """
+        SELECT 1
+        FROM predictions source_prediction
+        JOIN predictions target_prediction ON target_prediction.match_id = source_prediction.match_id
+        WHERE source_prediction.participant_id = ? AND target_prediction.participant_id = ?
+        LIMIT 1
+        """,
+        (source_id, target_id),
+    ).fetchone()
+    if conflict is not None:
+        raise ValueError(f"Cannot merge {duplicate}: both records have a prediction for the same match")
+
+    source_seasons = conn.execute(
+        "SELECT season_id, paid, active, alias, notes FROM season_participants WHERE participant_id = ?",
+        (source_id,),
+    ).fetchall()
+    for source_season in source_seasons:
+        season_id = int(source_season["season_id"])
+        target_season = conn.execute(
+            "SELECT paid, active, alias, notes FROM season_participants WHERE season_id = ? AND participant_id = ?",
+            (season_id, target_id),
+        ).fetchone()
+        if target_season is None:
+            conn.execute(
+                "UPDATE season_participants SET participant_id = ? WHERE season_id = ? AND participant_id = ?",
+                (target_id, season_id, source_id),
+            )
+            continue
+        alias = target_season["alias"] or source_season["alias"] or duplicate
+        notes = target_season["notes"] or source_season["notes"]
+        conn.execute(
+            """
+            UPDATE season_participants
+            SET paid = ?, active = ?, alias = ?, notes = ?
+            WHERE season_id = ? AND participant_id = ?
+            """,
+            (
+                max(int(target_season["paid"]), int(source_season["paid"])),
+                max(int(target_season["active"]), int(source_season["active"])),
+                alias,
+                notes,
+                season_id,
+                target_id,
+            ),
+        )
+        conn.execute(
+            "DELETE FROM season_participants WHERE season_id = ? AND participant_id = ?",
+            (season_id, source_id),
+        )
+
+    conn.execute("UPDATE predictions SET participant_id = ? WHERE participant_id = ?", (target_id, source_id))
+    conn.execute("UPDATE prediction_revisions SET participant_id = ? WHERE participant_id = ?", (target_id, source_id))
+    conn.execute("UPDATE vk_registration_entries SET participant_id = ? WHERE participant_id = ?", (target_id, source_id))
+    conn.execute(
+        "UPDATE participants SET paid = ? WHERE id = ?",
+        (max(int(target["paid"]), int(source["paid"])), target_id),
+    )
+    conn.execute("DELETE FROM participants WHERE id = ?", (source_id,))
+    return target_id
 
 
 def ensure_team(conn: sqlite3.Connection, name: str, **fields: object) -> int:

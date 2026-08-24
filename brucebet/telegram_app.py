@@ -78,6 +78,12 @@ from .reminders import (
     reminder_overview,
     subscribe_chat,
 )
+from .round_summary_notifications import (
+    enqueue_round_summary_notification,
+    mark_round_summary_delivery_failed,
+    mark_round_summary_delivery_sent,
+    pending_round_summary_deliveries,
+)
 from .scoring import is_standard_score, normalize_score, parse_datetime, parse_score
 from .service_messages import (
     deadline_schedule_created,
@@ -170,6 +176,7 @@ class BotSettings:
     auto_sync_enabled: bool
     auto_sync_interval_hours: int
     auto_sync_first_delay_minutes: int
+    result_sync_interval_minutes: int
     reminder_interval_minutes: int
     reminder_grace_minutes: int
     final_pick_lead_minutes: int
@@ -252,6 +259,7 @@ def load_settings() -> BotSettings:
         auto_sync_enabled=parse_bool(os.getenv("BRUCEBET_AUTO_SYNC"), default=True),
         auto_sync_interval_hours=int(os.getenv("BRUCEBET_AUTO_SYNC_INTERVAL_HOURS", "12")),
         auto_sync_first_delay_minutes=int(os.getenv("BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES", "5")),
+        result_sync_interval_minutes=int(os.getenv("BRUCEBET_RESULT_SYNC_INTERVAL_MINUTES", "15")),
         reminder_interval_minutes=int(os.getenv("BRUCEBET_REMINDER_INTERVAL_MINUTES", "5")),
         reminder_grace_minutes=int(os.getenv("BRUCEBET_REMINDER_GRACE_MINUTES", "35")),
         final_pick_lead_minutes=int(os.getenv("BRUCEBET_FINAL_PICK_LEAD_MINUTES", "10")),
@@ -753,6 +761,17 @@ def render_round_review(item: dict[str, object]) -> str:
         )
     sections.append(render_calibration(item["calibration"]))
     return "\n\n".join(sections)
+
+
+def render_round_summary_table(round_name: str, standings: list[object]) -> str:
+    rows = [
+        [item.rank, item.name, item.total, item.exact_hits, item.diff_hits, item.outcome_hits, item.late]
+        for item in standings
+    ]
+    return (
+        f"Итоги тура {round_name}. Общая таблица:\n"
+        + render_rows(["#", "участник", "очки", "точно", "разн", "исход", "поздно"], rows)
+    )[:MAX_MESSAGE]
 
 
 def render_dossier(dossier: dict[str, object]) -> str:
@@ -1779,12 +1798,15 @@ async def sync_results_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except PremierLeagueApiError as exc:
         await send_text(update, f"Результаты не синкнулись:\n{exc}")
         return
+    queued = await asyncio.to_thread(queue_completed_round_summary_notifications_worker, settings, reviews)
+    await deliver_pending_round_summary_notifications(context, settings)
     lines = [
         "Синк результатов готов.",
         f"finished_seen: {result.finished_seen}",
         f"matched: {result.matched}",
         f"updated: {result.updated}",
         f"completed_round_reviews: {len(reviews)}",
+        f"round_summary_notifications: {queued}",
     ]
     if result.unmatched:
         lines.append("Не сматчил: " + "; ".join(result.unmatched[:5]))
@@ -2521,6 +2543,41 @@ def record_vk_predictions_worker(settings: BotSettings, report: object) -> VkPre
         conn.close()
 
 
+def queue_completed_round_summary_notifications_worker(
+    settings: BotSettings,
+    reviews: list[dict[str, object]],
+) -> int:
+    if not reviews or not settings.allowed_chat_ids:
+        return 0
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        season = active_season(conn)
+        standings = compute_standings(
+            conn,
+            entry_fee_rub=int(season["entry_fee_rub"]),
+            lock_minutes=settings.lock_minutes,
+        )
+        created = 0
+        created_at = datetime.now().astimezone().isoformat()
+        for review in reviews:
+            if not bool(review.get("complete")):
+                continue
+            if enqueue_round_summary_notification(
+                conn,
+                season_id=int(season["id"]),
+                round_id=int(review["round_id"]),
+                text=render_round_summary_table(str(review["round_name"]), standings),
+                chat_ids=settings.allowed_chat_ids,
+                created_at=created_at,
+            ):
+                created += 1
+        conn.commit()
+        return created
+    finally:
+        conn.close()
+
+
 def pending_vk_prediction_notification_worker(settings: BotSettings):
     conn = connect(settings.db_path)
     try:
@@ -2622,6 +2679,49 @@ async def deliver_pending_contest_recommendation_notifications(
             )
             continue
         await asyncio.to_thread(complete_contest_recommendation_delivery_worker, settings, delivery)
+
+
+def pending_round_summary_delivery_worker(settings: BotSettings):
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        return pending_round_summary_deliveries(conn, settings.allowed_chat_ids)
+    finally:
+        conn.close()
+
+
+def complete_round_summary_delivery_worker(
+    settings: BotSettings,
+    delivery: object,
+    error: str | None = None,
+) -> None:
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        timestamp = datetime.now().astimezone().isoformat()
+        if error:
+            mark_round_summary_delivery_failed(conn, delivery, error, attempted_at=timestamp)
+        else:
+            mark_round_summary_delivery_sent(conn, delivery, sent_at=timestamp)
+    finally:
+        conn.close()
+
+
+async def deliver_pending_round_summary_notifications(
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: BotSettings,
+) -> None:
+    """Deliver one durable final contest table for every completed round."""
+
+    deliveries = await asyncio.to_thread(pending_round_summary_delivery_worker, settings)
+    for delivery in deliveries:
+        try:
+            await context.bot.send_message(chat_id=delivery.chat_id, text=delivery.text)
+        except Exception as exc:  # noqa: BLE001 - retain a per-chat retry record.
+            LOGGER.warning("Round summary failed chat=%s event=%s: %s", delivery.chat_id, delivery.event_key, exc)
+            await asyncio.to_thread(complete_round_summary_delivery_worker, settings, delivery, str(exc))
+            continue
+        await asyncio.to_thread(complete_round_summary_delivery_worker, settings, delivery)
 
 
 def render_vk_snapshot_status(label: str, report: object, archive: VkSnapshotArchiveResult | None) -> str:
@@ -2879,6 +2979,34 @@ async def auto_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         len(reviews),
         len(variable_result.errors),
     )
+    try:
+        queued = await asyncio.to_thread(queue_completed_round_summary_notifications_worker, settings, reviews)
+        if queued:
+            LOGGER.info("Queued %s completed-round summary notification(s)", queued)
+        await deliver_pending_round_summary_notifications(context, settings)
+    except Exception:  # noqa: BLE001 - result summaries must not block routine synchronization.
+        LOGGER.exception("Completed-round summary delivery pass failed")
+
+
+async def result_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Poll the official result feed without consuming variable or odds quotas."""
+
+    settings = settings_from_context(context)
+    try:
+        result, reviews = await asyncio.to_thread(sync_results_worker, settings)
+        queued = await asyncio.to_thread(queue_completed_round_summary_notifications_worker, settings, reviews)
+        await deliver_pending_round_summary_notifications(context, settings)
+    except Exception:  # noqa: BLE001 - a transient PL failure must not stop the job queue.
+        LOGGER.exception("Dedicated result sync failed")
+        return
+    LOGGER.info(
+        "Dedicated result sync finished seen=%s matched=%s updated=%s reviews=%s summaries=%s",
+        result.finished_seen,
+        result.matched,
+        result.updated,
+        len(reviews),
+        queued,
+    )
 
 
 def due_reminders_worker(settings: BotSettings):
@@ -3019,6 +3147,20 @@ def configure_auto_sync(application: Application, settings: BotSettings) -> None
         name="brucebet-auto-sync",
     )
     LOGGER.info("Auto sync scheduled every %s hours after %s minute first delay", interval_hours, first_delay_minutes)
+
+
+def configure_result_sync(application: Application, settings: BotSettings) -> None:
+    if application.job_queue is None:
+        LOGGER.warning("Result sync requested, but JobQueue is not available")
+        return
+    interval = max(5, settings.result_sync_interval_minutes)
+    application.job_queue.run_repeating(
+        result_sync_job,
+        interval=timedelta(minutes=interval),
+        first=timedelta(seconds=30),
+        name="brucebet-result-sync",
+    )
+    LOGGER.info("Dedicated result sync scheduled every %s minutes", interval)
 
 
 def configure_vk_topic_discovery(application: Application, settings: BotSettings) -> None:
@@ -3165,6 +3307,7 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     configure_auto_sync(application, settings)
+    configure_result_sync(application, settings)
     configure_deadline_reminders(application, settings)
     configure_final_contest_recommendations(application, settings)
     configure_vk_topic_discovery(application, settings)

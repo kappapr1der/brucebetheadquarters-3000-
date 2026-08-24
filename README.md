@@ -120,6 +120,7 @@ PREMIER_LEAGUE_SEASON_LABEL=2026/2027
 BRUCEBET_AUTO_SYNC=1
 BRUCEBET_AUTO_SYNC_INTERVAL_HOURS=12
 BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES=5
+BRUCEBET_RESULT_SYNC_INTERVAL_MINUTES=15
 BRUCEBET_REMINDER_INTERVAL_MINUTES=5
 BRUCEBET_REMINDER_GRACE_MINUTES=35
 BRUCEBET_FINAL_PICK_LEAD_MINUTES=10
@@ -262,7 +263,7 @@ python -m brucebet.cli --db brucebet.sqlite import --reset `
 - Team match factors: lineup confidence, absences impact, fatigue, baseline motivation.
 - Draft `match_assessments` based on Elo and latest stored odds when available.
 
-Telegram has `/sync_variables`, `/sync_results`, and `/dossier <match>`. The bot also runs a quiet background sync every `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS` when `BRUCEBET_AUTO_SYNC=1`, after `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES` on startup. Model drafts are frozen only once the relevant tour deadline has arrived; the deadline dispatcher checks this every `BRUCEBET_REMINDER_INTERVAL_MINUTES`. Finished official results are checked without spending Odds API credits.
+Telegram has `/sync_variables`, `/sync_results`, and `/dossier <match>`. The bot also runs a quiet background sync every `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS` when `BRUCEBET_AUTO_SYNC=1`, after `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES` on startup. A separate official-result check runs every `BRUCEBET_RESULT_SYNC_INTERVAL_MINUTES`, closes a fully finished tour, and posts one durable overall table to subscribed chats. Model drafts are frozen only once the relevant tour deadline has arrived; the deadline dispatcher checks this every `BRUCEBET_REMINDER_INTERVAL_MINUTES`. Finished official results are checked without spending Odds API credits.
 
 The background sync does not call The Odds API, so it does not spend odds credits. Use `/sync_odds` manually closer to deadline. `/schedule` subscribes the current chat to persistent reminders; the dispatcher checks due deliveries every `BRUCEBET_REMINDER_INTERVAL_MINUTES` and retries failed sends inside the configured grace window.
 

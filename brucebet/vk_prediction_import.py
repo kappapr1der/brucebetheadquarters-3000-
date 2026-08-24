@@ -211,15 +211,21 @@ def _registered_participant(conn: sqlite3.Connection, value: str) -> str | None:
     rows = list(
         conn.execute(
             """
-            SELECT p.name
+            SELECT DISTINCT p.name
             FROM season_participants sp
             JOIN participants p ON p.id = sp.participant_id
+            LEFT JOIN vk_registration_entries registration ON registration.participant_id = p.id
             WHERE sp.season_id = ?
               AND sp.active = 1
-              AND (lower(p.name) = lower(?) OR lower(COALESCE(sp.alias, '')) = lower(?))
+              AND (
+                  lower(p.name) = lower(?)
+                  OR lower(COALESCE(sp.alias, '')) = lower(?)
+                  OR lower(COALESCE(registration.participant_name, '')) = lower(?)
+                  OR lower(COALESCE(registration.vk_author, '')) = lower(?)
+              )
             ORDER BY p.id
             """,
-            (active_season_id(conn), value.strip(), value.strip()),
+            (active_season_id(conn), value.strip(), value.strip(), value.strip(), value.strip()),
         )
     )
     return str(rows[0]["name"]) if len(rows) == 1 else None
