@@ -763,15 +763,26 @@ def render_round_review(item: dict[str, object]) -> str:
     return "\n\n".join(sections)
 
 
-def render_round_summary_table(round_name: str, standings: list[object]) -> str:
-    rows = [
-        [item.rank, item.name, item.total, item.exact_hits, item.diff_hits, item.outcome_hits, item.late]
-        for item in standings
-    ]
-    return (
-        f"Итоги тура {round_name}. Общая таблица:\n"
-        + render_rows(["#", "участник", "очки", "точно", "разн", "исход", "поздно"], rows)
-    )[:MAX_MESSAGE]
+def render_round_summary_table(round_name: str, standings: list[object], user_participant: str) -> str:
+    """Render a concise phone-friendly standings update after a completed round."""
+
+    if not standings:
+        return f"Итоги тура {round_name}: пока нет участников в таблице."
+    lines = [f"Итоги тура {round_name}", ""]
+    lines.extend(f"{item.rank}. {item.name} - {item.total} оч." for item in standings)
+
+    mine = next((item for item in standings if item.name.casefold() == user_participant.casefold()), None)
+    if mine is not None:
+        podium_points = standings[min(2, len(standings) - 1)].total
+        leader_points = standings[0].total
+        lines.extend(
+            [
+                "",
+                f"Твоя позиция: {mine.rank}-е место, {mine.total} оч.",
+                f"До тройки: {max(0, podium_points - mine.total)}. До лидера: {max(0, leader_points - mine.total)}.",
+            ]
+        )
+    return "\n".join(lines)[:MAX_MESSAGE]
 
 
 def render_dossier(dossier: dict[str, object]) -> str:
@@ -2567,7 +2578,7 @@ def queue_completed_round_summary_notifications_worker(
                 conn,
                 season_id=int(season["id"]),
                 round_id=int(review["round_id"]),
-                text=render_round_summary_table(str(review["round_name"]), standings),
+                text=render_round_summary_table(str(review["round_name"]), standings, settings.user_participant),
                 chat_ids=settings.allowed_chat_ids,
                 created_at=created_at,
             ):

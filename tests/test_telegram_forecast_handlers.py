@@ -13,6 +13,7 @@ try:
         forecast_cmd,
         load_settings,
         notify_vk_access_challenge,
+        render_round_summary_table,
         text_handler,
         vk_predictions_snapshot_job,
     )
@@ -130,6 +131,21 @@ class TelegramForecastHandlerTests(unittest.IsolatedAsyncioTestCase):
         await notify_vk_access_challenge(context, self.settings)
 
         self.assertEqual(bot.messages, [])
+
+    def test_round_summary_is_phone_friendly_and_includes_bruce_gap(self) -> None:
+        standings = [
+            SimpleNamespace(rank=1, name="Igor", total=10),
+            SimpleNamespace(rank=2, name="Anna", total=9),
+            SimpleNamespace(rank=3, name="Sergey", total=9),
+            SimpleNamespace(rank=4, name="Bruce Wayne", total=7),
+        ]
+
+        text = render_round_summary_table("1", standings, "Bruce Wayne")
+
+        self.assertNotIn("```", text)
+        self.assertIn("1. Igor - 10 оч.", text)
+        self.assertIn("Твоя позиция: 4-е место, 7 оч.", text)
+        self.assertIn("До тройки: 2. До лидера: 3.", text)
 
     async def test_invalid_forecast_is_quarantined_without_projection(self) -> None:
         update = fake_update("/forecast Igor | 1\n10:0", "2030-08-21T17:00:00+01:00", message_id=102)
