@@ -78,6 +78,7 @@ from .reminders import (
     reminder_overview,
     subscribe_chat,
 )
+from .glm_analysis import GlmAnalysisError, GlmSettings, build_round_brief, build_round_prompt, request_analysis
 from .round_summary_notifications import (
     enqueue_round_summary_notification,
     mark_round_summary_delivery_failed,
@@ -204,6 +205,11 @@ class BotSettings:
     vk_topic_discovery_first_delay_seconds: int
     vk_chromium_bin: str
     vk_browser_wait_ms: int
+    glm_api_key: str
+    glm_base_url: str
+    glm_model: str
+    glm_timeout_seconds: int
+    glm_max_tokens: int
 
 
 def parse_chat_ids(raw: str | None) -> frozenset[int]:
@@ -301,6 +307,11 @@ def load_settings() -> BotSettings:
         vk_topic_discovery_first_delay_seconds=int(os.getenv("VK_TOPIC_DISCOVERY_FIRST_DELAY_SECONDS", "20")),
         vk_chromium_bin=os.getenv("VK_CHROMIUM_BIN", "chromium").strip() or "chromium",
         vk_browser_wait_ms=int(os.getenv("VK_BROWSER_WAIT_MS", "8000")),
+        glm_api_key=os.getenv("GLM_API_KEY", "").strip(),
+        glm_base_url=os.getenv("GLM_BASE_URL", "https://api.z.ai/api/paas/v4").strip() or "https://api.z.ai/api/paas/v4",
+        glm_model=os.getenv("GLM_MODEL", "glm-4.7-flash").strip() or "glm-4.7-flash",
+        glm_timeout_seconds=int(os.getenv("GLM_TIMEOUT_SECONDS", "45")),
+        glm_max_tokens=int(os.getenv("GLM_MAX_TOKENS", "1100")),
     )
 
 
@@ -927,7 +938,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Прогноз: первая строка - имя участника, ниже счета в порядке матчей. Текущий тур подставлю сам.",
         "Полный список команд: /help.",
     ]
-    lines.append("Быстрые команды: /forecast, /participants, /intel, /ready.")
+    lines.append("Быстрые команды: /forecast, /participants, /intel, /ready, /ai.")
     if not settings.allowed_chat_ids:
         lines.append("")
         if update.effective_chat is not None:
@@ -981,6 +992,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/table - таблица конкурса",
                 "/field <матч> - поле прогнозов",
                 "/recommend <матч> - рекомендация по матчу",
+                "/ai [тур] - независимый черновик GLM по сохраненным данным тура",
                 "/picks [тур] - конкурсный прогноз Brucebet: модель, поле, рынок и риск",
                 "/template [тур] - чистый русскоязычный шаблон прогноза для VK",
                 "/odds <матч> - последние сохранённые кэфы",
@@ -1419,6 +1431,41 @@ async def recommend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         ]
     )
     await send_text(update, "\n".join(lines))
+
+
+@require_access
+async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask GLM for a read-only, explicitly non-authoritative second opinion."""
+
+    settings = settings_from_context(context)
+    glm = GlmSettings(
+        api_key=settings.glm_api_key,
+        base_url=settings.glm_base_url,
+        model=settings.glm_model,
+        timeout_seconds=settings.glm_timeout_seconds,
+        max_tokens=settings.glm_max_tokens,
+    )
+    if not glm.configured:
+        await send_text(update, "GLM пока не настроен: добавь GLM_API_KEY в .env и перезапусти сервис.")
+        return
+    conn = conn_from_context(context)
+    try:
+        round_name, brief = build_round_brief(conn, query_text(context) or None)
+        analysis = await asyncio.to_thread(request_analysis, glm, build_round_prompt(brief))
+    except GlmAnalysisError as exc:
+        await send_text(update, f"GLM-анализ не получен: {exc}")
+        return
+    await send_text(
+        update,
+        "\n".join(
+            [
+                f"GLM: независимый черновик по туру {round_name}",
+                "Он не меняет прогнозы BruceBet и не отправляется во VK.",
+                "",
+                analysis,
+            ]
+        ),
+    )
 
 
 @require_access
@@ -3279,6 +3326,7 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(CommandHandler("table", table_cmd))
     application.add_handler(CommandHandler("field", field_cmd))
     application.add_handler(CommandHandler("recommend", recommend_cmd))
+    application.add_handler(CommandHandler("ai", ai_cmd))
     application.add_handler(CommandHandler("picks", picks_cmd))
     application.add_handler(CommandHandler("template", template_cmd))
     application.add_handler(CommandHandler("odds", odds_cmd))
