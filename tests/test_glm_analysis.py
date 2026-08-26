@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+import urllib.error
 
-from brucebet.glm_analysis import GlmSettings, build_round_brief, build_round_prompt, request_analysis
+from brucebet.glm_analysis import GlmAnalysisError, GlmSettings, build_round_brief, build_round_prompt, request_analysis
 from brucebet.storage import connect, reset_db, upsert_match, upsert_match_assessment, upsert_match_odds
 
 
@@ -94,3 +96,44 @@ class GlmAnalysisTests(unittest.TestCase):
 
     def test_timeout_default_allows_for_free_endpoint_queue(self) -> None:
         self.assertEqual(GlmSettings().timeout_seconds, 120)
+
+    def test_request_retries_once_with_free_fallback_after_rate_limit(self) -> None:
+        overloaded = urllib.error.HTTPError(
+            "https://api.z.ai/api/paas/v4/chat/completions",
+            429,
+            "Too many requests",
+            None,
+            io.BytesIO(b'{"error":{"code":"1305"}}'),
+        )
+        response = FakeResponse({"choices": [{"message": {"content": "Черновик готов."}}]})
+        settings = GlmSettings(api_key="secret")
+
+        with patch(
+            "brucebet.glm_analysis.urllib.request.urlopen",
+            side_effect=[overloaded, response],
+        ) as urlopen:
+            result = request_analysis(settings, "brief")
+
+        self.assertEqual(result, "Черновик готов.")
+        models = [
+            json.loads(call.args[0].data.decode("utf-8"))["model"]
+            for call in urlopen.call_args_list
+        ]
+        self.assertEqual(models, ["glm-4.7-flash", "glm-4.5-flash"])
+
+    def test_rate_limit_message_is_russian_after_both_free_models_reject(self) -> None:
+        overloaded = lambda: urllib.error.HTTPError(
+            "https://api.z.ai/api/paas/v4/chat/completions",
+            429,
+            "Too many requests",
+            None,
+            io.BytesIO(b'{"error":{"code":"1305"}}'),
+        )
+        settings = GlmSettings(api_key="secret")
+
+        with patch(
+            "brucebet.glm_analysis.urllib.request.urlopen",
+            side_effect=[overloaded(), overloaded()],
+        ):
+            with self.assertRaisesRegex(GlmAnalysisError, "Бесплатные модели Z.ai"):
+                request_analysis(settings, "brief")

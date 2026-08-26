@@ -13,10 +13,15 @@ from .analytics import field_summary, match_rows_for_round, target_round_name
 USER_AGENT = "BruceBetHQ/0.1 (+https://github.com/kappapr1der/brucebetheadquarters-3000-)"
 DEFAULT_BASE_URL = "https://api.z.ai/api/paas/v4"
 DEFAULT_MODEL = "glm-4.7-flash"
+DEFAULT_FALLBACK_MODEL = "glm-4.5-flash"
 
 
 class GlmAnalysisError(RuntimeError):
     """Raised when Z.ai cannot return a usable auxiliary analysis."""
+
+
+class GlmRateLimitError(GlmAnalysisError):
+    """Raised when a model is temporarily unavailable because its queue is full."""
 
 
 @dataclass(frozen=True)
@@ -24,6 +29,7 @@ class GlmSettings:
     api_key: str = ""
     base_url: str = DEFAULT_BASE_URL
     model: str = DEFAULT_MODEL
+    fallback_model: str = DEFAULT_FALLBACK_MODEL
     timeout_seconds: int = 120
     max_tokens: int = 700
 
@@ -115,14 +121,12 @@ def build_round_prompt(brief: dict[str, object]) -> str:
     )
 
 
-def request_analysis(settings: GlmSettings, prompt: str) -> str:
-    if not settings.configured:
-        raise GlmAnalysisError("GLM_API_KEY не задан.")
+def _request_model(settings: GlmSettings, prompt: str, model: str) -> str:
+    """Call one model once; caller decides whether a 429 deserves a fallback."""
+
     base_url = settings.base_url.rstrip("/")
-    if not base_url.startswith("https://"):
-        raise GlmAnalysisError("GLM_BASE_URL должен начинаться с https://")
     payload = {
-        "model": settings.model,
+        "model": model,
         "messages": [
             {"role": "system", "content": "Ты аккуратный аналитик. Не выдавай предположения за факты."},
             {"role": "user", "content": prompt},
@@ -150,6 +154,8 @@ def request_analysis(settings: GlmSettings, prompt: str) -> str:
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:300].replace("\n", " ")
+        if exc.code == 429:
+            raise GlmRateLimitError("Бесплатная очередь Z.ai сейчас перегружена.") from exc
         raise GlmAnalysisError(f"Z.ai вернул HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise GlmAnalysisError(f"Не удалось подключиться к Z.ai: {exc.reason}") from exc
@@ -164,3 +170,25 @@ def request_analysis(settings: GlmSettings, prompt: str) -> str:
     if not isinstance(content, str) or not content.strip():
         raise GlmAnalysisError("Z.ai не вернул текст анализа.")
     return content.strip()
+
+
+def request_analysis(settings: GlmSettings, prompt: str) -> str:
+    if not settings.configured:
+        raise GlmAnalysisError("GLM_API_KEY не задан.")
+    if not settings.base_url.rstrip("/").startswith("https://"):
+        raise GlmAnalysisError("GLM_BASE_URL должен начинаться с https://")
+
+    try:
+        return _request_model(settings, prompt, settings.model)
+    except GlmRateLimitError as primary_error:
+        fallback = settings.fallback_model.strip()
+        if not fallback or fallback == settings.model:
+            raise GlmAnalysisError(
+                "Бесплатная очередь Z.ai сейчас перегружена. Попробуй снова через 5-10 минут."
+            ) from primary_error
+        try:
+            return _request_model(settings, prompt, fallback)
+        except GlmRateLimitError as fallback_error:
+            raise GlmAnalysisError(
+                "Бесплатные модели Z.ai сейчас перегружены. Попробуй снова через 5-10 минут."
+            ) from fallback_error

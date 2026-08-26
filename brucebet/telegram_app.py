@@ -208,6 +208,7 @@ class BotSettings:
     glm_api_key: str
     glm_base_url: str
     glm_model: str
+    glm_fallback_model: str
     glm_timeout_seconds: int
     glm_max_tokens: int
 
@@ -310,6 +311,7 @@ def load_settings() -> BotSettings:
         glm_api_key=os.getenv("GLM_API_KEY", "").strip(),
         glm_base_url=os.getenv("GLM_BASE_URL", "https://api.z.ai/api/paas/v4").strip() or "https://api.z.ai/api/paas/v4",
         glm_model=os.getenv("GLM_MODEL", "glm-4.7-flash").strip() or "glm-4.7-flash",
+        glm_fallback_model=os.getenv("GLM_FALLBACK_MODEL", "glm-4.5-flash").strip(),
         glm_timeout_seconds=int(os.getenv("GLM_TIMEOUT_SECONDS", "120")),
         glm_max_tokens=int(os.getenv("GLM_MAX_TOKENS", "700")),
     )
@@ -1442,6 +1444,7 @@ async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         api_key=settings.glm_api_key,
         base_url=settings.glm_base_url,
         model=settings.glm_model,
+        fallback_model=settings.glm_fallback_model,
         timeout_seconds=settings.glm_timeout_seconds,
         max_tokens=settings.glm_max_tokens,
     )
