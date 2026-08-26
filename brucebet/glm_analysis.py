@@ -25,7 +25,7 @@ class GlmSettings:
     base_url: str = DEFAULT_BASE_URL
     model: str = DEFAULT_MODEL
     timeout_seconds: int = 45
-    max_tokens: int = 1100
+    max_tokens: int = 700
 
     @property
     def configured(self) -> bool:
@@ -128,6 +128,9 @@ def request_analysis(settings: GlmSettings, prompt: str) -> str:
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
+        # The auxiliary round summary is a constrained synthesis task. Turning
+        # off chain-of-thought keeps the free Flash endpoint responsive.
+        "thinking": {"type": "disabled"},
         "max_tokens": settings.max_tokens,
     }
     request = urllib.request.Request(

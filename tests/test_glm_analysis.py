@@ -90,3 +90,4 @@ class GlmAnalysisTests(unittest.TestCase):
         self.assertEqual(request.get_header("Authorization"), "Bearer secret")
         payload = json.loads(request.data.decode("utf-8"))
         self.assertEqual(payload["model"], "glm-4.7-flash")
+        self.assertEqual(payload["thinking"], {"type": "disabled"})
