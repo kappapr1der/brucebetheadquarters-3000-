@@ -66,6 +66,68 @@ def _assessment(conn: sqlite3.Connection, match_id: int) -> dict[str, object] | 
     return dict(row) if row is not None else None
 
 
+def _match_context(conn: sqlite3.Connection, match_id: int) -> dict[str, object] | None:
+    row = conn.execute(
+        """
+        SELECT home_rest_days, away_rest_days, home_travel_km, away_travel_km,
+               weather, temperature_c, pitch, referee, home_motivation,
+               away_motivation, home_rotation_risk, away_rotation_risk, notes
+        FROM match_contexts
+        WHERE match_id = ?
+        """,
+        (match_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _team_factors(conn: sqlite3.Connection, match_id: int) -> list[dict[str, object]]:
+    rows = conn.execute(
+        """
+        SELECT f.side, f.expected_lineup_confidence, f.absences_impact,
+               f.fatigue, f.morale, f.tactical_fit, f.pressing_advantage,
+               f.set_piece_edge, f.motivation, f.notes
+        FROM team_match_factors f
+        WHERE f.match_id = ?
+        ORDER BY f.side
+        """,
+        (match_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _team_form(conn: sqlite3.Connection, team_name: str) -> list[dict[str, object]]:
+    rows = conn.execute(
+        """
+        SELECT form.match_date, form.opponent, form.venue, form.competition,
+               form.goals_for, form.goals_against, form.xg_for, form.xg_against,
+               form.result, form.importance
+        FROM team_form form
+        JOIN teams team ON team.id = form.team_id
+        WHERE team.name = ?
+        ORDER BY form.match_date DESC, form.id DESC
+        LIMIT 5
+        """,
+        (team_name,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _absences(conn: sqlite3.Connection, home: str, away: str) -> list[dict[str, object]]:
+    rows = conn.execute(
+        """
+        SELECT team.name AS team, absence.player, absence.role, absence.status,
+               absence.severity, absence.impact_rating, absence.expected_return,
+               absence.source, absence.updated_at
+        FROM absences absence
+        JOIN teams team ON team.id = absence.team_id
+        WHERE team.name IN (?, ?)
+        ORDER BY team.name, absence.impact_rating DESC, absence.player
+        """,
+        (home, away),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def build_round_brief(conn: sqlite3.Connection, round_name: str | None = None) -> tuple[str, dict[str, object]]:
     """Produce an auditable, read-only context for an external LLM call."""
 
@@ -89,6 +151,13 @@ def build_round_brief(conn: sqlite3.Connection, round_name: str | None = None) -
                 "kickoff_at": match["kickoff_at"],
                 "model": _assessment(conn, int(match["id"])),
                 "odds": _latest_odds(conn, int(match["id"])),
+                "context": _match_context(conn, int(match["id"])),
+                "factors": _team_factors(conn, int(match["id"])),
+                "form": {
+                    "home_last_5": _team_form(conn, str(match["home"])),
+                    "away_last_5": _team_form(conn, str(match["away"])),
+                },
+                "absences": _absences(conn, str(match["home"]), str(match["away"])),
                 "field": {
                     "outcomes": outcomes,
                     "scores": scores,
@@ -104,17 +173,23 @@ def build_round_brief(conn: sqlite3.Connection, round_name: str | None = None) -
 
 
 def build_round_prompt(brief: dict[str, object]) -> str:
-    """Make the model a constrained second opinion, never a source of facts."""
+    """Make the model a disciplined second opinion, never a source of facts."""
 
     source = json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
     return "\n".join(
         [
-            "Ты вспомогательный футбольный аналитик для конкурса прогнозов счетов АПЛ.",
-            "Работай ТОЛЬКО с JSON ниже. Не используй интернет и не выдумывай травмы, форму, составы, коэффициенты или прогнозы участников.",
-            "Модель и рынок являются входными сигналами, а не доказанной истиной. Твой ответ - независимый черновик, он не отправляется во VK и не меняет прогноз пользователя.",
-            "Ответь по-русски, без таблиц, максимум 3200 символов.",
-            "Структура ответа: 'Картина тура' (2-3 короткие строки), 'По матчам' (по одной строке на матч: #, счет, уверенность высокая/средняя/низкая, краткая причина), 'Риски' (до 4 матчей), 'Перед дедлайном проверить' (до 3 пунктов).",
-            "Если у матча нет данных поля, прямо скажи, что стратегия против поля пока не определена.",
+            "Ты - строгий аудитор данных для конкурса прогнозов счетов АПЛ.",
+            "Работай ТОЛЬКО с JSON ниже. Нельзя использовать интернет, общие знания о футболе или придумывать форму, травмы, составы, коэффициенты, мотивацию, календарь и прогнозы участников.",
+            "Не пиши общих вступлений: запретны фразы о лидерах, аутсайдерах, привлекательности тура, вероятном ходе матча и 'явном преимуществе', если это не подтверждено конкретными полями JSON.",
+            "Каждое объяснение должно называть минимум один конкретный сигнал из JSON: счет базовой модели, вероятности модели, коэффициенты, форму, травму/доступность, отдых, контекст, фактор команды или агрегированное поле. Если подходящего сигнала нет, пиши 'данных нет'.",
+            "Модель и рынок - входные сигналы, не доказанная истина. При несогласии с базовым счетом модели прямо укажи исходный и свой счет. Не выдумывай причину несогласия.",
+            "Ответь только по-русски: названия команд можно оставить как в JSON, но не используй иероглифы и слова на других языках. Без таблиц, максимум 3200 символов.",
+            "Строгий формат ответа:",
+            "Вывод: одна строка о том, сколько матчей поддерживают базовый счет, сколько спорные и сколько не имеют данных.",
+            "Матчи: ровно одна строка на каждый матч: '#<номер> <хозяева> - <гости>: <итоговый счет>; база <счет модели или нет данных>; уверенность <высокая/средняя/низкая>; опора: <конкретные сигналы>'.",
+            "Риски: до четырех строк только с номером матча и фактической причиной риска из JSON: высокая volatility, низкая confidence, разнобой поля, отсутствие/устаревание данных или заметные кадровые/контекстные факторы.",
+            "Перед дедлайном проверить: до трех строк только о реально отсутствующих либо устаревших полях JSON. Не советуй проверять то, чего JSON уже не содержит и не называй новые факты.",
+            "Если у матча нет прогнозов поля, прямо укажи: 'поле: данных нет'. Не раскрывай имена участников: доступны только агрегаты поля.",
             "JSON:",
             source,
         ]
@@ -128,7 +203,13 @@ def _request_model(settings: GlmSettings, prompt: str, model: str) -> str:
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "Ты аккуратный аналитик. Не выдавай предположения за факты."},
+            {
+                "role": "system",
+                "content": (
+                    "Ты аккуратный русскоязычный аудитор данных. "
+                    "Не выдавай предположения за факты и не добавляй сведения вне входного JSON."
+                ),
+            },
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,

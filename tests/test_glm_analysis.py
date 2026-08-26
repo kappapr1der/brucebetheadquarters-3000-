@@ -10,7 +10,17 @@ from unittest.mock import patch
 import urllib.error
 
 from brucebet.glm_analysis import GlmAnalysisError, GlmSettings, build_round_brief, build_round_prompt, request_analysis
-from brucebet.storage import connect, reset_db, upsert_match, upsert_match_assessment, upsert_match_odds
+from brucebet.storage import (
+    connect,
+    reset_db,
+    upsert_absence,
+    upsert_match,
+    upsert_match_assessment,
+    upsert_match_context,
+    upsert_match_odds,
+    upsert_team_form,
+    upsert_team_match_factor,
+)
 
 
 class FakeResponse:
@@ -61,6 +71,51 @@ class GlmAnalysisTests(unittest.TestCase):
                 "away_win": "4.0",
             },
         )
+        upsert_team_form(
+            self.conn,
+            {
+                "team": "Arsenal",
+                "match_date": "2030-08-14",
+                "opponent": "Leeds",
+                "venue": "home",
+                "goals_for": "2",
+                "goals_against": "0",
+                "xg_for": "1.8",
+                "xg_against": "0.6",
+                "result": "W",
+            },
+        )
+        upsert_absence(
+            self.conn,
+            {
+                "team": "Chelsea",
+                "player": "Example Player",
+                "status": "injured",
+                "impact_rating": "0.8",
+                "updated_at": "2030-08-20T12:00:00+00:00",
+            },
+        )
+        upsert_match_context(
+            self.conn,
+            {
+                "round": "2",
+                "position": "1",
+                "home_rest_days": "6",
+                "away_rest_days": "3",
+                "weather": "clear",
+            },
+        )
+        upsert_team_match_factor(
+            self.conn,
+            {
+                "round": "2",
+                "position": "1",
+                "team": "Arsenal",
+                "side": "home",
+                "fatigue": "0.1",
+                "morale": "0.7",
+            },
+        )
         self.conn.commit()
 
     def tearDown(self) -> None:
@@ -74,9 +129,14 @@ class GlmAnalysisTests(unittest.TestCase):
         self.assertEqual(brief["matches"][0]["home"], "Arsenal")
         self.assertEqual(brief["matches"][0]["model"]["suggested_score"], "2:1")
         self.assertEqual(brief["matches"][0]["odds"]["home_win"], 1.9)
+        self.assertEqual(brief["matches"][0]["context"]["home_rest_days"], 6)
+        self.assertEqual(brief["matches"][0]["form"]["home_last_5"][0]["result"], "W")
+        self.assertEqual(brief["matches"][0]["absences"][0]["player"], "Example Player")
+        self.assertEqual(brief["matches"][0]["factors"][0]["fatigue"], 0.1)
         self.assertEqual(brief["matches"][0]["field"]["forecast_rows"], 0)
         prompt = build_round_prompt(brief)
-        self.assertIn("Не используй интернет", prompt)
+        self.assertIn("Нельзя использовать интернет", prompt)
+        self.assertIn("Не пиши общих вступлений", prompt)
         self.assertIn('"round":"2"', prompt)
 
     def test_request_uses_general_api_endpoint_and_extracts_text(self) -> None:
