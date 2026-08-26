@@ -157,6 +157,39 @@ class GlmAnalysisTests(unittest.TestCase):
     def test_timeout_default_allows_for_free_endpoint_queue(self) -> None:
         self.assertEqual(GlmSettings().timeout_seconds, 120)
 
+    def test_analysis_presentation_counts_only_actual_alternatives_and_limits_checklist(self) -> None:
+        response = FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "\n".join(
+                                [
+                                    "Вывод: 0 матчей поддерживают базовый счет, 2 спорных.",
+                                    "Матчи:",
+                                    "#1 Arsenal - Chelsea: 2:1; база 2:1; опора: away_edge 0.2",
+                                    "#2 Leeds - Everton: 1:0; база 0:1; опора: volatility 0.7",
+                                    "Перед дедлайном проверить:",
+                                    "форма: данных нет",
+                                    "травмы: данных нет",
+                                    "мораль: данных нет",
+                                    "прессинг: данных нет",
+                                ]
+                            )
+                        }
+                    }
+                ]
+            }
+        )
+
+        with patch("brucebet.glm_analysis.urllib.request.urlopen", return_value=response):
+            result = request_analysis(GlmSettings(api_key="secret"), "brief")
+
+        self.assertIn("Вывод: подтверждают базовый счет: 1; предлагают альтернативу: 1", result)
+        self.assertIn("преимущество гостей 0.2", result)
+        self.assertIn("нестабильность 0.7", result)
+        self.assertNotIn("прессинг: данных нет", result)
+
     def test_request_retries_once_with_free_fallback_after_rate_limit(self) -> None:
         overloaded = urllib.error.HTTPError(
             "https://api.z.ai/api/paas/v4/chat/completions",

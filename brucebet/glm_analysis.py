@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import re
 import sqlite3
 import urllib.error
 import urllib.request
@@ -14,6 +15,24 @@ USER_AGENT = "BruceBetHQ/0.1 (+https://github.com/kappapr1der/brucebetheadquarte
 DEFAULT_BASE_URL = "https://api.z.ai/api/paas/v4"
 DEFAULT_MODEL = "glm-4.7-flash"
 DEFAULT_FALLBACK_MODEL = "glm-4.5-flash"
+
+_MATCH_LINE_RE = re.compile(
+    r"^(#\d+\s+.+?:\s*)(?P<pick>\d+:\d+);\s*база\s+(?P<base>\d+:\d+|нет данных);",
+    re.IGNORECASE,
+)
+_RUSSIAN_LABELS = {
+    "away_edge": "преимущество гостей",
+    "home_edge": "преимущество хозяев",
+    "draw_edge": "вероятность ничьей",
+    "volatility": "нестабильность",
+    "confidence": "уверенность модели",
+    "away_win": "коэффициент победы гостей",
+    "home_win": "коэффициент победы хозяев",
+    "morale": "мораль",
+    "tactical_fit": "тактический фактор",
+    "pressing_advantage": "прессинг",
+    "set_piece_edge": "стандарты",
+}
 
 
 class GlmAnalysisError(RuntimeError):
@@ -185,15 +204,60 @@ def build_round_prompt(brief: dict[str, object]) -> str:
             "Модель и рынок - входные сигналы, не доказанная истина. При несогласии с базовым счетом модели прямо укажи исходный и свой счет. Не выдумывай причину несогласия.",
             "Ответь только по-русски: названия команд можно оставить как в JSON, но не используй иероглифы и слова на других языках. Без таблиц, максимум 3200 символов.",
             "Строгий формат ответа:",
-            "Вывод: одна строка о том, сколько матчей поддерживают базовый счет, сколько спорные и сколько не имеют данных.",
-            "Матчи: ровно одна строка на каждый матч: '#<номер> <хозяева> - <гости>: <итоговый счет>; база <счет модели или нет данных>; уверенность <высокая/средняя/низкая>; опора: <конкретные сигналы>'.",
+            "Вывод: одна строка о том, сколько матчей подтверждают базовый счет, сколько предлагают альтернативу и сколько не имеют базового счета. Считай строго по строкам ниже: одинаковый итоговый и базовый счет - подтверждение; другой счет - альтернатива. Нельзя назвать матч спорным, если итоговый счет равен базе.",
+            "Матчи: ровно одна строка на каждый матч: '#<номер> <хозяева> - <гости>: <итоговый счет>; база <счет модели или нет данных>; уверенность <высокая/средняя/низкая>; опора: <конкретные сигналы>'. Названия технических полей переводи на русский: away_edge - преимущество гостей, home_edge - преимущество хозяев, volatility - нестабильность, confidence - уверенность модели.",
             "Риски: до четырех строк только с номером матча и фактической причиной риска из JSON: высокая volatility, низкая confidence, разнобой поля, отсутствие/устаревание данных или заметные кадровые/контекстные факторы.",
-            "Перед дедлайном проверить: до трех строк только о реально отсутствующих либо устаревших полях JSON. Не советуй проверять то, чего JSON уже не содержит и не называй новые факты.",
+            "Перед дедлайном проверить: максимум три строки только о реально отсутствующих либо устаревших полях JSON. Однотипные пробелы обязательно объединяй в одну строку: например, форму, травмы и составы. Не советуй проверять то, чего JSON уже не содержит и не называй новые факты.",
             "Если у матча нет прогнозов поля, прямо укажи: 'поле: данных нет'. Не раскрывай имена участников: доступны только агрегаты поля.",
             "JSON:",
             source,
         ]
     )
+
+
+def _normalize_analysis(content: str) -> str:
+    """Enforce compact, internally consistent presentation around LLM text."""
+
+    for source_label, russian_label in _RUSSIAN_LABELS.items():
+        content = re.sub(rf"\b{re.escape(source_label)}\b", russian_label, content)
+
+    lines = content.splitlines()
+    supported = alternatives = missing_base = 0
+    for line in lines:
+        match = _MATCH_LINE_RE.match(line.strip())
+        if match is None:
+            continue
+        base = match.group("base").lower()
+        if base == "нет данных":
+            missing_base += 1
+        elif match.group("pick") == base:
+            supported += 1
+        else:
+            alternatives += 1
+    if supported + alternatives + missing_base:
+        for index, line in enumerate(lines):
+            if line.strip().lower().startswith("вывод:"):
+                lines[index] = (
+                    f"Вывод: подтверждают базовый счет: {supported}; "
+                    f"предлагают альтернативу: {alternatives}; без базового счета: {missing_base}."
+                )
+                break
+
+    deadline_index = next(
+        (index for index, line in enumerate(lines) if line.strip().lower().startswith("перед дедлайном проверить:")),
+        None,
+    )
+    if deadline_index is not None:
+        kept: list[str] = []
+        nonempty_count = 0
+        for line in lines[deadline_index + 1 :]:
+            if line.strip():
+                nonempty_count += 1
+                if nonempty_count > 3:
+                    continue
+            kept.append(line)
+        lines = lines[: deadline_index + 1] + kept
+    return "\n".join(lines).strip()
 
 
 def _request_model(settings: GlmSettings, prompt: str, model: str) -> str:
@@ -250,7 +314,7 @@ def _request_model(settings: GlmSettings, prompt: str, model: str) -> str:
         raise GlmAnalysisError("Z.ai вернул ответ в неожиданном формате.") from exc
     if not isinstance(content, str) or not content.strip():
         raise GlmAnalysisError("Z.ai не вернул текст анализа.")
-    return content.strip()
+    return _normalize_analysis(content)
 
 
 def request_analysis(settings: GlmSettings, prompt: str) -> str:
