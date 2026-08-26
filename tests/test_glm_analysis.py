@@ -91,3 +91,6 @@ class GlmAnalysisTests(unittest.TestCase):
         payload = json.loads(request.data.decode("utf-8"))
         self.assertEqual(payload["model"], "glm-4.7-flash")
         self.assertEqual(payload["thinking"], {"type": "disabled"})
+
+    def test_timeout_default_allows_for_free_endpoint_queue(self) -> None:
+        self.assertEqual(GlmSettings().timeout_seconds, 120)

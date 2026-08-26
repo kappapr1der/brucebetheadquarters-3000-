@@ -24,7 +24,7 @@ class GlmSettings:
     api_key: str = ""
     base_url: str = DEFAULT_BASE_URL
     model: str = DEFAULT_MODEL
-    timeout_seconds: int = 45
+    timeout_seconds: int = 120
     max_tokens: int = 700
 
     @property

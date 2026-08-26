@@ -310,7 +310,7 @@ def load_settings() -> BotSettings:
         glm_api_key=os.getenv("GLM_API_KEY", "").strip(),
         glm_base_url=os.getenv("GLM_BASE_URL", "https://api.z.ai/api/paas/v4").strip() or "https://api.z.ai/api/paas/v4",
         glm_model=os.getenv("GLM_MODEL", "glm-4.7-flash").strip() or "glm-4.7-flash",
-        glm_timeout_seconds=int(os.getenv("GLM_TIMEOUT_SECONDS", "45")),
+        glm_timeout_seconds=int(os.getenv("GLM_TIMEOUT_SECONDS", "120")),
         glm_max_tokens=int(os.getenv("GLM_MAX_TOKENS", "700")),
     )
 
