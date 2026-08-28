@@ -8,7 +8,7 @@ import sqlite3
 import urllib.error
 import urllib.request
 
-from .analytics import field_summary, match_rows_for_round, target_round_name
+from .analytics import field_summary, match_rows_for_round, participant_reliability, target_round_name, weighted_field_summary
 
 
 USER_AGENT = "BruceBetHQ/0.1 (+https://github.com/kappapr1der/brucebetheadquarters-3000-)"
@@ -157,9 +157,16 @@ def build_round_brief(conn: sqlite3.Connection, round_name: str | None = None) -
     if not matches:
         raise GlmAnalysisError(f"В туре {resolved_round} нет матчей.")
 
+    reliability = participant_reliability(conn, lock_minutes=0)
     payload_matches: list[dict[str, object]] = []
     for match in matches:
         summary = field_summary(conn, int(match["id"]))
+        weighted_summary = weighted_field_summary(
+            conn,
+            int(match["id"]),
+            reliability=reliability,
+            lock_minutes=0,
+        )
         outcomes = dict(summary["outcomes"])
         scores = dict(summary["scores"])
         payload_matches.append(
@@ -181,6 +188,9 @@ def build_round_brief(conn: sqlite3.Connection, round_name: str | None = None) -
                     "outcomes": outcomes,
                     "scores": scores,
                     "forecast_rows": sum(outcomes.values()),
+                    "quality_weighted_outcomes": dict(weighted_summary["outcomes"]),
+                    "quality_weighted_scores": dict(weighted_summary["scores"]),
+                    "history": weighted_summary["history"],
                 },
             }
         )
@@ -208,7 +218,8 @@ def build_round_prompt(brief: dict[str, object]) -> str:
             "Матчи: ровно одна строка на каждый матч: '#<номер> <хозяева> - <гости>: <итоговый счет>; база <счет модели или нет данных>; уверенность <высокая/средняя/низкая>; опора: <конкретные сигналы>'. Названия технических полей переводи на русский: away_edge - преимущество гостей, home_edge - преимущество хозяев, volatility - нестабильность, confidence - уверенность модели.",
             "Риски: до четырех строк только с номером матча и фактической причиной риска из JSON: высокая volatility, низкая confidence, разнобой поля, отсутствие/устаревание данных или заметные кадровые/контекстные факторы.",
             "Перед дедлайном проверить: максимум три строки только о реально отсутствующих либо устаревших полях JSON. Однотипные пробелы обязательно объединяй в одну строку: например, форму, травмы и составы. Не советуй проверять то, чего JSON уже не содержит и не называй новые факты.",
-            "Если у матча нет прогнозов поля, прямо укажи: 'поле: данных нет'. Не раскрывай имена участников: доступны только агрегаты поля.",
+            "Поле содержит обычный срез и обезличенный срез с небольшой поправкой на точность завершенных туров. Поправка сглажена и не делает одного участника авторитетом после одного тура. Не раскрывай имена участников: доступны только агрегаты поля.",
+            "Если у матча нет прогнозов поля, прямо укажи: 'поле: данных нет'.",
             "JSON:",
             source,
         ]

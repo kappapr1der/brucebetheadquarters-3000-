@@ -134,9 +134,12 @@ class GlmAnalysisTests(unittest.TestCase):
         self.assertEqual(brief["matches"][0]["absences"][0]["player"], "Example Player")
         self.assertEqual(brief["matches"][0]["factors"][0]["fatigue"], 0.1)
         self.assertEqual(brief["matches"][0]["field"]["forecast_rows"], 0)
+        self.assertEqual(brief["matches"][0]["field"]["quality_weighted_outcomes"], {})
+        self.assertIn("history", brief["matches"][0]["field"])
         prompt = build_round_prompt(brief)
         self.assertIn("Нельзя использовать интернет", prompt)
         self.assertIn("Не пиши общих вступлений", prompt)
+        self.assertIn("поправкой на точность завершенных туров", prompt)
         self.assertIn('"round":"2"', prompt)
 
     def test_request_uses_general_api_endpoint_and_extracts_text(self) -> None:

@@ -3,7 +3,17 @@ import unittest
 
 from datetime import datetime
 
-from brucebet.analytics import calendar_matches, edge_map, hq_summary, next_calendar_match, player_status_summary, risk_map, strategy_summary
+from brucebet.analytics import (
+    calendar_matches,
+    edge_map,
+    hq_summary,
+    next_calendar_match,
+    participant_reliability,
+    player_status_summary,
+    risk_map,
+    strategy_summary,
+    weighted_field_summary,
+)
 from brucebet.storage import (
     connect,
     init_db,
@@ -82,6 +92,20 @@ class EplHeadquartersTest(unittest.TestCase):
         self.assertEqual(item["mode"], "protect")
         self.assertEqual(item["me"].name, "Bruce Wayne")
         self.assertEqual(item["gap"], 0)
+
+    def test_history_weights_are_smoothed_and_anonymous_in_field_summary(self) -> None:
+        conn = load_epl_sample()
+
+        profiles = participant_reliability(conn)
+        bruce = next(item for item in profiles.values() if item.name == "Bruce Wayne")
+        guest = next(item for item in profiles.values() if item.name == "Guest")
+        weighted = weighted_field_summary(conn, 3, reliability=profiles)
+
+        self.assertEqual((bruce.scored_predictions, bruce.points), (2, 6))
+        self.assertGreater(bruce.weight, guest.weight)
+        self.assertNotEqual(weighted["outcomes"]["X"], 3)
+        self.assertEqual(weighted["history"]["participants_with_history"], 4)
+        self.assertEqual(weighted["history"]["scored_predictions"], 8)
 
     def test_calendar_finds_next_match_and_round(self) -> None:
         conn = load_epl_sample()

@@ -10,6 +10,11 @@ from .scoring import Score, is_prediction_eligible, normalize_score, parse_datet
 from .storage import active_season, active_season_id, mark_premature_model_forecasts
 
 
+RELIABILITY_PRIOR_PREDICTIONS = 24
+RELIABILITY_MIN_WEIGHT = 0.85
+RELIABILITY_MAX_WEIGHT = 1.15
+
+
 @dataclass
 class ParticipantStats:
     participant_id: int
@@ -36,6 +41,16 @@ class PredictionView:
     eligible: bool
     points: int
     category: str
+
+
+@dataclass(frozen=True)
+class ParticipantReliability:
+    participant_id: int
+    name: str
+    scored_predictions: int
+    points: int
+    points_per_prediction: float | None
+    weight: float
 
 
 @dataclass(frozen=True)
@@ -272,6 +287,95 @@ def field_summary(conn: sqlite3.Connection, match_id: int) -> dict[str, Counter]
         else:
             outcomes["X"] += 1
     return {"scores": scores, "outcomes": outcomes}
+
+
+def participant_reliability(
+    conn: sqlite3.Connection,
+    *,
+    lock_minutes: int = 90,
+) -> dict[int, ParticipantReliability]:
+    """Score active participants' finished predictions with a conservative prior."""
+
+    participants = _participants(conn)
+    points: Counter[int] = Counter()
+    samples: Counter[int] = Counter()
+    for row in _scored_rows(conn):
+        result = parse_score(row["result"])
+        if result is None:
+            continue
+        submitted_at = parse_datetime(row["submitted_at"])
+        kickoff_at = parse_datetime(row["kickoff_at"])
+        round_deadline_at = parse_datetime(row["round_deadline_at"])
+        if not prediction_is_eligible(submitted_at, kickoff_at, round_deadline_at, lock_minutes):
+            continue
+        participant_id = int(row["participant_id"])
+        award = score_prediction(parse_score(row["score"]), result)
+        samples[participant_id] += 1
+        points[participant_id] += award.points
+
+    total_samples = sum(samples.values())
+    baseline = sum(points.values()) / total_samples if total_samples else 1.0
+    if baseline <= 0:
+        baseline = 1.0
+    profiles: dict[int, ParticipantReliability] = {}
+    for row in participants:
+        participant_id = int(row["id"])
+        sample_size = int(samples[participant_id])
+        total_points = int(points[participant_id])
+        observed_rate = total_points / sample_size if sample_size else None
+        shrunk_rate = (
+            total_points + RELIABILITY_PRIOR_PREDICTIONS * baseline
+        ) / (sample_size + RELIABILITY_PRIOR_PREDICTIONS)
+        weight = max(
+            RELIABILITY_MIN_WEIGHT,
+            min(RELIABILITY_MAX_WEIGHT, shrunk_rate / baseline),
+        )
+        profiles[participant_id] = ParticipantReliability(
+            participant_id=participant_id,
+            name=str(row["name"]),
+            scored_predictions=sample_size,
+            points=total_points,
+            points_per_prediction=round(observed_rate, 3) if observed_rate is not None else None,
+            weight=round(weight, 4),
+        )
+    return profiles
+
+
+def weighted_field_summary(
+    conn: sqlite3.Connection,
+    match_id: int,
+    *,
+    reliability: dict[int, ParticipantReliability] | None = None,
+    lock_minutes: int = 90,
+) -> dict[str, object]:
+    """Return an anonymous field summary with conservative history-based weights."""
+
+    profiles = reliability if reliability is not None else participant_reliability(conn, lock_minutes=lock_minutes)
+    profile_by_name = {item.name.casefold(): item for item in profiles.values()}
+    scores: Counter[str] = Counter()
+    outcomes: Counter[str] = Counter()
+    profiles_used: list[ParticipantReliability] = []
+    for view in prediction_views_for_match(conn, match_id, lock_minutes=lock_minutes):
+        score = parse_score(view.score)
+        if score is None:
+            continue
+        profile = profile_by_name.get(view.participant.casefold())
+        weight = profile.weight if profile is not None else 1.0
+        if profile is not None:
+            profiles_used.append(profile)
+        scores[score.label()] += weight
+        outcomes["P1" if score.outcome > 0 else "P2" if score.outcome < 0 else "X"] += weight
+    known_profiles = [item for item in profiles_used if item.scored_predictions]
+    return {
+        "scores": scores,
+        "outcomes": outcomes,
+        "history": {
+            "participants_with_history": len(known_profiles),
+            "scored_predictions": sum(item.scored_predictions for item in known_profiles),
+            "weight_min": round(min((item.weight for item in profiles_used), default=1.0), 3),
+            "weight_max": round(max((item.weight for item in profiles_used), default=1.0), 3),
+        },
+    }
 
 
 def round_deadlines(conn: sqlite3.Connection, lock_minutes: int = 90) -> list[RoundDeadline]:

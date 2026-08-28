@@ -8,13 +8,20 @@ import json
 import sqlite3
 from typing import Iterable, Mapping
 
-from .analytics import intelligence_readiness, match_rows_for_round, round_deadlines, strategy_summary
+from .analytics import (
+    ParticipantReliability,
+    intelligence_readiness,
+    match_rows_for_round,
+    participant_reliability,
+    round_deadlines,
+    strategy_summary,
+)
 from .scoring import normalize_score, parse_datetime, parse_score
 from .storage import active_season_id
 from .team_display import russian_match_label
 
 
-ALGORITHM_VERSION = "contest-v2"
+ALGORITHM_VERSION = "contest-v3"
 MAX_TELEGRAM_TEXT = 3900
 OUTCOMES = ("P1", "X", "P2")
 MIN_FIELD_COVERAGE_FOR_OUTCOME_USE = 0.75
@@ -159,6 +166,7 @@ def _field_signal(
     match_id: int,
     season_id: int,
     user_participant: str,
+    reliability: Mapping[int, ParticipantReliability],
 ) -> dict[str, object]:
     roster = list(
         conn.execute(
@@ -190,6 +198,8 @@ def _field_signal(
     )
     scores: Counter[str] = Counter()
     outcomes: Counter[str] = Counter()
+    weighted_scores: Counter[str] = Counter()
+    weighted_outcomes: Counter[str] = Counter()
     participants: set[int] = set()
     for row in rows:
         participant_id = int(row["participant_id"])
@@ -201,20 +211,34 @@ def _field_signal(
         participants.add(participant_id)
         label = score.label()
         scores[label] += 1
-        outcomes[_outcome(label) or "X"] += 1
-    distribution = _normalise_distribution(outcomes)
+        outcome = _outcome(label) or "X"
+        outcomes[outcome] += 1
+        profile = reliability.get(participant_id)
+        weight = profile.weight if profile is not None else 1.0
+        weighted_scores[label] += weight
+        weighted_outcomes[outcome] += weight
+    distribution = _normalise_distribution(weighted_outcomes)
     top_outcome, top_share = _top(distribution)
-    top_score, top_score_share = _score_top(scores)
+    top_score, top_score_share = _score_top(weighted_scores)
+    profiles = [reliability[item] for item in participants if item in reliability]
     return {
         "prediction_count": len(participants),
         "expected_count": len(eligible_ids),
         "scores": dict(sorted(scores.items())),
         "outcomes": dict(sorted(outcomes.items())),
+        "weighted_scores": dict(sorted(weighted_scores.items())),
+        "weighted_outcomes": dict(sorted(weighted_outcomes.items())),
         "probabilities": distribution,
         "top_outcome": top_outcome,
         "top_share": top_share,
         "top_score": top_score,
         "top_score_share": top_score_share,
+        "history": {
+            "participants_with_history": sum(item.scored_predictions > 0 for item in profiles),
+            "scored_predictions": sum(item.scored_predictions for item in profiles),
+            "weight_min": round(min((item.weight for item in profiles), default=1.0), 3),
+            "weight_max": round(max((item.weight for item in profiles), default=1.0), 3),
+        },
     }
 
 
@@ -494,6 +518,7 @@ def recompute_contest_recommendations(
         season_id=season_id,
         user_participant=user_participant,
     )
+    reliability = participant_reliability(conn, lock_minutes=lock_minutes)
     frozen_final = bool(finalize or _round_has_final_snapshot(conn, round_id))
     changed: list[tuple[ContestRecommendation | None, ContestRecommendation]] = []
 
@@ -516,6 +541,7 @@ def recompute_contest_recommendations(
             match_id=match_id,
             season_id=season_id,
             user_participant=user_participant,
+            reliability=reliability,
         )
         field_coverage = _field_coverage(field)
         field_is_decisive = field_coverage >= MIN_FIELD_COVERAGE_FOR_OUTCOME_USE
