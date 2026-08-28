@@ -147,6 +147,9 @@ def variable_sync_rows(result: VariableSyncResult) -> list[tuple[str, object]]:
         ("fpl_players_seen", result.fpl_players_seen),
         ("fpl_players_imported", result.fpl_players_imported),
         ("fpl_teams_matched", result.fpl_teams_matched),
+        ("form_matches_seen", result.form_matches_seen),
+        ("form_rows_upserted", result.form_rows_upserted),
+        ("form_teams_matched", result.form_teams_matched),
         ("elo_teams_checked", result.elo_teams_checked),
         ("elo_teams_updated", result.elo_teams_updated),
         ("contexts_upserted", result.contexts_upserted),
@@ -158,6 +161,10 @@ def variable_sync_rows(result: VariableSyncResult) -> list[tuple[str, object]]:
     ]
     if result.fpl_unmatched_teams:
         rows.append(("fpl_unmatched_teams", ", ".join(result.fpl_unmatched_teams[:12])))
+    if result.form_fallback_teams:
+        rows.append(("form_fallback_teams", ", ".join(result.form_fallback_teams[:12])))
+    if result.form_unmatched_teams:
+        rows.append(("form_unmatched_teams", ", ".join(result.form_unmatched_teams[:12])))
     if result.elo_unmatched_teams:
         rows.append(("elo_unmatched_teams", ", ".join(result.elo_unmatched_teams[:12])))
     if result.errors:
@@ -1162,6 +1169,7 @@ def cmd_sync_variables(args: argparse.Namespace) -> int:
         include_elo=not args.skip_elo,
         include_context=not args.skip_context,
         include_assessments=not args.skip_assessments,
+        football_data_token=os.getenv("FOOTBALL_DATA_TOKEN", "").strip(),
     )
     print_key_values(variable_sync_rows(result))
     captured = capture_model_forecasts(conn)
