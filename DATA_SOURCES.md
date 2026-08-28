@@ -34,7 +34,7 @@ Target variable budget for strong match analytics: 60-120 variables total, with 
 | Club strength | ClubElo-style ratings, table, market value | Manual baseline | `teams.csv` |
 | Home/away strength | League table splits, xG splits | Manual estimate | `teams.csv`, `team_match_factors.csv` |
 | Market value, squad depth | Transfermarkt | Manual estimate | `teams.csv` |
-| Form and recent results | Premier League, Sofascore, Transfermarkt | Manual last 5 matches | `team_form.csv` |
+| Form and recent results | football-data.org completed-match feed | Manual last 5 matches | `team_form.csv` |
 | xG and match stats | Sofascore/FotMob/FBref when available | Manual “low/medium/high chance quality” | `team_form.csv` |
 | Injuries, suspensions, doubtful players | Official team news first | Transfermarkt, Sofascore/FotMob news, reputable beat reporters | `absences.csv` |
 | Player availability/form | Fantasy Premier League API, paid football API | Manual team news | `player_statuses.csv` |
@@ -81,7 +81,8 @@ Use:
 
 Current automated layer:
 
-- FPL bootstrap API -> `player_status_snapshots`
+- FPL bootstrap API -> `player_status_snapshots` (availability flags, not a confirmed medical report)
+- football-data.org -> source-tagged `team_form` rows from completed matches; the per-team fallback also covers official cup/European matches when league history is short
 - ClubElo API -> `teams.elo_rating`
 - Official schedule + stadium map -> `match_contexts`
 - Open-Meteo -> weather only inside the 16-day forecast horizon
@@ -100,11 +101,16 @@ The bot will not invent an injury feed. When a confirmed item appears in club ne
 
 `impact` is between `0` and `1`. Statuses `fit` or `available` remove the current record. Saving an absence recalculates lineup/rest factors and match assessments, so the information changes the recommendation rather than merely appearing in a note.
 
-The background sync intentionally does not call The Odds API. Odds snapshots should be pulled manually near deadline because each successful odds sync spends credits.
+FPL availability is useful before team news lands, but it is labelled as a player-status flag. It never turns into a confirmed absence record automatically.
+
+## Automated Odds Refresh
+
+`BRUCEBET_AUTO_ODDS_SYNC=1` enables a separate quiet scheduler when `THE_ODDS_API_KEY` is set. It only considers the next active round and only starts inside `BRUCEBET_AUTO_ODDS_WINDOW_HOURS` (72 by default). The scheduler checks stored snapshot age locally every `BRUCEBET_AUTO_ODDS_CHECK_INTERVAL_MINUTES` (15 by default), then calls The Odds API only if the target round needs a refresh. This preserves credits while moving to 30-minute snapshots during the final two hours before the effective deadline.
 
 ## Links
 
 - Premier League fixtures/results: https://www.premierleague.com/fixtures
+- football-data.org: https://www.football-data.org/
 - Fantasy Premier League bootstrap API: https://fantasy.premierleague.com/api/bootstrap-static/
 - ClubElo: https://clubelo.com/
 - Open-Meteo: https://open-meteo.com/

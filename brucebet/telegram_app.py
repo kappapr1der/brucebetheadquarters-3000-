@@ -60,7 +60,9 @@ from .odds_api import (
     DEFAULT_ODDS_REGIONS,
     DEFAULT_ODDS_SPORT,
     OddsApiError,
+    OddsRefreshPlan,
     TheOddsApiClient,
+    auto_odds_refresh_plan,
     sync_odds_to_db,
 )
 from .pl_fixtures import (
@@ -166,6 +168,9 @@ class BotSettings:
     odds_markets: str
     odds_bookmaker: str
     odds_days_ahead: int
+    auto_odds_sync_enabled: bool
+    auto_odds_window_hours: int
+    auto_odds_check_interval_minutes: int
     api_football_key: str
     football_data_token: str
     thesportsdb_key: str
@@ -238,6 +243,7 @@ def load_settings() -> BotSettings:
         )
     if allow_unrestricted_chats:
         LOGGER.warning("Development override enabled: Telegram access is unrestricted")
+    odds_api_key = os.getenv("THE_ODDS_API_KEY", "").strip()
     return BotSettings(
         token=token,
         db_path=Path(os.getenv("BRUCEBET_DB_PATH", "data/forecasters.sqlite")),
@@ -249,12 +255,15 @@ def load_settings() -> BotSettings:
         allowed_chat_ids=allowed_chat_ids,
         allow_unrestricted_chats=allow_unrestricted_chats,
         lock_minutes=int(os.getenv("BRUCEBET_LOCK_MINUTES", "90")),
-        odds_api_key=os.getenv("THE_ODDS_API_KEY", "").strip(),
+        odds_api_key=odds_api_key,
         odds_sport=os.getenv("THE_ODDS_API_SPORT", DEFAULT_ODDS_SPORT).strip() or DEFAULT_ODDS_SPORT,
         odds_regions=os.getenv("THE_ODDS_API_REGIONS", DEFAULT_ODDS_REGIONS).strip() or DEFAULT_ODDS_REGIONS,
         odds_markets=os.getenv("THE_ODDS_API_MARKETS", DEFAULT_ODDS_MARKETS).strip() or DEFAULT_ODDS_MARKETS,
         odds_bookmaker=os.getenv("THE_ODDS_API_BOOKMAKER", DEFAULT_ODDS_BOOKMAKER).strip() or DEFAULT_ODDS_BOOKMAKER,
         odds_days_ahead=int(os.getenv("THE_ODDS_API_DAYS_AHEAD", "30")),
+        auto_odds_sync_enabled=parse_bool(os.getenv("BRUCEBET_AUTO_ODDS_SYNC"), default=bool(odds_api_key)),
+        auto_odds_window_hours=int(os.getenv("BRUCEBET_AUTO_ODDS_WINDOW_HOURS", "72")),
+        auto_odds_check_interval_minutes=int(os.getenv("BRUCEBET_AUTO_ODDS_CHECK_INTERVAL_MINUTES", "15")),
         api_football_key=os.getenv("API_FOOTBALL_KEY", "").strip(),
         football_data_token=os.getenv("FOOTBALL_DATA_TOKEN", "").strip(),
         thesportsdb_key=os.getenv("THESPORTSDB_KEY", "123").strip() or "123",
@@ -621,6 +630,9 @@ def render_variable_sync(result: VariableSyncResult) -> str:
         ("fpl_players_seen", result.fpl_players_seen),
         ("fpl_players_imported", result.fpl_players_imported),
         ("fpl_teams_matched", result.fpl_teams_matched),
+        ("form_matches_seen", result.form_matches_seen),
+        ("form_rows_upserted", result.form_rows_upserted),
+        ("form_teams_matched", result.form_teams_matched),
         ("elo_teams_checked", result.elo_teams_checked),
         ("elo_teams_updated", result.elo_teams_updated),
         ("contexts_upserted", result.contexts_upserted),
@@ -632,6 +644,10 @@ def render_variable_sync(result: VariableSyncResult) -> str:
     ]
     if result.fpl_unmatched_teams:
         rows.append(("fpl_unmatched_teams", ", ".join(result.fpl_unmatched_teams[:10])))
+    if result.form_fallback_teams:
+        rows.append(("form_fallback_teams", ", ".join(result.form_fallback_teams[:10])))
+    if result.form_unmatched_teams:
+        rows.append(("form_unmatched_teams", ", ".join(result.form_unmatched_teams[:10])))
     if result.elo_unmatched_teams:
         rows.append(("elo_unmatched_teams", ", ".join(result.elo_unmatched_teams[:10])))
     if result.errors:
@@ -1765,6 +1781,41 @@ def sync_odds_worker(settings: BotSettings):
         conn.close()
 
 
+def auto_sync_odds_worker(settings: BotSettings) -> tuple[OddsRefreshPlan, object | None]:
+    """Refresh market data only when the next round is in its quota-safe window."""
+
+    settings.db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        activate_profile(
+            conn,
+            competition_code=settings.competition,
+            season_name=settings.season,
+            season_display_name=settings.season_display,
+            lock_minutes=settings.lock_minutes,
+        )
+        plan = auto_odds_refresh_plan(
+            conn,
+            lock_minutes=settings.lock_minutes,
+            window_hours=settings.auto_odds_window_hours,
+        )
+        if not plan.due:
+            return plan, None
+        result = sync_odds_to_db(
+            conn,
+            api_key=settings.odds_api_key,
+            sport=settings.odds_sport,
+            regions=settings.odds_regions,
+            markets=settings.odds_markets,
+            bookmaker=settings.odds_bookmaker,
+            days_ahead=settings.odds_days_ahead,
+        )
+        return plan, result
+    finally:
+        conn.close()
+
+
 @require_access
 async def sync_odds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = settings_from_context(context)
@@ -1811,6 +1862,7 @@ def sync_variables_worker(settings: BotSettings) -> tuple[VariableSyncResult, in
             days_ahead=settings.variables_days_ahead,
             weather_days=settings.weather_days_ahead,
             timezone_name=settings.timezone,
+            football_data_token=settings.football_data_token,
         )
         return result, capture_model_forecasts(
             conn,
@@ -1824,7 +1876,7 @@ def sync_variables_worker(settings: BotSettings) -> tuple[VariableSyncResult, in
 @require_access
 async def sync_variables_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = settings_from_context(context)
-    await send_text(update, "Syncing FPL, ClubElo, context, weather, and model draft variables.")
+    await send_text(update, "Синхронизирую форму команд, FPL, ClubElo, контекст, погоду и черновик модели.")
     result, captured = await asyncio.to_thread(sync_variables_worker, settings)
     await send_text(update, render_variable_sync(result) + f"\n\nModel forecasts frozen before kickoff: {captured}.")
 
@@ -3050,6 +3102,35 @@ async def auto_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         LOGGER.exception("Completed-round summary delivery pass failed")
 
 
+async def auto_odds_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Quietly keep target-round odds fresh near its deadline without chat noise."""
+
+    settings = settings_from_context(context)
+    try:
+        plan, result = await asyncio.to_thread(auto_sync_odds_worker, settings)
+    except OddsApiError as exc:
+        LOGGER.warning("Automatic odds sync failed: %s", exc)
+        return
+    except Exception:  # noqa: BLE001 - a failed provider call must not stop the queue.
+        LOGGER.exception("Automatic odds sync failed unexpectedly")
+        return
+    if result is None:
+        LOGGER.debug(
+            "Automatic odds sync skipped round=%s reason=%s deadline=%s",
+            plan.round_name,
+            plan.reason,
+            plan.deadline_at,
+        )
+        return
+    LOGGER.info(
+        "Automatic odds sync complete round=%s inserted=%s matched=%s quota_remaining=%s",
+        plan.round_name,
+        result.inserted,
+        result.matched,
+        result.quota.requests_remaining,
+    )
+
+
 async def result_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Poll the official result feed without consuming variable or odds quotas."""
 
@@ -3211,6 +3292,29 @@ def configure_auto_sync(application: Application, settings: BotSettings) -> None
     LOGGER.info("Auto sync scheduled every %s hours after %s minute first delay", interval_hours, first_delay_minutes)
 
 
+def configure_auto_odds_sync(application: Application, settings: BotSettings) -> None:
+    if not settings.auto_odds_sync_enabled:
+        return
+    if not settings.odds_api_key:
+        LOGGER.warning("Automatic odds sync is enabled, but THE_ODDS_API_KEY is empty")
+        return
+    if application.job_queue is None:
+        LOGGER.warning("Automatic odds sync requested, but JobQueue is not available")
+        return
+    interval = max(5, settings.auto_odds_check_interval_minutes)
+    application.job_queue.run_repeating(
+        auto_odds_sync_job,
+        interval=timedelta(minutes=interval),
+        first=timedelta(minutes=1),
+        name="brucebet-auto-odds-sync",
+    )
+    LOGGER.info(
+        "Automatic odds checks scheduled every %s minutes; refresh window=%s hours",
+        interval,
+        max(1, settings.auto_odds_window_hours),
+    )
+
+
 def configure_result_sync(application: Application, settings: BotSettings) -> None:
     if application.job_queue is None:
         LOGGER.warning("Result sync requested, but JobQueue is not available")
@@ -3370,6 +3474,7 @@ def build_application(settings: BotSettings) -> Application:
     application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     configure_auto_sync(application, settings)
+    configure_auto_odds_sync(application, settings)
     configure_result_sync(application, settings)
     configure_deadline_reminders(application, settings)
     configure_final_contest_recommendations(application, settings)

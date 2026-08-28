@@ -13,6 +13,7 @@ import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 
+from .football_data_sync import FootballDataError, sync_recent_team_form
 from .scoring import parse_datetime
 from .storage import (
     active_season_id,
@@ -37,6 +38,11 @@ class VariableSyncResult:
     fpl_players_imported: int = 0
     fpl_teams_matched: int = 0
     fpl_unmatched_teams: tuple[str, ...] = ()
+    form_matches_seen: int = 0
+    form_rows_upserted: int = 0
+    form_teams_matched: int = 0
+    form_fallback_teams: tuple[str, ...] = ()
+    form_unmatched_teams: tuple[str, ...] = ()
     elo_teams_checked: int = 0
     elo_teams_updated: int = 0
     elo_unmatched_teams: tuple[str, ...] = ()
@@ -799,11 +805,16 @@ def sync_match_variables(
     include_elo: bool = True,
     include_context: bool = True,
     include_assessments: bool = True,
+    football_data_token: str = "",
+    include_form: bool = True,
 ) -> VariableSyncResult:
     updated_at = _aware(now or datetime.now(timezone.utc), timezone_name).isoformat()
     errors: list[str] = []
     fpl_seen = fpl_imported = fpl_matched = 0
     fpl_unmatched: tuple[str, ...] = ()
+    form_seen = form_upserted = form_matched = 0
+    form_fallback: tuple[str, ...] = ()
+    form_unmatched: tuple[str, ...] = ()
     elo_checked = elo_updated = 0
     elo_unmatched: tuple[str, ...] = ()
     contexts = factors = weather_checked = weather_updated = weather_skipped = 0
@@ -814,6 +825,24 @@ def sync_match_variables(
             fpl_seen, fpl_imported, fpl_matched, fpl_unmatched = sync_fpl_player_statuses(conn, updated_at, timeout=timeout)
         except (VariableSyncError, urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
             errors.append(f"FPL: {exc}")
+
+    if include_form and football_data_token.strip():
+        try:
+            form_result = sync_recent_team_form(
+                conn,
+                token=football_data_token,
+                active_teams=_active_match_team_names(conn),
+                resolve_team=lambda raw_name: resolve_existing_team(conn, raw_name),
+                now=now,
+                timeout=timeout,
+            )
+            form_seen = form_result.matches_seen
+            form_upserted = form_result.rows_upserted
+            form_matched = form_result.teams_matched
+            form_fallback = form_result.fallback_teams
+            form_unmatched = form_result.unmatched_teams
+        except (FootballDataError, urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+            errors.append(f"football-data.org: {exc}")
 
     if include_elo:
         try:
@@ -846,6 +875,11 @@ def sync_match_variables(
         fpl_players_imported=fpl_imported,
         fpl_teams_matched=fpl_matched,
         fpl_unmatched_teams=fpl_unmatched,
+        form_matches_seen=form_seen,
+        form_rows_upserted=form_upserted,
+        form_teams_matched=form_matched,
+        form_fallback_teams=form_fallback,
+        form_unmatched_teams=form_unmatched,
         elo_teams_checked=elo_checked,
         elo_teams_updated=elo_updated,
         elo_unmatched_teams=elo_unmatched,

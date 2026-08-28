@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -6,11 +7,13 @@ from brucebet.odds_api import (
     OddsEvent,
     OddsQuota,
     OddsSnapshot,
+    auto_odds_refresh_plan,
     average_event_odds,
     match_pair_key,
+    odds_refresh_interval,
     sync_odds_to_db,
 )
-from brucebet.storage import connect, import_matches, import_teams, reset_db
+from brucebet.storage import connect, import_matches, import_teams, reset_db, upsert_match, upsert_match_odds
 
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
@@ -25,6 +28,45 @@ def load_match_sample():
 
 
 class OddsApiTest(unittest.TestCase):
+    def test_auto_refresh_plan_uses_deadline_window_and_snapshot_age(self) -> None:
+        conn = connect(":memory:")
+        reset_db(conn)
+        upsert_match(conn, "2", 1, "Arsenal", "Chelsea", "2026-08-30T19:00:00+00:00", None)
+        now = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
+
+        plan = auto_odds_refresh_plan(conn, now=now, lock_minutes=90)
+        self.assertTrue(plan.due)
+        self.assertEqual(plan.round_name, "2")
+        self.assertEqual(plan.reason, "no odds snapshot for target round")
+        self.assertEqual(plan.refresh_interval, timedelta(hours=12))
+
+        upsert_match_odds(
+            conn,
+            {
+                "round": "2",
+                "position": "1",
+                "bookmaker": "market_avg",
+                "captured_at": (now - timedelta(hours=2)).isoformat(),
+                "home_win": "1.8",
+                "draw": "3.5",
+                "away_win": "4.2",
+            },
+        )
+        conn.commit()
+        fresh = auto_odds_refresh_plan(conn, now=now, lock_minutes=90)
+        self.assertFalse(fresh.due)
+        self.assertEqual(fresh.reason, "latest target-round snapshot is fresh")
+
+        stale = auto_odds_refresh_plan(conn, now=now + timedelta(hours=11), lock_minutes=90)
+        self.assertTrue(stale.due)
+        self.assertEqual(stale.reason, "latest target-round snapshot is stale")
+
+    def test_auto_refresh_interval_increases_near_deadline(self) -> None:
+        self.assertEqual(odds_refresh_interval(timedelta(hours=50)), timedelta(hours=12))
+        self.assertEqual(odds_refresh_interval(timedelta(hours=12)), timedelta(hours=6))
+        self.assertEqual(odds_refresh_interval(timedelta(hours=4)), timedelta(hours=2))
+        self.assertEqual(odds_refresh_interval(timedelta(minutes=90)), timedelta(minutes=30))
+
     def test_average_event_odds_handles_h2h_totals_and_btts(self) -> None:
         event = {
             "home_team": "Arsenal",

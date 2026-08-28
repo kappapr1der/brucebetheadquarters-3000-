@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 
 from .storage import upsert_match_odds
+from .analytics import round_deadlines
 
 
 API_BASE = "https://api.the-odds-api.com/v4"
@@ -106,6 +107,16 @@ class OddsImportResult:
     quota: OddsQuota = field(default_factory=lambda: OddsQuota(None, None, None))
 
 
+@dataclass(frozen=True)
+class OddsRefreshPlan:
+    round_name: str | None
+    deadline_at: datetime | None
+    latest_captured_at: datetime | None
+    refresh_interval: timedelta | None
+    due: bool
+    reason: str
+
+
 class OddsApiError(RuntimeError):
     pass
 
@@ -156,6 +167,64 @@ def parse_iso_utc(raw: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def odds_refresh_interval(time_to_deadline: timedelta) -> timedelta:
+    """Return a quota-conscious interval that increases near the deadline."""
+
+    if time_to_deadline <= timedelta(hours=2):
+        return timedelta(minutes=30)
+    if time_to_deadline <= timedelta(hours=6):
+        return timedelta(hours=2)
+    if time_to_deadline <= timedelta(hours=24):
+        return timedelta(hours=6)
+    return timedelta(hours=12)
+
+
+def auto_odds_refresh_plan(
+    conn: sqlite3.Connection,
+    now: datetime | None = None,
+    lock_minutes: int = 90,
+    window_hours: int = 72,
+) -> OddsRefreshPlan:
+    """Decide whether a background job may spend Odds API quota for the next round."""
+
+    current = _as_utc(now or datetime.now(timezone.utc))
+    future = [
+        item
+        for item in round_deadlines(conn, lock_minutes=lock_minutes)
+        if item.effective_deadline_at is not None and _as_utc(item.effective_deadline_at) >= current
+    ]
+    if not future:
+        return OddsRefreshPlan(None, None, None, None, False, "no upcoming round deadline")
+    target = future[0]
+    deadline = _as_utc(target.effective_deadline_at)  # filtered above
+    time_to_deadline = deadline - current
+    if time_to_deadline > timedelta(hours=max(1, window_hours)):
+        return OddsRefreshPlan(target.round_name, deadline, None, None, False, "outside refresh window")
+    interval = odds_refresh_interval(time_to_deadline)
+    latest_row = conn.execute(
+        """
+        SELECT MAX(mo.captured_at) AS captured_at
+        FROM match_odds mo
+        JOIN matches m ON m.id = mo.match_id
+        JOIN rounds r ON r.id = m.round_id
+        JOIN seasons s ON s.id = r.season_id
+        WHERE r.name = ?
+          AND s.active = 1
+        """,
+        (target.round_name,),
+    ).fetchone()
+    latest = parse_iso_utc(str(latest_row["captured_at"])) if latest_row and latest_row["captured_at"] else None
+    if latest is None:
+        return OddsRefreshPlan(target.round_name, deadline, None, interval, True, "no odds snapshot for target round")
+    if current - latest >= interval:
+        return OddsRefreshPlan(target.round_name, deadline, latest, interval, True, "latest target-round snapshot is stale")
+    return OddsRefreshPlan(target.round_name, deadline, latest, interval, False, "latest target-round snapshot is fresh")
 
 
 def _odds_api_timestamp(value: datetime) -> str:

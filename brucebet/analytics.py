@@ -885,6 +885,20 @@ def match_intelligence_readiness(
         "SELECT COUNT(*) AS count, MAX(updated_at) AS updated_at FROM absences WHERE team_id IN (?, ?)",
         team_ids,
     ).fetchone()
+    availability_flags = {
+        int(row["team_id"]): int(row["count"] or 0)
+        for row in conn.execute(
+            """
+            SELECT team_id, COUNT(*) AS count
+            FROM player_status_snapshots
+            WHERE team_id IN (?, ?)
+              AND (status IN ('injured', 'suspended', 'unavailable', 'doubtful')
+                   OR availability_pct < 100)
+            GROUP BY team_id
+            """,
+            team_ids,
+        )
+    }
     context = dossier["context"]
     factors = dossier["factors"]
     assessment = dossier["assessment"]
@@ -960,7 +974,14 @@ def match_intelligence_readiness(
         ),
     ]
     absence_count = int(absence_row["count"] or 0) if absence_row else 0
-    absence_detail = f"manual absences logged={absence_count}" if absence_count else "manual injury/news review still needed"
+    if absence_count:
+        absence_detail = f"manual confirmed absences={absence_count}"
+    else:
+        absence_detail = (
+            "FPL availability flags home/away="
+            f"{availability_flags.get(team_ids[0], 0)}/{availability_flags.get(team_ids[1], 0)}; "
+            "confirmed injury/news review still needed"
+        )
     signals.append(
         {
             "key": "absences",

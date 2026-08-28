@@ -136,6 +136,9 @@ THE_ODDS_API_REGIONS=eu
 THE_ODDS_API_MARKETS=h2h,totals
 THE_ODDS_API_BOOKMAKER=market_avg
 THE_ODDS_API_DAYS_AHEAD=30
+BRUCEBET_AUTO_ODDS_SYNC=1
+BRUCEBET_AUTO_ODDS_WINDOW_HOURS=72
+BRUCEBET_AUTO_ODDS_CHECK_INTERVAL_MINUTES=15
 API_FOOTBALL_KEY=
 FOOTBALL_DATA_TOKEN=
 THESPORTSDB_KEY=123
@@ -257,7 +260,8 @@ python -m brucebet.cli --db brucebet.sqlite import --reset `
 
 `sync-variables` fills the first automated analytics layer:
 
-- FPL player availability/form snapshots into `player_status_snapshots`.
+- FPL player availability/form snapshots into `player_status_snapshots`; these are flags, not confirmed medical reports.
+- football-data.org completed matches into `team_form`; promoted or cup-only gaps fall back to each club's official competition history.
 - ClubElo ratings into `teams.elo_rating`.
 - Venue, rest days, weather window notes, and weather when the match is within the Open-Meteo forecast horizon.
 - Team match factors: lineup confidence, absences impact, fatigue, baseline motivation.
@@ -265,7 +269,7 @@ python -m brucebet.cli --db brucebet.sqlite import --reset `
 
 Telegram has `/sync_variables`, `/sync_results`, and `/dossier <match>`. The bot also runs a quiet background sync every `BRUCEBET_AUTO_SYNC_INTERVAL_HOURS` when `BRUCEBET_AUTO_SYNC=1`, after `BRUCEBET_AUTO_SYNC_FIRST_DELAY_MINUTES` on startup. A separate official-result check runs every `BRUCEBET_RESULT_SYNC_INTERVAL_MINUTES`, closes a fully finished tour, and posts one durable overall table to subscribed chats. Model drafts are frozen only once the relevant tour deadline has arrived; the deadline dispatcher checks this every `BRUCEBET_REMINDER_INTERVAL_MINUTES`. Finished official results are checked without spending Odds API credits.
 
-The background sync does not call The Odds API, so it does not spend odds credits. Use `/sync_odds` manually closer to deadline. `/schedule` subscribes the current chat to persistent reminders; the dispatcher checks due deliveries every `BRUCEBET_REMINDER_INTERVAL_MINUTES` and retries failed sends inside the configured grace window.
+The routine variable sync does not call The Odds API. A separate quiet odds scheduler checks the next round every `BRUCEBET_AUTO_ODDS_CHECK_INTERVAL_MINUTES` and can spend quota only inside `BRUCEBET_AUTO_ODDS_WINDOW_HOURS` before its effective deadline. It refreshes every 12 hours from 72 to 24 hours out, every 6 hours from 24 to 6, every 2 hours from 6 to 2, and every 30 minutes in the final 2 hours. `/sync_odds` remains available for an immediate manual snapshot. `/schedule` subscribes the current chat to persistent reminders; the dispatcher checks due deliveries every `BRUCEBET_REMINDER_INTERVAL_MINUTES` and retries failed sends inside the configured grace window.
 
 ## Preflight And Result Fallback
 
