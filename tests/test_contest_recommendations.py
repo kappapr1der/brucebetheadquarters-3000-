@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import json
 import unittest
 from unittest.mock import patch
 
@@ -120,6 +121,49 @@ class ContestRecommendationTests(unittest.TestCase):
 
         self.assertEqual(batch.market_present_count, 0)
         self.assertTrue(all(item.recommended_score for item in batch.recommendations))
+
+    def test_07a_incomplete_field_cannot_reverse_the_model_and_market_outcome(self) -> None:
+        self.conn.execute(
+            """
+            UPDATE predictions
+            SET score = '0:1'
+            WHERE match_id = (SELECT id FROM matches WHERE position = 1)
+              AND participant_id != (SELECT id FROM participants WHERE name = 'Bruce Wayne')
+            """
+        )
+        self.conn.execute("INSERT INTO participants(name, paid) VALUES ('Late entrant', 0)")
+        self.conn.execute(
+            """
+            INSERT INTO season_participants(season_id, participant_id, paid, active)
+            VALUES(
+                (SELECT id FROM seasons WHERE active = 1),
+                (SELECT id FROM participants WHERE name = 'Late entrant'),
+                0,
+                1
+            )
+            """
+        )
+        self.conn.commit()
+
+        incomplete = self.recompute()
+        first_incomplete = incomplete.recommendations[0]
+        self.assertEqual((first_incomplete.field_prediction_count, first_incomplete.field_expected_count), (3, 5))
+        self.assertEqual(first_incomplete.recommended_outcome, "P1")
+        warnings = json.loads(
+            self.conn.execute(
+                "SELECT readiness_warnings_json FROM contest_recommendations WHERE id = ?",
+                (first_incomplete.id,),
+            ).fetchone()["readiness_warnings_json"]
+        )
+        self.assertIn("field:below_outcome_threshold:3/5", warnings)
+
+        self.conn.execute(
+            "UPDATE season_participants SET active = 0 WHERE participant_id = (SELECT id FROM participants WHERE name = 'Late entrant')"
+        )
+        self.conn.commit()
+        self.make_field_complete()
+        complete = self.recompute()
+        self.assertEqual(complete.recommendations[0].recommended_outcome, "P2")
 
     def test_08_unchanged_inputs_are_idempotent(self) -> None:
         first = self.recompute()

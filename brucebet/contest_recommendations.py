@@ -14,9 +14,10 @@ from .storage import active_season_id
 from .team_display import russian_match_label
 
 
-ALGORITHM_VERSION = "contest-v1"
+ALGORITHM_VERSION = "contest-v2"
 MAX_TELEGRAM_TEXT = 3900
 OUTCOMES = ("P1", "X", "P2")
+MIN_FIELD_COVERAGE_FOR_OUTCOME_USE = 0.75
 
 
 @dataclass(frozen=True)
@@ -215,6 +216,17 @@ def _field_signal(
         "top_score": top_score,
         "top_score_share": top_score_share,
     }
+
+
+def _field_coverage(field: Mapping[str, object]) -> float:
+    try:
+        prediction_count = max(0, int(field.get("prediction_count", 0)))
+        expected_count = max(0, int(field.get("expected_count", 0)))
+    except (TypeError, ValueError):
+        return 0.0
+    if expected_count == 0:
+        return 0.0
+    return min(1.0, prediction_count / expected_count)
 
 
 def _round_field_completeness(
@@ -435,8 +447,10 @@ def recompute_contest_recommendations(
     """Build the auditable contest pick without mutating the independent model.
 
     Model weights are 55%, market 25%, and the eligible competitor field 20%,
-    normalized across present sources. Strategy only adds a documented bounded
-    adjustment; it never changes the stored football assessment.
+    normalized across present sources. The field can affect the recommendation
+    only after at least 75% of eligible competitors have submitted for a match.
+    Strategy only adds a documented bounded adjustment; it never changes the
+    stored football assessment.
     """
 
     generated = now or datetime.now().astimezone()
@@ -503,6 +517,11 @@ def recompute_contest_recommendations(
             season_id=season_id,
             user_participant=user_participant,
         )
+        field_coverage = _field_coverage(field)
+        field_is_decisive = field_coverage >= MIN_FIELD_COVERAGE_FOR_OUTCOME_USE
+        effective_field = field["probabilities"] if field_is_decisive else {}
+        effective_field_top = field["top_outcome"] if field_is_decisive else None
+        effective_field_share = field["top_share"] if field_is_decisive else None
         odds, market = _latest_market(conn, match_id)
         market_top, market_share = _top(market)
         volatility = 0.0
@@ -514,10 +533,10 @@ def recompute_contest_recommendations(
         final_outcome, composite = _weighted_outcome(
             model=model,
             market=market,
-            field=field["probabilities"],
+            field=effective_field,
             strategy_mode=strategy_mode,
-            field_top=field["top_outcome"],
-            field_share=field["top_share"],
+            field_top=effective_field_top,
+            field_share=effective_field_share,
         )
         readiness_item = readiness_by_match.get(match_id)
         readiness_status = str(readiness_item["status"]) if readiness_item else "blocked"
@@ -529,6 +548,10 @@ def recompute_contest_recommendations(
             warnings.append("market:missing")
         if field["prediction_count"] < field["expected_count"]:
             warnings.append(f"field:incomplete:{field['prediction_count']}/{field['expected_count']}")
+        if field["prediction_count"] and not field_is_decisive:
+            warnings.append(
+                f"field:below_outcome_threshold:{field['prediction_count']}/{field['expected_count']}"
+            )
         if not base_score or not final_outcome:
             status = "blocked"
             recommended_score = ""
@@ -538,9 +561,9 @@ def recompute_contest_recommendations(
             recommended_score = _choose_exact_score(
                 final_outcome=final_outcome,
                 base_score=base_score,
-                field_top_score=field["top_score"],
-                field_top_score_share=field["top_score_share"],
-                field_top_outcome=field["top_outcome"],
+                field_top_score=field["top_score"] if field_is_decisive else None,
+                field_top_score_share=field["top_score_share"] if field_is_decisive else None,
+                field_top_outcome=effective_field_top,
                 market_top_outcome=market_top,
                 volatility=volatility,
             )
@@ -578,7 +601,12 @@ def recompute_contest_recommendations(
                 "volatility": volatility,
                 "assessment_updated_at": assessment["updated_at"] if assessment else None,
             },
-            "field": field,
+            "field": {
+                **field,
+                "coverage": round(field_coverage, 4),
+                "minimum_coverage_for_outcome_use": MIN_FIELD_COVERAGE_FOR_OUTCOME_USE,
+                "used_for_outcome": field_is_decisive,
+            },
             "market": {
                 "captured_at": odds["captured_at"] if odds else None,
                 "probabilities": market,
