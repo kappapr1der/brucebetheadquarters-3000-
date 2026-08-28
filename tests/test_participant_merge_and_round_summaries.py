@@ -10,9 +10,11 @@ from brucebet.round_summary_notifications import (
     pending_round_summary_deliveries,
 )
 from brucebet.storage import (
+    active_participant_id,
     connect,
     ensure_participant,
     merge_participants,
+    rename_participant,
     reset_db,
     upsert_match,
     upsert_prediction,
@@ -71,6 +73,18 @@ class ParticipantMergeTests(unittest.TestCase):
         )
 
         self.assertEqual(_registered_participant(self.conn, "Mr Sam"), "Сергей")
+
+    def test_renamed_participant_keeps_alias_for_vk_and_imports(self) -> None:
+        participant_id = ensure_participant(self.conn, "Сергей", paid=1)
+
+        renamed_id = rename_participant(self.conn, "Сергей", "Mr Sam", alias="Сергей")
+        resolved_id = ensure_participant(self.conn, "Сергей", paid=None)
+
+        self.assertEqual((renamed_id, resolved_id), (participant_id, participant_id))
+        self.assertEqual(active_participant_id(self.conn, "Mr Sam"), participant_id)
+        self.assertEqual(active_participant_id(self.conn, "Сергей"), participant_id)
+        self.assertEqual(_registered_participant(self.conn, "Сергей"), "Mr Sam")
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM participants WHERE name = 'Сергей'").fetchone())
 
 
 class RoundSummaryOutboxTests(unittest.TestCase):

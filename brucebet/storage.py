@@ -1430,6 +1430,13 @@ def optional_iso_datetime(raw: str | None) -> str | None:
 
 def ensure_participant(conn: sqlite3.Connection, name: str, paid: int | None = 1) -> int:
     name = name.strip()
+    existing_active_id = active_participant_id(conn, name)
+    if existing_active_id is not None:
+        if paid is not None:
+            conn.execute("UPDATE participants SET paid = ? WHERE id = ?", (paid, existing_active_id))
+        ensure_season_participant(conn, existing_active_id, paid)
+        return existing_active_id
+
     if paid is None:
         conn.execute(
             """
@@ -1451,6 +1458,44 @@ def ensure_participant(conn: sqlite3.Connection, name: str, paid: int | None = 1
     row = conn.execute("SELECT id FROM participants WHERE name = ?", (name,)).fetchone()
     participant_id = int(row["id"])
     ensure_season_participant(conn, participant_id, paid)
+    return participant_id
+
+
+def rename_participant(
+    conn: sqlite3.Connection,
+    current_name: str,
+    new_name: str,
+    *,
+    alias: str | None = None,
+) -> int:
+    """Rename a contestant while retaining an active-season lookup alias."""
+
+    current = current_name.strip()
+    target = new_name.strip()
+    if not current or not target:
+        raise ValueError("Participant names must not be empty")
+
+    source = conn.execute("SELECT id FROM participants WHERE name = ?", (current,)).fetchone()
+    if source is None:
+        raise ValueError(f"Unknown participant: {current}")
+    participant_id = int(source["id"])
+    collision = conn.execute(
+        "SELECT id FROM participants WHERE name = ? AND id != ?",
+        (target, participant_id),
+    ).fetchone()
+    if collision is not None:
+        raise ValueError(f"Participant already exists: {target}")
+
+    conn.execute("UPDATE participants SET name = ? WHERE id = ?", (target, participant_id))
+    if alias is not None:
+        conn.execute(
+            """
+            UPDATE season_participants
+            SET alias = ?
+            WHERE season_id = ? AND participant_id = ?
+            """,
+            (alias.strip() or None, active_season_id(conn), participant_id),
+        )
     return participant_id
 
 
