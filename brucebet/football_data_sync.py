@@ -14,6 +14,7 @@ from .storage import upsert_team_form
 
 FOOTBALL_DATA_BASE_URL = "https://api.football-data.org/v4"
 DEFAULT_COMPETITION = "PL"
+SECONDARY_COMPETITIONS = ("ELC",)
 
 
 class FootballDataError(RuntimeError):
@@ -224,6 +225,7 @@ def sync_recent_team_form(
     competition: str = DEFAULT_COMPETITION,
     form_limit: int = 5,
     lookback_days: int = 400,
+    secondary_competitions: Iterable[str] = SECONDARY_COMPETITIONS,
     timeout: int = 30,
     client: FootballDataClient | None = None,
 ) -> FootballDataFormResult:
@@ -274,8 +276,24 @@ def sync_recent_team_form(
         )
         inserted += fallback_inserted
         matched.update(fallback_matched)
+    for secondary_competition in secondary_competitions:
+        remaining = [team for team in requested_teams if _team_form_count(conn, team) < form_limit]
+        if not remaining:
+            break
+        secondary_matches = source.competition_matches(secondary_competition, date_from, date_to)
+        secondary_inserted, secondary_matched = _insert_recent_rows(
+            conn,
+            secondary_matches,
+            remaining,
+            resolve_team,
+            secondary_competition,
+            form_limit,
+        )
+        inserted += secondary_inserted
+        matched.update(secondary_matched)
+        primary_matches.extend(secondary_matches)
     conn.commit()
-    unmatched = tuple(sorted(team for team in requested_teams if team not in matched))
+    unmatched = tuple(sorted(team for team in requested_teams if _team_form_count(conn, team) < form_limit))
     return FootballDataFormResult(
         matches_seen=len(primary_matches),
         rows_upserted=inserted,

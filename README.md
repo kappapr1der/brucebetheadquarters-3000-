@@ -261,7 +261,7 @@ python -m brucebet.cli --db brucebet.sqlite import --reset `
 `sync-variables` fills the first automated analytics layer:
 
 - FPL player availability/form snapshots into `player_status_snapshots`; these are flags, not confirmed medical reports.
-- football-data.org completed matches into `team_form`; promoted or cup-only gaps fall back to each club's official competition history.
+- football-data.org completed matches into `team_form`; gaps first fall back to each club's official competition history, then to Championship history for recently promoted clubs.
 - ClubElo ratings into `teams.elo_rating`.
 - Venue, rest days, weather window notes, and weather when the match is within the Open-Meteo forecast horizon.
 - Team match factors: lineup confidence, absences impact, fatigue, baseline motivation.

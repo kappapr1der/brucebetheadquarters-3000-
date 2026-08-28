@@ -22,7 +22,8 @@ class FootballDataSyncTest(unittest.TestCase):
         reset_db(conn)
         ensure_team(conn, "Arsenal")
         ensure_team(conn, "Coventry City")
-        aliases = {"arsenal fc": "Arsenal", "coventry city": "Coventry City"}
+        ensure_team(conn, "Hull City")
+        aliases = {"arsenal fc": "Arsenal", "coventry city": "Coventry City", "hull city": "Hull City"}
         test_case = self
 
         class FakeClient:
@@ -31,9 +32,22 @@ class FootballDataSyncTest(unittest.TestCase):
                 return [{"id": 1, "name": "Arsenal FC"}, {"id": 2, "name": "Coventry City"}]
 
             def competition_matches(self, competition, date_from, date_to):
-                test_case.assertEqual(competition, "PL")
+                if competition == "PL":
+                    return [
+                        _match(index, f"2026-08-{10 + index:02d}T15:00:00Z", {"id": 1, "name": "Arsenal FC"}, {"id": 100 + index, "name": f"League Opponent {index}"}, index % 3, 0, "Premier League")
+                        for index in range(1, 6)
+                    ]
+                test_case.assertEqual(competition, "ELC")
                 return [
-                    _match(index, f"2026-08-{10 + index:02d}T15:00:00Z", {"id": 1, "name": "Arsenal FC"}, {"id": 100 + index, "name": f"League Opponent {index}"}, index % 3, 0, "Premier League")
+                    _match(
+                        200 + index,
+                        f"2026-07-{10 + index:02d}T15:00:00Z",
+                        {"id": 300 + index, "name": f"Championship Opponent {index}"},
+                        {"id": 3, "name": "Hull City"},
+                        index % 2,
+                        2,
+                        "Championship",
+                    )
                     for index in range(1, 6)
                 ]
 
@@ -56,15 +70,15 @@ class FootballDataSyncTest(unittest.TestCase):
         result = sync_recent_team_form(
             conn,
             token="test-token",
-            active_teams=["Arsenal", "Coventry City"],
+            active_teams=["Arsenal", "Coventry City", "Hull City"],
             resolve_team=lambda name: aliases.get(name.lower()),
             now=datetime(2026, 8, 28, tzinfo=timezone.utc),
             client=FakeClient(),
         )
 
-        self.assertEqual(result.matches_seen, 5)
-        self.assertEqual(result.rows_upserted, 10)
-        self.assertEqual(result.teams_matched, 2)
+        self.assertEqual(result.matches_seen, 10)
+        self.assertEqual(result.rows_upserted, 15)
+        self.assertEqual(result.teams_matched, 3)
         self.assertEqual(result.fallback_teams, ("Coventry City",))
         self.assertEqual(result.unmatched_teams, ())
         rows = conn.execute(
@@ -75,13 +89,16 @@ class FootballDataSyncTest(unittest.TestCase):
             ORDER BY t.name, tf.match_date
             """
         ).fetchall()
-        self.assertEqual(len(rows), 10)
+        self.assertEqual(len(rows), 15)
         arsenal = [row for row in rows if row["team"] == "Arsenal"]
         coventry = [row for row in rows if row["team"] == "Coventry City"]
+        hull = [row for row in rows if row["team"] == "Hull City"]
         self.assertEqual(len(arsenal), 5)
         self.assertEqual(len(coventry), 5)
+        self.assertEqual(len(hull), 5)
         self.assertTrue(all(row["venue"] == "home" for row in arsenal))
         self.assertTrue(all(row["competition"] == "Championship" for row in coventry))
+        self.assertTrue(all(row["venue"] == "away" for row in hull))
         self.assertTrue(all("football-data.org match=" in row["notes"] for row in rows))
 
 

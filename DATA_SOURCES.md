@@ -82,7 +82,7 @@ Use:
 Current automated layer:
 
 - FPL bootstrap API -> `player_status_snapshots` (availability flags, not a confirmed medical report)
-- football-data.org -> source-tagged `team_form` rows from completed matches; the per-team fallback also covers official cup/European matches when league history is short
+- football-data.org -> source-tagged `team_form` rows from completed matches; the per-team fallback covers official cup/European history, with Championship history for recently promoted clubs
 - ClubElo API -> `teams.elo_rating`
 - Official schedule + stadium map -> `match_contexts`
 - Open-Meteo -> weather only inside the 16-day forecast horizon
