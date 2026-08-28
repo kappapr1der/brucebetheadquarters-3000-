@@ -130,6 +130,8 @@ class VariableSyncTest(unittest.TestCase):
         self.assertEqual(canonical_team_name("Арсенал"), "Arsenal")
         self.assertEqual(canonical_team_name("Брайтон"), "Brighton and Hove Albion")
         self.assertEqual(canonical_team_name("Манчестер Юнайтед"), "Manchester United")
+        self.assertEqual(canonical_team_name("Hull City AFC"), "Hull City")
+        self.assertEqual(canonical_team_name("Sunderland AFC"), "Sunderland")
 
 
 if __name__ == "__main__":

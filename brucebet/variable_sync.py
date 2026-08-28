@@ -195,7 +195,7 @@ def _as_int(value: object) -> int | None:
 
 def _clean_key(value: str) -> str:
     text = value.lower().replace("&", " and ")
-    text = re.sub(r"\bfc\b", " ", text)
+    text = re.sub(r"\b(?:a)?fc\b", " ", text)
     text = re.sub(r"[^a-zа-яё0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
