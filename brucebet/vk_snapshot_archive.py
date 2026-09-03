@@ -56,7 +56,7 @@ def archive_public_topic_capture(out_dir: str | Path, capture: VkPublicTopicCapt
     captured_at = report.captured_at.astimezone().strftime("%Y%m%dT%H%M%S%z")
     archive_path = topic_dir / f"{captured_at}-{fingerprint[:16]}.json"
     document = {
-        "schema_version": 1,
+        "schema_version": 2,
         "captured_at": report.captured_at.isoformat(),
         "content_fingerprint": fingerprint,
         "source": {
@@ -65,6 +65,9 @@ def archive_public_topic_capture(out_dir: str | Path, capture: VkPublicTopicCapt
             "html_chars": capture.html_chars,
             "visible_chars": capture.visible_chars,
             "score_line_count": capture.score_line_count,
+            "pages_fetched": capture.page_count,
+            "capture_complete": capture.capture_complete,
+            "stop_reason": capture.capture_stop_reason,
         },
         "visible_text": capture.visible_text,
         "report": _json_value(report),

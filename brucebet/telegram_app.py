@@ -128,6 +128,7 @@ from .vk_oauth import (
 )
 from .vk_parser import parse_file as parse_vk_file
 from .vk_prediction_import import VkPredictionImportReport, import_vk_prediction_report
+from .vk_capture_state import record_vk_capture_failure, record_vk_capture_state
 from .vk_prediction_notifications import (
     mark_vk_prediction_notification_delivery_failed,
     mark_vk_prediction_notification_delivery_sent,
@@ -210,6 +211,7 @@ class BotSettings:
     vk_topic_discovery_first_delay_seconds: int
     vk_chromium_bin: str
     vk_browser_wait_ms: int
+    vk_topic_max_pages: int
     glm_api_key: str
     glm_base_url: str
     glm_model: str
@@ -317,6 +319,7 @@ def load_settings() -> BotSettings:
         vk_topic_discovery_first_delay_seconds=int(os.getenv("VK_TOPIC_DISCOVERY_FIRST_DELAY_SECONDS", "20")),
         vk_chromium_bin=os.getenv("VK_CHROMIUM_BIN", "chromium").strip() or "chromium",
         vk_browser_wait_ms=int(os.getenv("VK_BROWSER_WAIT_MS", "8000")),
+        vk_topic_max_pages=max(1, int(os.getenv("VK_TOPIC_MAX_PAGES", "80"))),
         glm_api_key=os.getenv("GLM_API_KEY", "").strip(),
         glm_base_url=os.getenv("GLM_BASE_URL", "https://api.z.ai/api/paas/v4").strip() or "https://api.z.ai/api/paas/v4",
         glm_model=os.getenv("GLM_MODEL", "glm-4.7-flash").strip() or "glm-4.7-flash",
@@ -2559,6 +2562,7 @@ def read_vk_topic_worker(
             topic_kind,
             chromium_bin=settings.vk_chromium_bin,
             wait_ms=settings.vk_registration_browser_wait_ms,
+            max_pages=settings.vk_topic_max_pages,
         )
         archive = archive_public_topic_capture(settings.vk_public_snapshot_dir, capture)
         LOGGER.info(
@@ -2653,6 +2657,43 @@ def record_vk_predictions_worker(settings: BotSettings, report: object) -> VkPre
                 enqueue_update=True,
             )
         return result
+    finally:
+        conn.close()
+
+
+def record_vk_predictions_capture_state_worker(settings: BotSettings, report: object) -> tuple[object, bool]:
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        activate_profile(
+            conn,
+            competition_code=settings.competition,
+            season_name=settings.season,
+            season_display_name=settings.season_display,
+            lock_minutes=settings.lock_minutes,
+        )
+        return record_vk_capture_state(
+            conn,
+            report,
+            score_line_count=int(getattr(report, "capture_score_line_count", 0)),
+            notification_chat_ids=settings.allowed_chat_ids,
+        )
+    finally:
+        conn.close()
+
+
+def record_vk_predictions_capture_failure_worker(settings: BotSettings, reason: str) -> tuple[object, bool]:
+    conn = connect(settings.db_path)
+    try:
+        init_db(conn)
+        return record_vk_capture_failure(
+            conn,
+            group_id=settings.vk_group_id,
+            topic_id=settings.vk_predictions_topic_id,
+            topic_kind="predictions",
+            reason=reason,
+            notification_chat_ids=settings.allowed_chat_ids,
+        )
     finally:
         conn.close()
 
@@ -2845,9 +2886,12 @@ def render_vk_snapshot_status(label: str, report: object, archive: VkSnapshotArc
     if getattr(report, "topic_kind", "") == "registration":
         return f"{label}: {stored}; заявок {len(report.registration_entries)}, статус {report.registration_state}."
     full = sum(1 for item in report.forecast_submissions if item.is_full)
+    capture = "полный" if getattr(report, "capture_complete", True) else "НЕПОЛНЫЙ"
     return (
-        f"{label}: {stored}; шаблонов {len(report.templates)}, "
-        f"блоков прогнозов {len(report.forecast_submissions)} (полных {full})."
+        f"{label}: {stored}; захват {capture} "
+        f"(страниц {len(getattr(report, 'capture_page_keys', ()))}, "
+        f"стоп {getattr(report, 'capture_stop_reason', 'unknown')}); "
+        f"шаблонов {len(report.templates)}, блоков прогнозов {len(report.forecast_submissions)} (полных {full})."
     )
 
 
@@ -3035,10 +3079,29 @@ async def vk_predictions_snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> Non
         report, archive = await asyncio.to_thread(read_vk_predictions_worker, settings)
     except VkAccessChallengeError:
         LOGGER.warning("VK predictions snapshot hit an anti-bot challenge")
-        await notify_vk_access_challenge(context, settings)
+        try:
+            _state, warning_created = await asyncio.to_thread(
+                record_vk_predictions_capture_failure_worker,
+                settings,
+                "vk_challenge",
+            )
+            if warning_created:
+                await deliver_pending_vk_prediction_notifications(context, settings)
+        except Exception:  # noqa: BLE001 - preserve the scheduler after a diagnostic failure.
+            LOGGER.exception("VK challenge capture state update failed")
         return
-    except Exception:  # noqa: BLE001 - an unavailable public page must not stop Telegram polling.
+    except Exception as exc:  # noqa: BLE001 - an unavailable public page must not stop Telegram polling.
         LOGGER.exception("VK predictions snapshot failed")
+        try:
+            _state, warning_created = await asyncio.to_thread(
+                record_vk_predictions_capture_failure_worker,
+                settings,
+                "page_error",
+            )
+            if warning_created:
+                await deliver_pending_vk_prediction_notifications(context, settings)
+        except Exception:  # noqa: BLE001 - preserve the scheduler after a diagnostic failure.
+            LOGGER.exception("VK failure capture state update failed: %s", exc)
         return
     LOGGER.info(
         "VK predictions snapshot topic=%s created=%s blocks=%s",
@@ -3046,6 +3109,28 @@ async def vk_predictions_snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> Non
         getattr(archive, "created", False),
         len(report.forecast_submissions),
     )
+    try:
+        capture_state, warning_created = await asyncio.to_thread(
+            record_vk_predictions_capture_state_worker,
+            settings,
+            report,
+        )
+    except Exception:  # noqa: BLE001 - capture diagnostics must not stop the scheduler.
+        LOGGER.exception("VK predictions capture state update failed")
+        return
+    if not capture_state.capture_complete:
+        LOGGER.warning(
+            "VK predictions capture incomplete topic=%s reason=%s pages=%s warning_created=%s",
+            report.topic_id,
+            capture_state.stop_reason,
+            capture_state.pages_fetched,
+            warning_created,
+        )
+        try:
+            await deliver_pending_vk_prediction_notifications(context, settings)
+        except Exception:  # noqa: BLE001 - retain the durable warning for a retry.
+            LOGGER.exception("VK incomplete-capture warning delivery failed")
+        return
     if not settings.vk_predictions_import_enabled:
         return
     try:

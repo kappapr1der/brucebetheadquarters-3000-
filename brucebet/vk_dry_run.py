@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import os
@@ -13,8 +13,11 @@ from .scoring import normalize_score
 from .vk_board import (
     DEFAULT_BROWSER_WAIT_MS,
     DEFAULT_CHROMIUM_BIN,
+    DEFAULT_TOPIC_MAX_PAGES,
     VkBrowserError,
+    VkPublicTopicCaptureResult,
     VkPublicTopicResult,
+    capture_public_topic,
     parse_topic_url,
     probe_public_topic,
 )
@@ -160,6 +163,14 @@ class VkTopicDryRunReport:
     registration_state: RegistrationState
     final_roster_detected: bool
     warnings: tuple[str, ...]
+    capture_complete: bool = True
+    capture_stop_reason: str = "single_page"
+    capture_page_keys: tuple[str, ...] = ()
+    capture_page_fingerprints: tuple[str, ...] = ()
+    capture_warnings: tuple[str, ...] = ()
+    capture_score_line_count: int = 0
+    capture_earliest_submitted_at: datetime | None = None
+    capture_latest_submitted_at: datetime | None = None
 
     @property
     def future_ingestion_allowed(self) -> bool:
@@ -175,6 +186,9 @@ class VkPublicTopicCapture:
     html_chars: int
     visible_chars: int
     score_line_count: int
+    capture_complete: bool = True
+    capture_stop_reason: str = "single_page"
+    page_count: int = 1
 
 
 def _clean_lines(text: str) -> list[str]:
@@ -261,6 +275,81 @@ def parse_comment_blocks(text: str, *, group_id: int, topic_id: int) -> list[VkC
             )
         )
     return comments
+
+
+def _comments_for_public_page(result: VkPublicTopicResult) -> tuple[VkComment, ...]:
+    """Prefer public VK post IDs only when the DOM evidence maps one-to-one."""
+
+    comments = parse_comment_blocks(result.text, group_id=result.group_id, topic_id=result.topic_id)
+    if result.comment_ids and len(result.comment_ids) == len(comments):
+        return tuple(
+            replace(
+                comment,
+                source_key=f"vk-public:{result.group_id}:{result.topic_id}:post:{comment_id}",
+            )
+            for comment, comment_id in zip(comments, result.comment_ids, strict=True)
+        )
+    return tuple(comments)
+
+
+def _comment_payload_key(comment: VkComment) -> str:
+    return sha256(
+        "\n".join((comment.author, comment.submitted_at.isoformat(), *comment.body_lines)).encode("utf-8")
+    ).hexdigest()
+
+
+def _ambiguous_comment(comment: VkComment) -> VkComment:
+    return replace(comment, source_key=f"vk-ambiguous:{comment.source_key}:{_comment_payload_key(comment)[:16]}")
+
+
+def _merge_public_comments(pages: tuple[VkPublicTopicResult, ...]) -> tuple[VkComment, ...]:
+    """Deduplicate overlapping pages at comment identity, never at score-line level."""
+
+    comments: list[VkComment] = []
+    by_key: dict[str, int] = {}
+    for page in pages:
+        for comment in _comments_for_public_page(page):
+            existing_index = by_key.get(comment.source_key)
+            if existing_index is None:
+                by_key[comment.source_key] = len(comments)
+                comments.append(comment)
+                continue
+            existing = comments[existing_index]
+            if _comment_payload_key(existing) == _comment_payload_key(comment):
+                continue
+            # Fallback author+timestamp identity cannot prove which comment is
+            # an edit. Keep both evidence objects quarantinable rather than
+            # inventing a revision from DOM order.
+            if existing.source_key.startswith("vk-public:"):
+                # An immutable post id with divergent contents is a genuine
+                # edit and remains one source item for revision ingestion.
+                comments[existing_index] = comment
+                continue
+            comments[existing_index] = _ambiguous_comment(existing)
+            ambiguous = _ambiguous_comment(comment)
+            by_key[ambiguous.source_key] = len(comments)
+            comments.append(ambiguous)
+    return tuple(comments)
+
+
+def _template_key(template: RoundTemplate) -> tuple[object, ...]:
+    return (
+        template.round_name.strip(),
+        template.deadline_at.isoformat(),
+        tuple((item.position, item.home, item.away) for item in template.matches),
+    )
+
+
+def _merge_templates(pages: tuple[VkPublicTopicResult, ...]) -> tuple[RoundTemplate, ...]:
+    templates: list[RoundTemplate] = []
+    seen: set[tuple[object, ...]] = set()
+    for page in pages:
+        for template in parse_templates(_clean_lines(page.text)):
+            key = _template_key(template)
+            if key not in seen:
+                seen.add(key)
+                templates.append(template)
+    return tuple(templates)
 
 
 def _canonical_label(value: str) -> str:
@@ -411,9 +500,17 @@ def _parse_topic(
     source_text: str,
     topic_kind: TopicKind,
     comments: tuple[VkComment, ...],
+    templates: tuple[RoundTemplate, ...] | None = None,
+    content_fingerprint: str | None = None,
+    capture_complete: bool = True,
+    capture_stop_reason: str = "single_page",
+    capture_page_keys: tuple[str, ...] = (),
+    capture_page_fingerprints: tuple[str, ...] = (),
+    capture_warnings: tuple[str, ...] = (),
+    capture_score_line_count: int = 0,
 ) -> VkTopicDryRunReport:
     lines = _clean_lines(source_text)
-    templates = tuple(parse_templates(lines))
+    templates = templates if templates is not None else tuple(parse_templates(lines))
     warnings: list[str] = []
     forecast_submissions: list[VkForecastSubmission] = []
     registration_entries: list[VkRegistrationEntry] = []
@@ -464,7 +561,7 @@ def _parse_topic(
         topic_id=topic_id,
         url=url,
         captured_at=datetime.now(timezone.utc),
-        content_fingerprint=sha256(source_text.encode("utf-8")).hexdigest(),
+        content_fingerprint=content_fingerprint or sha256(source_text.encode("utf-8")).hexdigest(),
         title=title or _title(lines),
         league_hint=league_hint,
         comments=comments,
@@ -474,6 +571,14 @@ def _parse_topic(
         registration_state=_registration_state(source_text),
         final_roster_detected=bool(FINAL_ROSTER_RE.search(source_text)),
         warnings=tuple(warnings),
+        capture_complete=capture_complete,
+        capture_stop_reason=capture_stop_reason,
+        capture_page_keys=capture_page_keys,
+        capture_page_fingerprints=capture_page_fingerprints,
+        capture_warnings=capture_warnings,
+        capture_score_line_count=capture_score_line_count,
+        capture_earliest_submitted_at=min((item.submitted_at for item in comments), default=None),
+        capture_latest_submitted_at=max((item.submitted_at for item in comments), default=None),
     )
 
 
@@ -487,7 +592,39 @@ def parse_public_topic_result(result: VkPublicTopicResult, topic_kind: TopicKind
         title=_title(_clean_lines(result.text)),
         source_text=result.text,
         topic_kind=topic_kind,
-        comments=tuple(parse_comment_blocks(result.text, group_id=result.group_id, topic_id=result.topic_id)),
+        comments=_comments_for_public_page(result),
+        capture_page_keys=(result.page_key,),
+        capture_page_fingerprints=(sha256(result.text.encode("utf-8")).hexdigest(),),
+        capture_score_line_count=result.score_line_count,
+    )
+
+
+def parse_public_topic_capture_result(
+    result: VkPublicTopicCaptureResult,
+    topic_kind: TopicKind,
+) -> VkTopicDryRunReport:
+    """Interpret a multi-page capture as one deduplicated, auditable topic."""
+
+    source_text = "\n".join(page.text for page in result.pages if page.text)
+    page_fingerprints = result.page_fingerprints
+    capture_fingerprint = sha256("\n".join(sorted(page_fingerprints)).encode("utf-8")).hexdigest()
+    lines = _clean_lines(source_text)
+    return _parse_topic(
+        group_id=result.group_id,
+        topic_id=result.topic_id,
+        url=result.url,
+        title=_title(lines),
+        source_text=source_text,
+        topic_kind=topic_kind,
+        comments=_merge_public_comments(result.pages),
+        templates=_merge_templates(result.pages),
+        content_fingerprint=capture_fingerprint,
+        capture_complete=result.capture_complete,
+        capture_stop_reason=result.stop_reason,
+        capture_page_keys=tuple(page.page_key for page in result.pages),
+        capture_page_fingerprints=page_fingerprints,
+        capture_warnings=result.warnings,
+        capture_score_line_count=result.score_line_count,
     )
 
 
@@ -527,6 +664,7 @@ def read_public_topic_dry_run(
     chromium_bin: str = DEFAULT_CHROMIUM_BIN,
     wait_ms: int = DEFAULT_BROWSER_WAIT_MS,
     timeout: int = 45,
+    max_pages: int = DEFAULT_TOPIC_MAX_PAGES,
 ) -> VkTopicDryRunReport:
     return capture_public_topic_dry_run(
         topic_url,
@@ -534,6 +672,7 @@ def read_public_topic_dry_run(
         chromium_bin=chromium_bin,
         wait_ms=wait_ms,
         timeout=timeout,
+        max_pages=max_pages,
     ).report
 
 
@@ -544,23 +683,28 @@ def capture_public_topic_dry_run(
     chromium_bin: str = DEFAULT_CHROMIUM_BIN,
     wait_ms: int = DEFAULT_BROWSER_WAIT_MS,
     timeout: int = 45,
+    max_pages: int = DEFAULT_TOPIC_MAX_PAGES,
 ) -> VkPublicTopicCapture:
-    """Read a public topic once and retain the exact visible source text."""
+    """Read a public topic through all rendered safe page links and retain visible text."""
 
     group_id, topic_id = parse_topic_url(topic_url)
-    result = probe_public_topic(
+    result = capture_public_topic(
         group_id,
         topic_id,
         chromium_bin=chromium_bin,
         virtual_time_ms=wait_ms,
         timeout=timeout,
+        max_pages=max_pages,
     )
     return VkPublicTopicCapture(
-        report=parse_public_topic_result(result, topic_kind),
+        report=parse_public_topic_capture_result(result, topic_kind),
         visible_text=result.text,
         html_chars=result.html_chars,
         visible_chars=result.visible_chars,
         score_line_count=result.score_line_count,
+        capture_complete=result.capture_complete,
+        capture_stop_reason=result.stop_reason,
+        page_count=len(result.pages),
     )
 
 
@@ -573,6 +717,8 @@ def render_dry_run_report(report: VkTopicDryRunReport, *, limit: int = 60) -> st
         f"league gate: {report.league_hint}",
         f"captured_at: {report.captured_at.isoformat()}",
         f"content_fingerprint: {report.content_fingerprint}",
+        f"capture: {'complete' if report.capture_complete else 'incomplete'}; "
+        f"pages={len(report.capture_page_keys)}; stop={report.capture_stop_reason}",
         f"comments: {len(report.comments)}",
     ]
 
@@ -607,6 +753,9 @@ def render_dry_run_report(report: VkTopicDryRunReport, *, limit: int = 60) -> st
     if report.warnings:
         lines.append("warnings:")
         lines.extend(f"  - {warning}" for warning in report.warnings)
+    if report.capture_warnings:
+        lines.append("capture warnings:")
+        lines.extend(f"  - {warning}" for warning in report.capture_warnings)
     return "\n".join(lines)
 
 
@@ -622,6 +771,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chromium", default=os.getenv("VK_CHROMIUM_BIN", DEFAULT_CHROMIUM_BIN).strip())
     parser.add_argument("--wait-ms", type=int, default=_env_int("VK_BROWSER_WAIT_MS", DEFAULT_BROWSER_WAIT_MS))
     parser.add_argument("--timeout", type=int, default=45)
+    parser.add_argument("--max-pages", type=int, default=_env_int("VK_TOPIC_MAX_PAGES", DEFAULT_TOPIC_MAX_PAGES))
     parser.add_argument("--limit", type=int, default=60)
     return parser
 
@@ -635,6 +785,7 @@ def main(argv: list[str] | None = None) -> int:
             chromium_bin=args.chromium,
             wait_ms=args.wait_ms,
             timeout=args.timeout,
+            max_pages=args.max_pages,
         )
     except (ValueError, VkBrowserError) as exc:
         print(str(exc), file=sys.stderr)

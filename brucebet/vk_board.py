@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass
 from html import unescape
 from html.parser import HTMLParser
+from hashlib import sha256
 import logging
 import os
 from pathlib import Path
@@ -14,11 +15,13 @@ import sys
 import threading
 import time
 from typing import Callable
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 
 DEFAULT_FORECASTERS_GROUP_ID = 217130885
 DEFAULT_CHROMIUM_BIN = "chromium"
 DEFAULT_BROWSER_WAIT_MS = 8000
+DEFAULT_TOPIC_MAX_PAGES = 80
 CHROMIUM_TERMINATE_GRACE_SECONDS = 0.75
 CHROMIUM_KILL_GRACE_SECONDS = 0.75
 VK_CHROMIUM_PROBE_LOCK = threading.Lock()
@@ -39,6 +42,20 @@ PREDICTIONS_TOPIC_RE = re.compile(r"\b(?:прогноз\w*|ставк\w*)\b", re
 ACCESS_CHALLENGE_MARKERS = (
     "Проверяем, что вы не робот",
     "checking that you are not a robot",
+)
+PAGINATION_QUERY_KEYS = frozenset({"offset", "page", "start", "from", "last"})
+PAGINATION_AUXILIARY_QUERY_KEYS = frozenset({"act"})
+PAGINATION_NEXT_MARKERS = ("next", "следующ", "далее", "older", "стар")
+CLIENT_PAGINATION_MARKERS = (
+    "show more posts",
+    "show more comments",
+    "load more",
+    "load_more",
+    "показать ещё",
+    "показать еще",
+    "загрузить ещё",
+    "загрузить еще",
+    "больше комментариев",
 )
 
 
@@ -106,6 +123,92 @@ class _TopicLinkParser(HTMLParser):
 
 
 @dataclass(frozen=True)
+class VkTopicPaginationLink:
+    """A same-topic URL found in rendered navigation, never a guessed VK route."""
+
+    url: str
+    label: str
+    relation: str
+
+    @property
+    def is_next(self) -> bool:
+        return self.relation == "next"
+
+
+class _TopicPaginationParser(HTMLParser):
+    def __init__(self, *, base_url: str, group_id: int, topic_id: int) -> None:
+        super().__init__()
+        self.base_url = base_url
+        self.group_id = int(group_id)
+        self.topic_id = int(topic_id)
+        self.links: list[VkTopicPaginationLink] = []
+        self._current: tuple[str, str, str, list[str]] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a" or self._current is not None:
+            return
+        values = {name.lower(): value or "" for name, value in attrs}
+        candidate = canonical_topic_pagination_url(
+            values.get("href", ""),
+            base_url=self.base_url,
+            group_id=self.group_id,
+            topic_id=self.topic_id,
+        )
+        if candidate is None:
+            return
+        relation = "next" if "next" in values.get("rel", "").casefold().split() else "other"
+        descriptor = " ".join(
+            value
+            for value in (values.get("aria-label", ""), values.get("title", ""), values.get("class", ""))
+            if value
+        )
+        self._current = (candidate, relation, descriptor, [])
+
+    def handle_data(self, data: str) -> None:
+        if self._current is None:
+            return
+        value = " ".join(data.split())
+        if value:
+            self._current[3].append(value)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "a" or self._current is None:
+            return
+        url, relation, descriptor, parts = self._current
+        label = " ".join(parts).strip()
+        hint = f"{label} {descriptor}".casefold()
+        if relation != "next" and any(marker in hint for marker in PAGINATION_NEXT_MARKERS):
+            relation = "next"
+        self.links.append(VkTopicPaginationLink(url=url, label=label, relation=relation))
+        self._current = None
+
+
+class _TopicCommentPermalinkParser(HTMLParser):
+    def __init__(self, *, base_url: str, group_id: int, topic_id: int) -> None:
+        super().__init__()
+        self.base_url = base_url
+        self.group_id = int(group_id)
+        self.topic_id = int(topic_id)
+        self.comment_ids: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        values = {name.lower(): value or "" for name, value in attrs}
+        absolute = urljoin(self.base_url, unescape(values.get("href", "")))
+        try:
+            group_id, topic_id = parse_topic_url(absolute)
+        except ValueError:
+            return
+        if (group_id, topic_id) != (self.group_id, self.topic_id):
+            return
+        query = dict(parse_qsl(urlsplit(absolute).query, keep_blank_values=True))
+        comment_id = query.get("post", "").strip()
+        if comment_id.isdigit():
+            self.comment_ids.append(comment_id)
+
+
+@dataclass(frozen=True)
 class VkPublicTopicResult:
     group_id: int
     topic_id: int
@@ -114,10 +217,47 @@ class VkPublicTopicResult:
     visible_chars: int
     score_line_count: int
     text: str
+    page_key: str = "root"
+    comment_ids: tuple[str, ...] = ()
+    pagination_links: tuple[VkTopicPaginationLink, ...] = ()
+    client_pagination_visible: bool = False
 
     @property
     def lines(self) -> list[str]:
         return [line for line in self.text.splitlines() if line.strip()]
+
+
+@dataclass(frozen=True)
+class VkPublicTopicCaptureResult:
+    """A bounded public-topic traversal with enough evidence to audit completeness."""
+
+    group_id: int
+    topic_id: int
+    url: str
+    pages: tuple[VkPublicTopicResult, ...]
+    capture_complete: bool
+    stop_reason: str
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def html_chars(self) -> int:
+        return sum(page.html_chars for page in self.pages)
+
+    @property
+    def visible_chars(self) -> int:
+        return sum(page.visible_chars for page in self.pages)
+
+    @property
+    def score_line_count(self) -> int:
+        return sum(page.score_line_count for page in self.pages)
+
+    @property
+    def text(self) -> str:
+        return "\n".join(page.text for page in self.pages if page.text)
+
+    @property
+    def page_fingerprints(self) -> tuple[str, ...]:
+        return tuple(sha256(page.text.encode("utf-8")).hexdigest() for page in self.pages)
 
 
 @dataclass(frozen=True)
@@ -152,6 +292,98 @@ def parse_topic_url(url: str) -> tuple[int, int]:
 
 def build_topic_url(group_id: int, topic_id: int) -> str:
     return f"https://vk.ru/topic-{int(group_id)}_{int(topic_id)}"
+
+
+def canonical_topic_pagination_url(
+    href: str,
+    *,
+    base_url: str,
+    group_id: int,
+    topic_id: int,
+) -> str | None:
+    """Accept only rendered, same-topic pagination URLs with a small safe query surface."""
+
+    raw = unescape(href).strip()
+    if not raw:
+        return None
+    absolute = urljoin(base_url, raw)
+    try:
+        parsed_group, parsed_topic = parse_topic_url(absolute)
+    except ValueError:
+        return None
+    if (parsed_group, parsed_topic) != (int(group_id), int(topic_id)):
+        return None
+    split = urlsplit(absolute)
+    pairs = parse_qsl(split.query, keep_blank_values=True)
+    if not pairs:
+        return None
+    query: list[tuple[str, str]] = []
+    has_page_control = False
+    for key, value in pairs:
+        normalized_key = key.casefold()
+        if normalized_key in PAGINATION_QUERY_KEYS:
+            if not value.isdigit() or len(value) > 8:
+                return None
+            query.append((normalized_key, value))
+            has_page_control = True
+            continue
+        if normalized_key in PAGINATION_AUXILIARY_QUERY_KEYS and value.casefold() in {"comments", "topic"}:
+            query.append((normalized_key, value.casefold()))
+            continue
+        return None
+    if not has_page_control:
+        return None
+    canonical_query = urlencode(sorted(set(query)))
+    return urlunsplit(("https", "vk.ru", f"/topic-{int(group_id)}_{int(topic_id)}", canonical_query, ""))
+
+
+def topic_page_key(url: str, *, root_url: str) -> str:
+    if url == root_url:
+        return "root"
+    query = urlsplit(url).query
+    return query or sha256(url.encode("utf-8")).hexdigest()[:12]
+
+
+def extract_topic_pagination_links(
+    html: str,
+    *,
+    base_url: str,
+    group_id: int,
+    topic_id: int,
+) -> tuple[VkTopicPaginationLink, ...]:
+    parser = _TopicPaginationParser(base_url=base_url, group_id=group_id, topic_id=topic_id)
+    parser.feed(html)
+    deduplicated: dict[str, VkTopicPaginationLink] = {}
+    for link in parser.links:
+        existing = deduplicated.get(link.url)
+        if existing is None or (link.is_next and not existing.is_next):
+            deduplicated[link.url] = link
+    return tuple(deduplicated[url] for url in sorted(deduplicated))
+
+
+def extract_topic_comment_ids(
+    html: str,
+    *,
+    base_url: str,
+    group_id: int,
+    topic_id: int,
+) -> tuple[str, ...]:
+    """Return public comment permalinks in DOM order, without storing raw HTML."""
+
+    parser = _TopicCommentPermalinkParser(base_url=base_url, group_id=group_id, topic_id=topic_id)
+    parser.feed(html)
+    unique: list[str] = []
+    seen: set[str] = set()
+    for comment_id in parser.comment_ids:
+        if comment_id not in seen:
+            seen.add(comment_id)
+            unique.append(comment_id)
+    return tuple(unique)
+
+
+def has_client_pagination_marker(html: str) -> bool:
+    compact = html.casefold()
+    return any(marker in compact for marker in CLIENT_PAGINATION_MARKERS)
 
 
 def build_group_topics_urls(group_id: int) -> tuple[str, ...]:
@@ -422,14 +654,16 @@ def probe_public_topic(
     group_id: int,
     topic_id: int,
     *,
+    url: str | None = None,
+    page_key: str | None = None,
     chromium_bin: str = DEFAULT_CHROMIUM_BIN,
     virtual_time_ms: int = DEFAULT_BROWSER_WAIT_MS,
     timeout: int = 45,
     runner: Callable[..., object] | None = None,
 ) -> VkPublicTopicResult:
-    url = build_topic_url(group_id, topic_id)
+    requested_url = url or build_topic_url(group_id, topic_id)
     html = fetch_topic_html(
-        url,
+        requested_url,
         chromium_bin=chromium_bin,
         virtual_time_ms=virtual_time_ms,
         timeout=timeout,
@@ -440,11 +674,186 @@ def probe_public_topic(
     return VkPublicTopicResult(
         group_id=int(group_id),
         topic_id=int(topic_id),
-        url=url,
+        url=requested_url,
         html_chars=len(html),
         visible_chars=len(text),
         score_line_count=score_lines,
         text=text,
+        page_key=page_key or topic_page_key(requested_url, root_url=build_topic_url(group_id, topic_id)),
+        comment_ids=extract_topic_comment_ids(
+            html,
+            base_url=requested_url,
+            group_id=group_id,
+            topic_id=topic_id,
+        ),
+        pagination_links=extract_topic_pagination_links(
+            html,
+            base_url=requested_url,
+            group_id=group_id,
+            topic_id=topic_id,
+        ),
+        client_pagination_visible=has_client_pagination_marker(html),
+    )
+
+
+def capture_public_topic(
+    group_id: int,
+    topic_id: int,
+    *,
+    chromium_bin: str = DEFAULT_CHROMIUM_BIN,
+    virtual_time_ms: int = DEFAULT_BROWSER_WAIT_MS,
+    timeout: int = 45,
+    max_pages: int = DEFAULT_TOPIC_MAX_PAGES,
+    runner: Callable[..., object] | None = None,
+) -> VkPublicTopicCaptureResult:
+    """Fetch every server-rendered same-topic page discovered from prior pages.
+
+    No VK offset, cursor, or page value is manufactured here.  The queue is
+    seeded with the ordinary topic URL, then grows only from safe pagination
+    links present in rendered DOM.  A cap, a repeated page, or a later-page
+    failure produces an explicitly incomplete capture.
+    """
+
+    root_url = build_topic_url(group_id, topic_id)
+    cap = max(1, int(max_pages))
+    pending: list[str] = [root_url]
+    queued: set[str] = {root_url}
+    visited: set[str] = set()
+    fingerprints: dict[str, str] = {}
+    pages: list[VkPublicTopicResult] = []
+    warnings: list[str] = []
+
+    while pending:
+        if len(pages) >= cap:
+            warnings.append(f"pagination limit reached at {cap} page(s)")
+            return VkPublicTopicCaptureResult(
+                group_id=int(group_id),
+                topic_id=int(topic_id),
+                url=root_url,
+                pages=tuple(pages),
+                capture_complete=False,
+                stop_reason="pagination_limit",
+                warnings=tuple(warnings),
+            )
+        requested_url = pending.pop(0)
+        if requested_url in visited:
+            continue
+        try:
+            page = probe_public_topic(
+                group_id,
+                topic_id,
+                url=requested_url,
+                page_key=topic_page_key(requested_url, root_url=root_url),
+                chromium_bin=chromium_bin,
+                virtual_time_ms=virtual_time_ms,
+                timeout=timeout,
+                runner=runner,
+            )
+        except VkAccessChallengeError:
+            if not pages:
+                raise
+            warnings.append("VK anti-bot challenge on a later topic page")
+            return VkPublicTopicCaptureResult(
+                group_id=int(group_id),
+                topic_id=int(topic_id),
+                url=root_url,
+                pages=tuple(pages),
+                capture_complete=False,
+                stop_reason="vk_challenge",
+                warnings=tuple(warnings),
+            )
+        except VkBrowserError as exc:
+            if not pages:
+                raise
+            warnings.append(f"page error: {exc}")
+            return VkPublicTopicCaptureResult(
+                group_id=int(group_id),
+                topic_id=int(topic_id),
+                url=root_url,
+                pages=tuple(pages),
+                capture_complete=False,
+                stop_reason="page_error",
+                warnings=tuple(warnings),
+            )
+
+        visited.add(requested_url)
+        if not page.text.strip():
+            pages.append(page)
+            warnings.append(f"empty visible page: {page.page_key}")
+            return VkPublicTopicCaptureResult(
+                group_id=int(group_id),
+                topic_id=int(topic_id),
+                url=root_url,
+                pages=tuple(pages),
+                capture_complete=False,
+                stop_reason="empty_page",
+                warnings=tuple(warnings),
+            )
+        fingerprint = sha256(page.text.encode("utf-8")).hexdigest()
+        previous_url = fingerprints.get(fingerprint)
+        if previous_url is not None and previous_url != requested_url:
+            warnings.append(f"repeated page fingerprint: {page.page_key}")
+            return VkPublicTopicCaptureResult(
+                group_id=int(group_id),
+                topic_id=int(topic_id),
+                url=root_url,
+                pages=tuple(pages),
+                capture_complete=False,
+                stop_reason="repeated_page_fingerprint",
+                warnings=tuple(warnings),
+            )
+        fingerprints[fingerprint] = requested_url
+        pages.append(page)
+
+        for link in page.pagination_links:
+            if link.url in visited:
+                if link.is_next:
+                    warnings.append(f"next-page cycle detected at {page.page_key}")
+                    return VkPublicTopicCaptureResult(
+                        group_id=int(group_id),
+                        topic_id=int(topic_id),
+                        url=root_url,
+                        pages=tuple(pages),
+                        capture_complete=False,
+                        stop_reason="pagination_cycle",
+                        warnings=tuple(warnings),
+                    )
+                continue
+            if link.url not in queued:
+                pending.append(link.url)
+                queued.add(link.url)
+
+        if not pending and page.client_pagination_visible:
+            warnings.append("client-side load-more control was visible but has no safe server page URL")
+            return VkPublicTopicCaptureResult(
+                group_id=int(group_id),
+                topic_id=int(topic_id),
+                url=root_url,
+                pages=tuple(pages),
+                capture_complete=False,
+                stop_reason="client_pagination_unproven",
+                warnings=tuple(warnings),
+            )
+        if not pending and len(pages) == 1 and len(page.comment_ids) > 1:
+            warnings.append("multiple public comments were visible without proven pagination navigation")
+            return VkPublicTopicCaptureResult(
+                group_id=int(group_id),
+                topic_id=int(topic_id),
+                url=root_url,
+                pages=tuple(pages),
+                capture_complete=False,
+                stop_reason="pagination_unproven",
+                warnings=tuple(warnings),
+            )
+
+    return VkPublicTopicCaptureResult(
+        group_id=int(group_id),
+        topic_id=int(topic_id),
+        url=root_url,
+        pages=tuple(pages),
+        capture_complete=True,
+        stop_reason="pagination_exhausted",
+        warnings=tuple(warnings),
     )
 
 
@@ -523,6 +932,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Virtual time budget for VK JavaScript rendering.",
     )
     parser.add_argument("--timeout", type=int, default=45)
+    parser.add_argument("--max-pages", type=int, default=_env_int("VK_TOPIC_MAX_PAGES", DEFAULT_TOPIC_MAX_PAGES))
     parser.add_argument("--show-lines", type=int, default=120)
     parser.add_argument("--html-out", type=Path)
     parser.add_argument("--text-out", type=Path)
@@ -567,43 +977,37 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        url = build_topic_url(group_id, topic_id)
-        html = fetch_topic_html(
-            url,
+        if args.html_out:
+            print("--html-out is unavailable for multi-page capture; use the sanitized text/report output instead.", file=sys.stderr)
+            return 2
+        capture = capture_public_topic(
+            group_id,
+            topic_id,
             chromium_bin=args.chromium,
             virtual_time_ms=args.wait_ms,
             timeout=args.timeout,
-        )
-        text = extract_visible_text(html)
-        result = VkPublicTopicResult(
-            group_id=int(group_id),
-            topic_id=int(topic_id),
-            url=url,
-            html_chars=len(html),
-            visible_chars=len(text),
-            score_line_count=sum(1 for line in text.splitlines() if SCORE_LINE_RE.fullmatch(line.strip())),
-            text=text,
+            max_pages=args.max_pages,
         )
     except (ValueError, VkBrowserError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
-    if args.html_out:
-        args.html_out.parent.mkdir(parents=True, exist_ok=True)
-        args.html_out.write_text(html, encoding="utf-8")
     if args.text_out:
         args.text_out.parent.mkdir(parents=True, exist_ok=True)
-        args.text_out.write_text(result.text + "\n", encoding="utf-8")
+        args.text_out.write_text(capture.text + "\n", encoding="utf-8")
 
-    print(f"VK group: {result.group_id}")
-    print(f"VK topic: {result.topic_id}")
-    print(f"URL: {result.url}")
-    print(f"HTML chars: {result.html_chars}")
-    print(f"Visible chars: {result.visible_chars}")
-    print(f"Prediction-like score lines: {result.score_line_count}")
-    print(f"Forecasters Club visible: {'yes' if 'Forecasters Club' in result.text else 'no'}")
+    print(f"VK group: {capture.group_id}")
+    print(f"VK topic: {capture.topic_id}")
+    print(f"URL: {capture.url}")
+    print(f"Pages fetched: {len(capture.pages)}")
+    print(f"Capture complete: {'yes' if capture.capture_complete else 'no'}")
+    print(f"Stop reason: {capture.stop_reason}")
+    print(f"HTML chars: {capture.html_chars}")
+    print(f"Visible chars: {capture.visible_chars}")
+    print(f"Prediction-like score lines: {capture.score_line_count}")
+    print(f"Forecasters Club visible: {'yes' if 'Forecasters Club' in capture.text else 'no'}")
 
-    lines = result.lines
+    lines = [line for line in capture.text.splitlines() if line.strip()]
     if args.show_lines > 0 and lines:
         print()
         print("Visible topic text:")

@@ -239,6 +239,23 @@ class VkBoardTests(unittest.TestCase):
         self.assert_pid_exits(int(completed.stdout.strip()))
 
     @unittest.skipUnless(os.name == "posix", "POSIX process groups are used in the production container")
+    def test_nonzero_exit_kills_orphaned_descendants(self) -> None:
+        script = (
+            "import subprocess, sys; "
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True); "
+            "print(child.pid, flush=True); sys.exit(7)"
+        )
+        completed = run_chromium_command(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(completed.returncode, 7)
+        self.assert_pid_exits(int(completed.stdout.strip()))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups are used in the production container")
     def test_timeout_kills_browser_and_descendants(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             child_pid_path = Path(tmp) / "child.pid"

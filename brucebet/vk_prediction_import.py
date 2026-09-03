@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from hashlib import sha256
 import json
@@ -12,6 +12,7 @@ from .variable_sync import resolve_existing_team
 from .vk_dry_run import VkForecastSubmission, VkTopicDryRunReport
 from .vk_parser import MatchTemplate, RoundTemplate
 from .vk_prediction_notifications import enqueue_vk_prediction_notification
+from .analytics import finalize_completed_rounds, round_review
 
 
 class VkPredictionImportError(ValueError):
@@ -40,6 +41,15 @@ class VkPredictionImportReport:
     issues: tuple[VkPredictionImportIssue, ...]
     notification_events_created: int = 0
     accepted_rounds: tuple[str, ...] = ()
+    recovery_mode: bool = False
+    recovered_participants: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VkHistoricalRecoveryResult:
+    round_name: str
+    import_report: VkPredictionImportReport
+    review: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -74,6 +84,12 @@ def stable_vk_comment_key(source_key: str) -> str:
         if value.rsplit(":", 1)[-1].isdigit():
             return value
         raise VkPredictionImportError("VK API comment key has no numeric comment id")
+    if value.startswith("vk-public:"):
+        if re.fullmatch(r"vk-public:\d+:\d+:post:\d+", value):
+            return value
+        raise VkPredictionImportError("public VK comment key has no numeric post id")
+    if value.startswith("vk-ambiguous:"):
+        raise VkPredictionImportError("ambiguous public VK comment identity")
     if value.startswith("vk:"):
         # Chromium captures include an ordinal only when presentation order is
         # needed to disambiguate otherwise identical rendered comments. A
@@ -207,6 +223,39 @@ def _queue_notification(
     )
 
 
+def _queue_recovery_summary(
+    conn: sqlite3.Connection,
+    *,
+    report: VkTopicDryRunReport,
+    rounds: set[str],
+    participants: set[str],
+    accepted: int,
+    rejected: int,
+    quarantined: int,
+    chat_ids: tuple[int, ...],
+) -> bool:
+    round_name = ", ".join(sorted(rounds)) or "unknown"
+    return enqueue_vk_prediction_notification(
+        conn,
+        kind="recovery_summary",
+        group_id=report.group_id,
+        topic_id=report.topic_id,
+        source_key=f"recovery:{round_name}",
+        content_fingerprint=report.content_fingerprint,
+        participant_name="VK recovery",
+        vk_author="Forecasters Club",
+        round_name=round_name,
+        payload={
+            "participants": len(participants),
+            "accepted": accepted,
+            "rejected": rejected,
+            "quarantined": quarantined,
+        },
+        chat_ids=chat_ids,
+        created_at=report.captured_at.isoformat(),
+    )
+
+
 def _registered_participant(conn: sqlite3.Connection, value: str) -> str | None:
     rows = list(
         conn.execute(
@@ -283,6 +332,19 @@ def _template_by_round(report: VkTopicDryRunReport) -> dict[str, RoundTemplate]:
     return templates
 
 
+def filter_vk_report_to_round(report: VkTopicDryRunReport, round_name: str) -> VkTopicDryRunReport:
+    """Keep an explicit historical recovery bounded to one auditable contest round."""
+
+    target = round_name.strip()
+    if not target:
+        raise VkPredictionImportError("historical recovery requires a round name")
+    templates = tuple(item for item in report.templates if item.round_name.strip() == target)
+    submissions = tuple(item for item in report.forecast_submissions if item.round_name.strip() == target)
+    if not templates:
+        raise VkPredictionImportError(f"VK capture has no template for round {target}")
+    return replace(report, templates=templates, forecast_submissions=submissions)
+
+
 def _map_template(conn: sqlite3.Connection, template: RoundTemplate) -> dict[int, _MappedMatch]:
     rows = list(
         conn.execute(
@@ -347,6 +409,7 @@ def import_vk_prediction_report(
     expected_topic_id: int,
     lock_minutes: int = 90,
     notification_chat_ids: tuple[int, ...] | list[int] | set[int] = (),
+    recovery_mode: bool = False,
 ) -> VkPredictionImportReport:
     """Project one read-only VK capture into SQLite through immutable revisions.
 
@@ -363,8 +426,13 @@ def import_vk_prediction_report(
         raise VkPredictionImportError("VK capture does not match the configured group/topic")
     if report.league_hint != "epl" or not report.future_ingestion_allowed:
         raise VkPredictionImportError(f"VK predictions topic failed EPL gate: {report.league_hint}")
+    if not report.capture_complete:
+        raise VkPredictionImportError(
+            f"VK capture is incomplete: {report.capture_stop_reason or 'unknown'}; field was not imported"
+        )
     observed_at = _aware(report.captured_at, "captured_at")
     notification_recipients = tuple(sorted({int(chat_id) for chat_id in notification_chat_ids}))
+    ordinary_notification_recipients = () if recovery_mode else notification_recipients
     templates = _template_by_round(report)
 
     referenced_rounds = {item.round_name.strip() for item in report.forecast_submissions}
@@ -411,6 +479,7 @@ def import_vk_prediction_report(
     quarantined = 0
     notification_events_created = 0
     accepted_rounds: set[str] = set()
+    recovered_participants: set[str] = set()
     issues: list[VkPredictionImportIssue] = []
     forecasts_seen = sum(len(item.forecasts) for item in report.forecast_submissions)
 
@@ -427,7 +496,7 @@ def import_vk_prediction_report(
                     stable_comment_key=stable_comment,
                     content_fingerprint=_payload_fingerprint(_submission_payload(submission, stable_comment)),
                     payload={"reason": reason},
-                    chat_ids=notification_recipients,
+                    chat_ids=ordinary_notification_recipients,
                 ):
                     notification_events_created += 1
             issues.append(
@@ -452,7 +521,7 @@ def import_vk_prediction_report(
                         stable_comment_key=stable_comment,
                         content_fingerprint=_payload_key,
                         payload={"reason": reason},
-                        chat_ids=notification_recipients,
+                        chat_ids=ordinary_notification_recipients,
                     ):
                         notification_events_created += 1
                 issues.append(VkPredictionImportIssue(submission.source_key, submission.participant, round_name, reason))
@@ -480,7 +549,7 @@ def import_vk_prediction_report(
                         stable_comment_key=stable_comment,
                         content_fingerprint=_payload_key,
                         payload={"reason": reason},
-                        chat_ids=notification_recipients,
+                        chat_ids=ordinary_notification_recipients,
                     ):
                         notification_events_created += 1
                 issues.append(VkPredictionImportIssue(submission.source_key, submission.participant, round_name, reason))
@@ -499,7 +568,7 @@ def import_vk_prediction_report(
                         stable_comment_key=stable_comment,
                         content_fingerprint=_payload_key,
                         payload={"reason": reason},
-                        chat_ids=notification_recipients,
+                        chat_ids=ordinary_notification_recipients,
                     ):
                         notification_events_created += 1
                 issues.append(VkPredictionImportIssue(submission.source_key, submission.participant, round_name, reason))
@@ -563,6 +632,9 @@ def import_vk_prediction_report(
             ]
             if accepted_details:
                 accepted_rounds.add(round_name)
+                recovered_participants.add(participant)
+                if recovery_mode:
+                    continue
                 is_edit = any(item["previous_revision_id"] is not None for item in accepted_details)
                 if is_edit:
                     kind = "edit"
@@ -592,7 +664,7 @@ def import_vk_prediction_report(
                     stable_comment_key=stable_comment,
                     content_fingerprint=_payload_key,
                     payload=payload,
-                    chat_ids=notification_recipients,
+                    chat_ids=ordinary_notification_recipients,
                 ):
                     notification_events_created += 1
             if rejected_details and not any(
@@ -612,7 +684,7 @@ def import_vk_prediction_report(
                         "reason": "late_edit" if has_late_edit else str(rejected_details[0]["reason"]),
                         "changes": _notification_changes(rejected_details),
                     },
-                    chat_ids=notification_recipients,
+                    chat_ids=ordinary_notification_recipients,
                 ):
                     notification_events_created += 1
             if quarantined_details:
@@ -624,10 +696,21 @@ def import_vk_prediction_report(
                     stable_comment_key=stable_comment,
                     content_fingerprint=_payload_key,
                     payload={"reason": str(quarantined_details[0]["reason"])},
-                    chat_ids=notification_recipients,
+                    chat_ids=ordinary_notification_recipients,
                 ):
                     notification_events_created += 1
 
+        if recovery_mode and revisions_created and _queue_recovery_summary(
+            conn,
+            report=report,
+            rounds=accepted_rounds,
+            participants=recovered_participants,
+            accepted=accepted,
+            rejected=rejected,
+            quarantined=quarantined,
+            chat_ids=notification_recipients,
+        ):
+            notification_events_created += 1
         conn.execute("RELEASE SAVEPOINT vk_prediction_import")
         conn.commit()
     except Exception:
@@ -648,4 +731,41 @@ def import_vk_prediction_report(
         issues=tuple(issues),
         notification_events_created=notification_events_created,
         accepted_rounds=tuple(sorted(accepted_rounds)),
+        recovery_mode=recovery_mode,
+        recovered_participants=tuple(sorted(recovered_participants, key=str.casefold)),
+    )
+
+
+def recover_vk_round(
+    conn: sqlite3.Connection,
+    report: VkTopicDryRunReport,
+    *,
+    round_name: str,
+    expected_group_id: int,
+    expected_topic_id: int,
+    lock_minutes: int = 90,
+    notification_chat_ids: tuple[int, ...] | list[int] | set[int] = (),
+) -> VkHistoricalRecoveryResult:
+    """Backfill one completed round without recomputing frozen BruceBet picks.
+
+    Prediction revisions and projection scoring are corrected from original VK
+    timestamps.  Round reviews are refreshed, while contest recommendations
+    remain intentionally untouched as historical audit evidence.
+    """
+
+    scoped = filter_vk_report_to_round(report, round_name)
+    imported = import_vk_prediction_report(
+        conn,
+        scoped,
+        expected_group_id=expected_group_id,
+        expected_topic_id=expected_topic_id,
+        lock_minutes=lock_minutes,
+        notification_chat_ids=notification_chat_ids,
+        recovery_mode=True,
+    )
+    finalize_completed_rounds(conn, lock_minutes=lock_minutes)
+    return VkHistoricalRecoveryResult(
+        round_name=round_name.strip(),
+        import_report=imported,
+        review=round_review(conn, round_name.strip(), lock_minutes=lock_minutes),
     )

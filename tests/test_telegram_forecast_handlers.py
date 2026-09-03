@@ -194,6 +194,7 @@ class TelegramForecastHandlerTests(unittest.IsolatedAsyncioTestCase):
             quarantined=0,
             issues=(),
         )
+        capture_state = SimpleNamespace(capture_complete=True, stop_reason="complete", pages_fetched=1)
         disabled_context = SimpleNamespace(
             application=SimpleNamespace(bot_data={"settings": self.settings}),
         )
@@ -204,6 +205,10 @@ class TelegramForecastHandlerTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch("brucebet.telegram_app.read_vk_predictions_worker", return_value=(report, archive)),
+            patch(
+                "brucebet.telegram_app.record_vk_predictions_capture_state_worker",
+                return_value=(capture_state, False),
+            ) as record_capture,
             patch("brucebet.telegram_app.record_vk_predictions_worker", return_value=imported) as record,
             patch("brucebet.telegram_app.deliver_pending_vk_prediction_notifications") as deliver,
         ):
@@ -211,6 +216,7 @@ class TelegramForecastHandlerTests(unittest.IsolatedAsyncioTestCase):
             record.assert_not_called()
             deliver.assert_not_called()
             await vk_predictions_snapshot_job(enabled_context)
+            self.assertEqual(record_capture.call_count, 2)
             record.assert_called_once_with(enabled_context.application.bot_data["settings"], report)
             deliver.assert_awaited_once_with(enabled_context, enabled_context.application.bot_data["settings"])
 

@@ -269,6 +269,22 @@ def render_vk_prediction_notification(delivery: VkPredictionNotificationDelivery
             "Текущий прогноз не изменён.",
             f"Причина: {payload.get('reason', 'late_submission')}",
         ]
+    elif delivery.kind == "recovery_summary":
+        lines = [
+            f"🛠 Восстановлен импорт VK — {round_label}",
+            f"Найдено пропущенных участников: {int(payload.get('participants', 0))}",
+            f"Добавлено прогнозов: {int(payload.get('accepted', 0))}",
+            f"Поздних/отклонённых: {int(payload.get('rejected', 0))}",
+            f"На проверке: {int(payload.get('quarantined', 0))}",
+            "Итоги тура пересчитаны.",
+        ]
+    elif delivery.kind == "field_incomplete":
+        lines = [
+            "⚠️ VK-поле загружено не полностью",
+            round_label,
+            f"Причина: {payload.get('reason', 'unknown')}",
+            f"Последний полный снимок: {payload.get('last_complete_at', 'нет данных')}",
+        ]
     else:
         lines = [
             "⚠️ Прогноз отправлен на проверку",

@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from brucebet.analytics import match_rows_for_round
+from brucebet.vk_capture_state import record_vk_capture_failure
 from brucebet.contest_recommendations import (
     due_final_contest_rounds,
     mark_contest_recommendation_delivery_failed,
@@ -94,6 +95,25 @@ class ContestRecommendationTests(unittest.TestCase):
 
         self.assertEqual((batch.field_complete_count, batch.field_expected_count), (3, 3))
         self.assertTrue(all(item.status == "ready" for item in batch.recommendations))
+
+    def test_04a_incomplete_vk_capture_keeps_field_provisional_and_blocks_final_freeze(self) -> None:
+        self.make_field_complete()
+        record_vk_capture_failure(
+            self.conn,
+            group_id=217130885,
+            topic_id=67251746,
+            topic_kind="predictions",
+            reason="pagination_limit",
+        )
+
+        with patch("brucebet.contest_recommendations.intelligence_readiness", return_value=self.ready_intelligence()):
+            batch = self.recompute()
+
+        self.assertTrue(all(item.status == "provisional" for item in batch.recommendations))
+        warnings = [row[0] for row in self.conn.execute("SELECT readiness_warnings_json FROM contest_recommendations")]
+        self.assertTrue(all("vk_capture:pagination_limit" in item for item in warnings))
+        with self.assertRaisesRegex(ValueError, "VK field is incomplete"):
+            self.recompute(finalize=True)
 
     def test_05_missing_base_assessment_blocks_only_that_match(self) -> None:
         first_match = self.conn.execute("SELECT id FROM matches WHERE position = 1").fetchone()[0]

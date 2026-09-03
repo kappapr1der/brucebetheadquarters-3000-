@@ -19,6 +19,7 @@ from .analytics import (
 from .scoring import normalize_score, parse_datetime, parse_score
 from .storage import active_season_id
 from .team_display import russian_match_label
+from .vk_capture_state import capture_gate_for_round
 
 
 ALGORITHM_VERSION = "contest-v3"
@@ -518,6 +519,9 @@ def recompute_contest_recommendations(
         season_id=season_id,
         user_participant=user_participant,
     )
+    capture_gate = capture_gate_for_round(conn, resolved_round_name)
+    if finalize and capture_gate:
+        raise ValueError(f"Cannot freeze contest recommendation while VK field is incomplete: {capture_gate}")
     reliability = participant_reliability(conn, lock_minutes=lock_minutes)
     frozen_final = bool(finalize or _round_has_final_snapshot(conn, round_id))
     changed: list[tuple[ContestRecommendation | None, ContestRecommendation]] = []
@@ -578,6 +582,8 @@ def recompute_contest_recommendations(
             warnings.append(
                 f"field:below_outcome_threshold:{field['prediction_count']}/{field['expected_count']}"
             )
+        if capture_gate:
+            warnings.append(capture_gate)
         if not base_score or not final_outcome:
             status = "blocked"
             recommended_score = ""
@@ -596,7 +602,7 @@ def recompute_contest_recommendations(
             recommended_outcome = final_outcome
             if readiness_status == "blocked":
                 status = "blocked"
-            elif readiness_status != "ready" or field_complete_count < field_expected_count:
+            elif capture_gate or readiness_status != "ready" or field_complete_count < field_expected_count:
                 status = "provisional"
             elif frozen_final:
                 status = "final"
@@ -633,6 +639,7 @@ def recompute_contest_recommendations(
                 "minimum_coverage_for_outcome_use": MIN_FIELD_COVERAGE_FOR_OUTCOME_USE,
                 "used_for_outcome": field_is_decisive,
             },
+            "vk_capture": {"gate": capture_gate or "complete"},
             "market": {
                 "captured_at": odds["captured_at"] if odds else None,
                 "probabilities": market,

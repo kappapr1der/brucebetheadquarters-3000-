@@ -601,6 +601,29 @@ def active_season_snapshot_tables(season_id: int) -> Iterable[SnapshotTable]:
         (season_id,),
     )
     yield SnapshotTable(
+        "vk_capture_state.csv",
+        """
+        SELECT
+            group_id,
+            topic_id,
+            topic_kind,
+            last_captured_at,
+            capture_complete,
+            stop_reason,
+            pages_fetched,
+            submissions_seen,
+            score_line_count,
+            round_names_json,
+            earliest_submitted_at,
+            latest_submitted_at,
+            last_complete_at,
+            last_complete_fingerprint,
+            warnings_json
+        FROM vk_topic_capture_state
+        ORDER BY topic_kind, group_id, topic_id
+        """,
+    )
+    yield SnapshotTable(
         "manual_result_overrides.csv",
         """
         SELECT

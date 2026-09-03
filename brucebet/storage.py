@@ -532,6 +532,26 @@ CREATE TABLE IF NOT EXISTS vk_prediction_notification_deliveries (
     PRIMARY KEY(event_key, chat_id)
 );
 
+CREATE TABLE IF NOT EXISTS vk_topic_capture_state (
+    group_id INTEGER NOT NULL,
+    topic_id INTEGER NOT NULL,
+    topic_kind TEXT NOT NULL,
+    last_captured_at TEXT NOT NULL,
+    capture_complete INTEGER NOT NULL,
+    stop_reason TEXT NOT NULL,
+    pages_fetched INTEGER NOT NULL,
+    submissions_seen INTEGER NOT NULL,
+    score_line_count INTEGER NOT NULL,
+    round_names_json TEXT NOT NULL,
+    earliest_submitted_at TEXT,
+    latest_submitted_at TEXT,
+    warnings_json TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL,
+    last_complete_at TEXT,
+    last_complete_fingerprint TEXT,
+    PRIMARY KEY(group_id, topic_id, topic_kind)
+);
+
 CREATE TABLE IF NOT EXISTS contest_recommendations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     season_id INTEGER NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
@@ -661,6 +681,7 @@ def reset_db(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS contest_recommendations;
         DROP TABLE IF EXISTS vk_prediction_notification_deliveries;
         DROP TABLE IF EXISTS vk_prediction_notifications;
+        DROP TABLE IF EXISTS vk_topic_capture_state;
         DROP TABLE IF EXISTS vk_prediction_quarantine;
         DROP TABLE IF EXISTS model_forecast_legacy_audit;
         DROP TABLE IF EXISTS model_forecasts;
