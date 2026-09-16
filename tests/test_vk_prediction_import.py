@@ -119,12 +119,28 @@ class VkPredictionImportTests(unittest.TestCase):
         report = make_report()
 
         first = self.import_report(report)
+        self.conn.commit()
+        before_dump = tuple(self.conn.iterdump())
+        before_total_changes = self.conn.total_changes
+        statements: list[str] = []
+        self.conn.set_trace_callback(statements.append)
         repeated = self.import_report(report)
+        self.conn.set_trace_callback(None)
 
         self.assertEqual((first.revisions_created, first.accepted, first.duplicates), (10, 10, 0))
         self.assertEqual((repeated.revisions_created, repeated.accepted, repeated.duplicates), (0, 0, 10))
         self.assertEqual(first.accepted_rounds, ("1",))
         self.assertEqual(repeated.accepted_rounds, ())
+        self.assertEqual(self.conn.total_changes - before_total_changes, 0)
+        self.assertEqual(
+            [
+                statement
+                for statement in statements
+                if statement.lstrip().upper().startswith(("INSERT ", "UPDATE ", "DELETE ", "REPLACE "))
+            ],
+            [],
+        )
+        self.assertEqual(tuple(self.conn.iterdump()), before_dump)
         arsenal = self.conn.execute(
             """
             SELECT m.position, pr.score
@@ -247,6 +263,21 @@ class VkPredictionImportTests(unittest.TestCase):
             "SELECT status, sent_at FROM vk_prediction_notification_deliveries"
         ).fetchone()
         self.assertEqual((sent["status"], sent["sent_at"]), ("sent", "2030-08-10T13:01:00+03:00"))
+
+    def test_recipient_free_historical_event_never_gains_delivery_on_replay(self) -> None:
+        ensure_participant(self.conn, "Сергей", paid=1)
+        report = make_report()
+
+        imported = self.import_report(report, notification_chat_ids=())
+        replayed = self.import_report(report, notification_chat_ids=(42,))
+
+        self.assertEqual((imported.notification_events_created, replayed.notification_events_created), (1, 0))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM vk_prediction_notifications").fetchone()[0], 1)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM vk_prediction_notification_deliveries").fetchone()[0],
+            0,
+        )
+        self.assertEqual(pending_vk_prediction_notification_deliveries(self.conn, (42,)), [])
 
     def test_one_and_many_match_edits_each_enqueue_one_grouped_event(self) -> None:
         ensure_participant(self.conn, "Сергей", paid=1)

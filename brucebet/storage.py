@@ -1405,20 +1405,27 @@ def ensure_season_participant(
 ) -> None:
     season_id = active_season_id(conn)
     existing = conn.execute(
-        "SELECT paid FROM season_participants WHERE season_id = ? AND participant_id = ?",
+        "SELECT paid, active FROM season_participants WHERE season_id = ? AND participant_id = ?",
         (season_id, participant_id),
     ).fetchone()
     paid_value = paid if paid is not None else (int(existing["paid"]) if existing else 1)
-    conn.execute(
-        """
-        INSERT INTO season_participants(season_id, participant_id, paid, active)
-        VALUES(?, ?, ?, ?)
-        ON CONFLICT(season_id, participant_id) DO UPDATE SET
-            paid = excluded.paid,
-            active = excluded.active
-        """,
-        (season_id, participant_id, paid_value, active),
-    )
+    if existing is None:
+        conn.execute(
+            """
+            INSERT INTO season_participants(season_id, participant_id, paid, active)
+            VALUES(?, ?, ?, ?)
+            """,
+            (season_id, participant_id, paid_value, active),
+        )
+    elif (int(existing["paid"]), int(existing["active"])) != (paid_value, active):
+        conn.execute(
+            """
+            UPDATE season_participants
+            SET paid = ?, active = ?
+            WHERE season_id = ? AND participant_id = ?
+            """,
+            (paid_value, active, season_id, participant_id),
+        )
 
 
 def truthy(raw: str | None) -> int:
@@ -1648,32 +1655,31 @@ def ensure_round(conn: sqlite3.Connection, name: str, deadline_at: str | None = 
     order = round_sort_order(conn, name, season_id)
     deadline = optional_iso_datetime(deadline_at)
     row = conn.execute(
-        "SELECT id FROM rounds WHERE season_id = ? AND name = ?",
+        "SELECT id, sort_order, deadline_at FROM rounds WHERE season_id = ? AND name = ?",
         (season_id, name),
     ).fetchone()
     if row is None:
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO rounds(season_id, name, sort_order, deadline_at)
             VALUES(?, ?, ?, ?)
             """,
             (season_id, name, order, deadline),
         )
+        return int(cursor.lastrowid)
     else:
         round_id = int(row["id"])
-        conn.execute(
-            """
-            UPDATE rounds
-            SET sort_order = ?, deadline_at = COALESCE(?, deadline_at), season_id = ?
-            WHERE id = ?
-            """,
-            (order, deadline, season_id, round_id),
-        )
-    row = conn.execute(
-        "SELECT id FROM rounds WHERE season_id = ? AND name = ?",
-        (season_id, name),
-    ).fetchone()
-    return int(row["id"])
+        effective_deadline = deadline if deadline is not None else row["deadline_at"]
+        if (int(row["sort_order"]), row["deadline_at"]) != (order, effective_deadline):
+            conn.execute(
+                """
+                UPDATE rounds
+                SET sort_order = ?, deadline_at = ?
+                WHERE id = ?
+                """,
+                (order, effective_deadline, round_id),
+            )
+        return round_id
 
 
 def get_match_id(conn: sqlite3.Connection, round_name: str, position: int) -> int:
