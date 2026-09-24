@@ -1,8 +1,8 @@
 # VK operational source of truth
 
 This directory mirrors the installed, non-secret VK Browser Node and production
-pull/pipeline code as observed on 2026-09-24. The files were copied byte for
-byte; no production, Browser Node, timers, or GitHub state was changed while
+pull/pipeline code as observed on 2026-09-24. The 22 deployed files below were
+copied byte for byte; no server, timer, or GitHub state was changed while
 preparing this local branch. Git `main` at
 `27b9573ee8e499e0ec2699e2cfde94b7e10cb1ba` had none of these `ops/vk`
 files. The application code and `VK_PIPELINE_SCHEDULER_DESIGN.md` already
@@ -48,6 +48,18 @@ the installation runbook, not from the Git checkout alone.
 | Production | `/etc/systemd/system/brucebet-vk-pipeline.service` | `systemd/production/brucebet-vk-pipeline.service` | `f0491c45c1dfc79b8cd1f68071d4e2f66ac5311559c1370fb8d74434b2b9f374` |
 | Production | `/etc/systemd/system/brucebet-vk-pipeline.timer` | `systemd/production/brucebet-vk-pipeline.timer` | `5fcf97694d38a66852a1ab4aa9c98156145d8bc47b93483712acdad02b3709f9` |
 
+## Local candidate, not installed
+
+| Target host | Proposed path | Repository file | SHA-256 |
+| --- | --- | --- | --- |
+| Browser Node | `/etc/systemd/system/brucebet-vk-reader.timer` | `systemd/browser-node/brucebet-vk-reader.timer` | `a342ccfc068c1f11a8ee61b6476e2bf54260544601f0082f12fddeea208aeaaa` |
+
+This timer is a local source candidate only. It has not been installed,
+enabled, or started on the Browser Node. Its calendar is `:00/:20/:40` with a
+stable host-specific delay of at most 120 seconds. The existing service's
+flock, resource guard, completeness checks, cleanup, and retention remain
+unchanged.
+
 ## Recovery and enablement boundary
 
 1. Restore non-secret files only after checksum review and a separate change
@@ -64,8 +76,9 @@ the installation runbook, not from the Git checkout alone.
    Telegram messages. Neither timer enablement nor live import is authorized
    by this repository snapshot.
 4. The 2026-09-24 cutover proved 71 complete source records, 53 known forecast
-   posts and 13 new Round 5 posts (`3623`-`3635`). Those 13 are not imported.
-   Import approval and then observation-mode timer approval are separate gates.
+   posts and 13 Round 5 posts (`3623`-`3635`). R5 was later recovered through
+   a separately approved one-time historical recovery. Timer installation and
+   observation-mode enablement still require separate approval.
 
 `tests/test_vk_operational_contract.py` covers the source contracts without
 shipping real VK comment bodies. The existing storage no-op regression remains

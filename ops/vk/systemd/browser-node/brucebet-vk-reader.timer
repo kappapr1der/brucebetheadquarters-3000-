@@ -1,0 +1,13 @@
+[Unit]
+Description=Schedule BruceBet VK Browser Node sanitized captures
+
+[Timer]
+OnCalendar=*-*-* *:00,20,40:00
+AccuracySec=1s
+RandomizedDelaySec=120s
+FixedRandomDelay=yes
+Persistent=false
+Unit=brucebet-vk-reader.service
+
+[Install]
+WantedBy=timers.target

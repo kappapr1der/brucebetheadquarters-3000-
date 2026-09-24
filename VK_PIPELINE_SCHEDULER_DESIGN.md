@@ -1,8 +1,9 @@
 # VK Pipeline Scheduler Design
 
 Status: operational design and installed-unit reference. As of 2026-09-24, the
-Timeweb Browser Node reader is manually triggered; production pull/pipeline
-services are installed, but both timers are disabled/inactive. The pipeline
+Timeweb Browser Node reader is manually triggered; a reader timer candidate is
+in the local source tree but not installed. Production pull/pipeline services
+are installed, but both timers are disabled/inactive. The pipeline
 unit pins `BRUCEBET_VK_PIPELINE_ALLOW_IMPORT=0`. This document does not enable
 timers, live import, or Telegram delivery. See `ops/vk/README.md` for the
 byte-identical installed sources and deployment boundaries.
@@ -23,16 +24,27 @@ Policy:
 
 | Stage | Frequency | Lock | Timeout | Retry | Fail-closed rules | Retention |
 | --- | --- | --- | --- | --- | --- | --- |
-| Timeweb Browser Node capture | Manual only; no reader timer installed | One host `flock`; never run parallel Chrome | Reader service timeout 240 seconds | No retry in one run | Challenge, incomplete pagination, count mismatch, or cleanup failure cannot publish `latest-complete` | Reader retention drop-in prunes only eligible runs |
-| Timeweb SSH pull | Installed timer at `*:07,27,47`, currently disabled | One pull `flock` | Service timeout 90 seconds | No in-run retry | Host-key, schema, SHA-256, fingerprint, topic, completeness, duplicate-ID, or freshness failure cannot replace inbox latest | Pull retention keeps 30 accepted runs and protects latest |
+| Timeweb Browser Node capture | Local timer candidate at `:00,20,40` plus fixed 0-120s delay; not installed or enabled | One host `flock`; never run parallel Chrome | Reader start timeout 240 seconds, stop timeout 20 seconds | No retry in one run | Challenge, incomplete pagination, count mismatch, or cleanup failure cannot publish `latest-complete` | Reader retention drop-in prunes only eligible runs |
+| Timeweb SSH pull | Installed timer at `*:07,27,47`, currently disabled | One pull `flock` | Pull start timeout 60 seconds, stop timeout 10 seconds | No in-run retry | Host-key, schema, SHA-256, fingerprint, topic, completeness, duplicate-ID, or freshness failure cannot replace inbox latest | Pull retention keeps 30 accepted runs and protects latest |
 | Inbox validation | Installed timer at `*:09,29,49`, currently disabled | Pipeline lock; production DB backup copy | Service timeout 240 seconds | No automatic retry for content errors | Unknown participant, changed canonical post, quarantine candidate, unsupported schema, stale source, or incomplete capture stops before import | Pipeline run retention |
 | Guarded import | Disabled by `ALLOW_IMPORT=0`; separate approval required | SQLite transaction plus pipeline lock | Bounded by pipeline service | No automatic retry after transaction start | Empty notification recipients; rollback on count, history, frozen-pick, integrity, or FK mismatch | Import receipts and table diffs |
 
 ## End-to-end gate
 
+The candidate reader timer uses systemd 255 `FixedRandomDelay=yes` with
+`RandomizedDelaySec=120s`, `AccuracySec=1s`, and `Persistent=false`. Both hosts
+currently use UTC and report synchronized NTP. Even at the latest configured
+reader start, the `240s` start and `20s` stop bounds leave at least `39s`
+before the `:07/:27/:47` pull. The pull's `60s` start and `10s` stop bounds
+leave at least `49s` before `:09/:29/:49` reconciliation. These are configured
+bounds, not a guarantee against unbounded host scheduling delays; freshness
+and completeness checks remain fail-closed.
+
 1. Capture publishes only a complete sanitized artifact and never overwrites `latest-complete` with an incomplete run.
 2. Pull verifies the pinned SSH host key, manifest, schema, SHA-256, fingerprint, topic IDs, canonical uniqueness, and freshness before atomic inbox publication.
-3. A known fingerprint is a transport and parser no-op.
+3. A known fingerprint creates no new logical event, but a fresh complete
+   duplicate advances the reader's latest pointer and is still validated for
+   source freshness by pull and reconciliation.
 4. Validation compares canonical post revisions against SQLite without writes.
 5. `new` is eligible for guarded import only when every identity and fixture is known and no quarantine is projected.
 6. `changed`, `unknown`, and `quarantine` require a separate operator gate. They are never imported automatically.
@@ -54,7 +66,8 @@ Policy:
 
 - duplicate physical no-op fix deployed and verified on a production copy;
 - synchronize installed operational scripts and units into Git source of truth;
-- separately approve and verify the 13 new Round 5 submissions before any live import;
+- preserve the separately approved, completed Round 5 historical recovery;
+- install and review the reader timer candidate separately before enabling any timers;
 - preserve the pre-R3/R4 rollback backup through several successful automatic cycles;
 - add one end-to-end scheduler rehearsal on a fresh production copy;
 - approve timer cadence and operational ownership;

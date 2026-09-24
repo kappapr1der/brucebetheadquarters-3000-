@@ -3,6 +3,7 @@
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 import ast
+import configparser
 import hashlib
 import importlib.util
 import io
@@ -108,7 +109,9 @@ def bundle(count, fingerprint_contract, relative=False):
 
 class FingerprintContracts(unittest.TestCase):
     def test_documented_inventory_matches_local_source_bytes(self):
-        inventory = (OPS / "README.md").read_text(encoding="utf-8")
+        inventory = (OPS / "README.md").read_text(encoding="utf-8").split(
+            "## Local candidate, not installed", 1
+        )[0]
         listed = 0
         for line in inventory.splitlines():
             if not line.startswith(("| Browser Node |", "| Production |")):
@@ -229,6 +232,62 @@ class ReaderPublication(unittest.TestCase):
 
 
 class RetentionAndScheduler(unittest.TestCase):
+    def test_reader_timer_candidate_has_bounded_ordered_windows(self):
+        units = OPS / "systemd"
+
+        def unit(path):
+            parser = configparser.ConfigParser(interpolation=None, strict=False)
+            parser.read(path, encoding="utf-8")
+            return parser
+
+        def minutes(calendar):
+            match = re.fullmatch(r"\*-\*-\* \*:(\d{2}(?:,\d{2})*):00", calendar)
+            self.assertIsNotNone(match, calendar)
+            return tuple(int(value) for value in match.group(1).split(","))
+
+        reader_timer_path = units / "browser-node" / "brucebet-vk-reader.timer"
+        inventory = (OPS / "README.md").read_text(encoding="utf-8")
+        candidate_hash = hashlib.sha256(reader_timer_path.read_bytes()).hexdigest()
+        self.assertIn(
+            f"`systemd/browser-node/brucebet-vk-reader.timer` | `{candidate_hash}`",
+            inventory,
+        )
+        reader_timer = unit(reader_timer_path)["Timer"]
+        pull_timer = unit(units / "production" / "brucebet-vk-pull.timer")["Timer"]
+        pipeline_timer = unit(units / "production" / "brucebet-vk-pipeline.timer")["Timer"]
+        reader_service = unit(units / "browser-node" / "brucebet-vk-reader.service")["Service"]
+        pull_service = unit(units / "production" / "brucebet-vk-pull.service")["Service"]
+
+        self.assertEqual("brucebet-vk-reader.service", reader_timer["Unit"])
+        self.assertEqual("yes", reader_timer["FixedRandomDelay"])
+        self.assertEqual("false", reader_timer["Persistent"])
+        self.assertEqual("1s", reader_timer["AccuracySec"])
+        self.assertEqual("120s", reader_timer["RandomizedDelaySec"])
+        self.assertFalse(any(key.lower().startswith(("onunit", "onboot", "onfailure"))
+                             for key in reader_timer))
+        self.assertIn("kernel_oom_check.py pre", reader_service["ExecStartPre"])
+        reader_dropin = (units / "browser-node" / "10-retention.conf").read_text(encoding="utf-8")
+        self.assertIn("/usr/bin/flock --nonblock", reader_dropin)
+        self.assertIn("reader_retention.py", reader_dropin)
+
+        capture = minutes(reader_timer["OnCalendar"])
+        pull = minutes(pull_timer["OnCalendar"])
+        reconcile = minutes(pipeline_timer["OnCalendar"])
+        self.assertEqual((0, 20, 40), capture)
+        self.assertEqual((7, 27, 47), pull)
+        self.assertEqual((9, 29, 49), reconcile)
+        reader_bound = int(reader_service["TimeoutStartSec"]) + int(reader_service["TimeoutStopSec"])
+        pull_bound = int(pull_service["TimeoutStartSec"]) + int(pull_service["TimeoutStopSec"])
+        jitter = int(reader_timer["RandomizedDelaySec"].removesuffix("s"))
+        for first, second, third in zip(capture, pull, reconcile):
+            with self.subTest(capture_minute=first):
+                self.assertLess(first, second)
+                self.assertLess(second, third)
+                capture_to_pull = (second - first) * 60 - jitter - 1 - reader_bound
+                pull_to_reconcile = (third - second) * 60 - 1 - pull_bound
+                self.assertGreaterEqual(capture_to_pull, 30)
+                self.assertGreaterEqual(pull_to_reconcile, 30)
+
     @unittest.skipUnless(os.name == "posix", "POSIX sealed-directory permission test")
     def test_sealed_retention_preserves_latest_and_reseals_on_failure(self):
         with tempfile.TemporaryDirectory() as directory:
