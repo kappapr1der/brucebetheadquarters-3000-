@@ -1,0 +1,30 @@
+[Unit]
+Description=BruceBet VK Browser Node one-shot reader
+After=network.target
+ConditionPathIsDirectory=/var/lib/brucebet-browser/profile
+
+[Service]
+Type=oneshot
+User=brucebet-browser
+Group=brucebet-browser
+UMask=0077
+WorkingDirectory=/var/lib/brucebet-browser
+Environment=HOME=/var/lib/brucebet-browser
+Environment=XDG_RUNTIME_DIR=/var/lib/brucebet-browser/runtime
+Environment=DISPLAY=:99
+ExecStartPre=+/usr/local/lib/brucebet-vk-reader/kernel_oom_check.py pre
+ExecStart=/usr/local/lib/brucebet-vk-reader/reader.py
+ExecStopPost=+/usr/local/lib/brucebet-vk-reader/kernel_oom_check.py post
+TimeoutStartSec=240
+TimeoutStopSec=20
+KillMode=control-group
+SendSIGKILL=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/brucebet-browser
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes

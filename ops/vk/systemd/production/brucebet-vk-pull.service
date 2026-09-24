@@ -1,0 +1,31 @@
+[Unit]
+Description=BruceBet restricted sanitized VK capture pull
+After=network.target
+ConditionPathExists=/var/lib/brucebet-vk-pull/keys/id_ed25519
+ConditionPathExists=/var/lib/brucebet-vk-pull/keys/known_hosts
+
+[Service]
+Type=oneshot
+User=brucebet-vk-pull
+Group=brucebet-vk-pull
+UMask=0077
+WorkingDirectory=/var/lib/brucebet-vk-pull
+Environment=HOME=/var/lib/brucebet-vk-pull
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/local/lib/brucebet-vk-pull/timeweb_pull.py
+TimeoutStartSec=60
+TimeoutStopSec=10
+KillMode=control-group
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ReadWritePaths=/var/lib/brucebet-vk-pull/inbox
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes

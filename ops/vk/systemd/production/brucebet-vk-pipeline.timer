@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule BruceBet VK inbox reconciliation and guarded import gate
+
+[Timer]
+OnCalendar=*-*-* *:09,29,49:00
+AccuracySec=1s
+Persistent=false
+Unit=brucebet-vk-pipeline.service
+
+[Install]
+WantedBy=timers.target

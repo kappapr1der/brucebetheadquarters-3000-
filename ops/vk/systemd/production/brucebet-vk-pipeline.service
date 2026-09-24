@@ -1,0 +1,33 @@
+[Unit]
+Description=BruceBet fail-closed VK sanitized inbox processor and guarded import gate
+After=docker.service brucebet-vk-pull.service
+Requires=docker.service
+ConditionPathIsDirectory=/var/lib/brucebet-vk-pull/inbox
+ConditionPathIsDirectory=/opt/brucebet-3000/data
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=BRUCEBET_VK_PIPELINE_ALLOW_IMPORT=0
+ExecStart=/usr/local/lib/brucebet-vk-pipeline/pipeline.py
+TimeoutStartSec=240
+TimeoutStopSec=20
+KillMode=control-group
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ReadOnlyPaths=/var/lib/brucebet-vk-pull/inbox /opt/brucebet-3000
+ReadWritePaths=/var/lib/brucebet-vk-pipeline /run/lock
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+

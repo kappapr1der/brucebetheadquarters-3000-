@@ -1,6 +1,11 @@
 # VK Pipeline Scheduler Design
 
-Status: design only. No timers, services, production configuration, Telegram delivery, or deployment are enabled by this document.
+Status: operational design and installed-unit reference. As of 2026-09-24, the
+Timeweb Browser Node reader is manually triggered; production pull/pipeline
+services are installed, but both timers are disabled/inactive. The pipeline
+unit pins `BRUCEBET_VK_PIPELINE_ALLOW_IMPORT=0`. This document does not enable
+timers, live import, or Telegram delivery. See `ops/vk/README.md` for the
+byte-identical installed sources and deployment boundaries.
 
 ## Notification disposition
 
@@ -18,10 +23,10 @@ Policy:
 
 | Stage | Frequency | Lock | Timeout | Retry | Fail-closed rules | Retention |
 | --- | --- | --- | --- | --- | --- | --- |
-| IHC capture | Every 20 minutes, with 0-120 second deterministic jitter | One host `flock`; never run parallel Chrome | 8 minutes total, 90 seconds per page action | No retry in one run; next scheduled window only | Challenge, incomplete pagination, count mismatch, or cleanup failure cannot publish `latest-complete` | 14 daily complete artifacts plus 30 days of manifests and failure metadata |
-| Timeweb SSH pull | Five minutes after the capture window | One pull `flock` | 90 seconds | One retry after 60 seconds for transport failure only | Host-key, schema, SHA-256, fingerprint, topic, completeness, duplicate-ID, or freshness failure cannot replace inbox latest | 30 accepted immutable artifacts; 30 days of transport logs |
-| Inbox validation | Immediately after a newly accepted fingerprint | Same pipeline lock; read-only DB connection | 2 minutes | No automatic retry for content errors | Unknown participant, changed canonical post, quarantine candidate, unsupported schema, stale source, or incomplete capture stops before import | Verification reports for 90 days |
-| Guarded import | Only after validation reports a new, clean candidate | SQLite `BEGIN IMMEDIATE` plus pipeline lock | 2 minutes | No automatic retry after transaction start; operator review on ambiguity | Import only a complete allowlisted source; empty notification recipients; rollback on any count, history, frozen-pick, integrity, or FK mismatch | Import receipts and table diffs for the season |
+| Timeweb Browser Node capture | Manual only; no reader timer installed | One host `flock`; never run parallel Chrome | Reader service timeout 240 seconds | No retry in one run | Challenge, incomplete pagination, count mismatch, or cleanup failure cannot publish `latest-complete` | Reader retention drop-in prunes only eligible runs |
+| Timeweb SSH pull | Installed timer at `*:07,27,47`, currently disabled | One pull `flock` | Service timeout 90 seconds | No in-run retry | Host-key, schema, SHA-256, fingerprint, topic, completeness, duplicate-ID, or freshness failure cannot replace inbox latest | Pull retention keeps 30 accepted runs and protects latest |
+| Inbox validation | Installed timer at `*:09,29,49`, currently disabled | Pipeline lock; production DB backup copy | Service timeout 240 seconds | No automatic retry for content errors | Unknown participant, changed canonical post, quarantine candidate, unsupported schema, stale source, or incomplete capture stops before import | Pipeline run retention |
+| Guarded import | Disabled by `ALLOW_IMPORT=0`; separate approval required | SQLite transaction plus pipeline lock | Bounded by pipeline service | No automatic retry after transaction start | Empty notification recipients; rollback on count, history, frozen-pick, integrity, or FK mismatch | Import receipts and table diffs |
 
 ## End-to-end gate
 
@@ -37,16 +42,19 @@ Policy:
 
 ## Failure isolation
 
-- Browser-node failure cannot reach Timeweb or production credentials.
+- Browser-node failure cannot reach the production host or its credentials.
 - Pull failure cannot alter the accepted inbox artifact.
 - Parser or validation failure cannot open a write transaction.
 - Import failure rolls back the whole candidate and leaves the previous receipt current.
 - Logs contain only sanitized IDs, hashes, counts, stop reasons, and bounded errors.
-- The scheduler remains disabled until the no-op fix is deployed and a separate enablement review approves exact service/timer units and notification policy.
+- The no-op fix is deployed, but the timers remain disabled pending a separate
+  observation-mode enablement review. Automatic import remains disabled.
 
 ## Enablement prerequisites
 
-- deploy the duplicate physical no-op fix with its regression tests;
+- duplicate physical no-op fix deployed and verified on a production copy;
+- synchronize installed operational scripts and units into Git source of truth;
+- separately approve and verify the 13 new Round 5 submissions before any live import;
 - preserve the pre-R3/R4 rollback backup through several successful automatic cycles;
 - add one end-to-end scheduler rehearsal on a fresh production copy;
 - approve timer cadence and operational ownership;

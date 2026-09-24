@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule restricted BruceBet VK sanitized pulls
+
+[Timer]
+OnCalendar=*-*-* *:07,27,47:00
+AccuracySec=1s
+Persistent=false
+Unit=brucebet-vk-pull.service
+
+[Install]
+WantedBy=timers.target
