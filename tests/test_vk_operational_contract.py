@@ -16,7 +16,6 @@ import sys
 import tempfile
 import types
 import unittest
-import warnings
 from unittest.mock import patch
 
 
@@ -298,10 +297,21 @@ class RetentionAndScheduler(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             root = Path(directory)
+            lock_handles = []
+
+            class HeldLockPath:
+                parent = root
+
+                def open(self, mode):
+                    handle = (root / "pipeline.lock").open(mode)
+                    lock_handles.append(handle)
+                    return handle
+
             stack.enter_context(patch.multiple(
                 pipeline, ROOT=root, RUNS=root / "runs", RESULTS=root / "results",
-                LOCK=root / "pipeline.lock", LATEST_RESULT=root / "latest.json",
+                LOCK=HeldLockPath(), LATEST_RESULT=root / "latest.json",
             ))
+            stack.callback(lambda: [handle.close() for handle in lock_handles])
             stack.enter_context(patch.dict(os.environ, {"BRUCEBET_VK_PIPELINE_ALLOW_IMPORT": "0"}))
             stack.enter_context(patch.object(pipeline, "now", return_value=datetime(2026, 9, 18, tzinfo=timezone.utc)))
             stack.enter_context(patch.object(pipeline, "inspect_production", return_value={"unchanged": True}))
@@ -326,8 +336,7 @@ class RetentionAndScheduler(unittest.TestCase):
                 return {"returncode": 0}
 
             stack.enter_context(patch.object(pipeline, "run_checked", side_effect=run_checked))
-            with redirect_stdout(io.StringIO()), warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=ResourceWarning, message="unclosed file")
+            with redirect_stdout(io.StringIO()):
                 self.assertEqual(0, pipeline.main())
             self.assertEqual(1, len(calls))
             outcome = json.loads((root / "latest.json").read_text())
