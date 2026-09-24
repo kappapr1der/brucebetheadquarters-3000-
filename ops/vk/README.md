@@ -1,12 +1,17 @@
 # VK operational source of truth
 
 This directory mirrors the installed, non-secret VK Browser Node and production
-pull/pipeline code as observed on 2026-09-24. The 22 deployed files below were
-copied byte for byte; no server, timer, or GitHub state was changed while
-preparing this local branch. Git `main` at
+pull/pipeline code. The initial 22 deployed files below were copied byte for
+byte on 2026-09-24; Git `main` at
 `27b9573ee8e499e0ec2699e2cfde94b7e10cb1ba` had none of these `ops/vk`
-files. The application code and `VK_PIPELINE_SCHEDULER_DESIGN.md` already
-existed in `main`.
+files. The reader timer was added later and installed from
+`main=3e1f0b078446309a4ab0305ec203db379d2f706b`.
+
+After the 2026-09-24 UTC unattended observation gate, reader, pull, and
+pipeline timers are enabled in observation mode. The pipeline still pins
+`BRUCEBET_VK_PIPELINE_ALLOW_IMPORT=0`: automatic live import is off, and the
+scheduled pipeline does not invoke Telegram delivery. Server state was not
+changed by this documentation update.
 
 The script name `ihc_export.py` is retained to preserve the proven forced-command
 SSH protocol. It runs on the Timeweb Browser Node, not the retired IHC host.
@@ -48,17 +53,17 @@ the installation runbook, not from the Git checkout alone.
 | Production | `/etc/systemd/system/brucebet-vk-pipeline.service` | `systemd/production/brucebet-vk-pipeline.service` | `f0491c45c1dfc79b8cd1f68071d4e2f66ac5311559c1370fb8d74434b2b9f374` |
 | Production | `/etc/systemd/system/brucebet-vk-pipeline.timer` | `systemd/production/brucebet-vk-pipeline.timer` | `5fcf97694d38a66852a1ab4aa9c98156145d8bc47b93483712acdad02b3709f9` |
 
-## Local candidate, not installed
+## Local candidate, not installed (historical; now installed)
 
-| Target host | Proposed path | Repository file | SHA-256 |
+| Host | Installed path | Repository file | SHA-256 |
 | --- | --- | --- | --- |
 | Browser Node | `/etc/systemd/system/brucebet-vk-reader.timer` | `systemd/browser-node/brucebet-vk-reader.timer` | `a342ccfc068c1f11a8ee61b6476e2bf54260544601f0082f12fddeea208aeaaa` |
 
-This timer is a local source candidate only. It has not been installed,
-enabled, or started on the Browser Node. Its calendar is `:00/:20/:40` with a
-stable host-specific delay of at most 120 seconds. The existing service's
-flock, resource guard, completeness checks, cleanup, and retention remain
-unchanged.
+This section records the former candidate separately from the original
+22-file inventory. The timer is now installed on the Browser Node with this
+exact SHA-256 and enabled. Its calendar is `:00/:20/:40` with a stable
+host-specific delay of at most 120 seconds. The existing service's flock,
+resource guard, completeness checks, cleanup, and retention remain unchanged.
 
 ## Recovery and enablement boundary
 
@@ -67,18 +72,26 @@ unchanged.
    separately; never commit their credentials. Pin the host key on production
    using the independently verified fingerprint. Keep SSH pull private key on
    production only.
-2. The Browser Node has a manual `brucebet-vk-reader.service` and no installed
-   reader timer. Production has pull/pipeline service and timer files, but both
-   timers are disabled/inactive. Installed does not mean enabled.
+2. The Browser Node reader timer and production pull/pipeline timers are
+   installed and enabled in observation mode. Their cadence is
+   `:00/:20/:40` -> `:07/:27/:47` -> `:09/:29/:49`; services remain one-shot
+   and are not invoked manually during unattended observation.
 3. The current pipeline unit fixes `BRUCEBET_VK_PIPELINE_ALLOW_IMPORT=0`; it
    reconciles against a DB copy and stops at the approval gate for new source.
-   The guarded importer uses `notification_chat_ids=()` and does not send
-   Telegram messages. Neither timer enablement nor live import is authorized
-   by this repository snapshot.
+   The guarded importer uses `notification_chat_ids=()` and the scheduled
+   pipeline does not send Telegram messages. Live import still needs separate
+   approval; timer enablement does not grant it.
 4. The 2026-09-24 cutover proved 71 complete source records, 53 known forecast
    posts and 13 Round 5 posts (`3623`-`3635`). R5 was later recovered through
-   a separately approved one-time historical recovery. Timer installation and
-   observation-mode enablement still require separate approval.
+   a separately approved one-time historical recovery.
+5. Three consecutive unattended cycles completed with source-chain correlation
+   by `capture run_id` -> `pull source_run_id` -> `pipeline observed_run_id`.
+   Minimum observed gaps were 360 seconds from capture finish to pull start
+   and 117 seconds from pull finish to pipeline start. All three duplicate
+   cycles were physical no-ops on a production DB copy. Production remained
+   at 648 predictions and 695 revisions during the gate. A real unattended
+   `new_source_requires_approval` case awaits a naturally new forecast; do
+   not infer it from the three unchanged-source cycles.
 
 `tests/test_vk_operational_contract.py` covers the source contracts without
 shipping real VK comment bodies. The existing storage no-op regression remains
